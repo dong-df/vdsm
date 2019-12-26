@@ -25,7 +25,6 @@ import uuid
 
 import pytest
 
-from vdsm.storage import blockSD
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import clusterlock
@@ -40,6 +39,7 @@ from storage.storagetestlib import (
     make_file_volume,
 )
 
+
 MB = 1048576
 
 # We want to create volumes larger than the minimum block volume size
@@ -50,7 +50,8 @@ VOLSIZE = 256 * MB
 class ManifestMixin(object):
 
     def test_init_failure_raises(self, monkeypatch):
-        def fail(*args):
+        def fail(sdUUID, idsPath, lease, alignment=sc.ALIGNMENT_1M,
+                 block_size=sc.BLOCK_SIZE_512):
             raise RuntimeError("injected failure")
 
         with self.env() as env:
@@ -156,29 +157,6 @@ class TestBlockManifest(ManifestMixin):
             assert (env.sd_manifest.sdUUID ==
                     env.sd_manifest.getMetaParam(sd.DMDK_SDUUID))
 
-    def test_getblocksize_defaults(self):
-        with self.env() as env:
-            assert 512 == env.sd_manifest.logBlkSize
-            assert 512 == env.sd_manifest.phyBlkSize
-
-    def test_overwrite_blocksize(self):
-        metadata = {sd.DMDK_VERSION: 3,
-                    sd.DMDK_LOGBLKSIZE: 2048,
-                    sd.DMDK_PHYBLKSIZE: 1024}
-        with self.env() as env:
-            # Replacing the metadata will not overwrite these values since they
-            # are set only in the manifest constructor.
-            env.sd_manifest.replaceMetadata(metadata)
-            assert 512 == env.sd_manifest.logBlkSize
-            assert 512 == env.sd_manifest.phyBlkSize
-
-            # If we supply values in the metadata used to construct the
-            # manifest then those values will apply.
-            new_manifest = blockSD.BlockStorageDomainManifest(
-                env.sd_manifest.sdUUID, metadata)
-            assert 2048 == new_manifest.logBlkSize
-            assert 1024 == new_manifest.phyBlkSize
-
 
 class TestBlockDomainMetadataSlot:
 
@@ -211,7 +189,7 @@ class TestBlockDomainMetadataSlot:
                 sduuid = env.sd_manifest.sdUUID
                 env.lvm.createLV(sduuid, lv, VOLSIZE // MB)
                 tag = sc.TAG_PREFIX_MD + str(offset)
-                env.lvm.addtag(sduuid, lv, tag)
+                env.lvm.changeLVsTags(sduuid, (lv,), addTags=(tag,))
             with env.sd_manifest.acquireVolumeMetadataSlot(None) as mdSlot:
                 assert mdSlot == free_slot
 

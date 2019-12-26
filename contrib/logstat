@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 #
 # Copyright 2016 Red Hat, Inc.
 #
@@ -25,6 +25,7 @@ Usage: logstat logfile ...
 Show the amount of data each log call produce.
 """
 
+from __future__ import absolute_import
 from __future__ import print_function
 
 import collections

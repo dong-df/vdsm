@@ -1,4 +1,4 @@
-# Copyright 2018 Red Hat, Inc.
+# Copyright 2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from .netintegtestlib import bridge_device
 from network import nettestlib
 
 from vdsm.network.link import stats as link_stats
@@ -37,7 +38,7 @@ def _vlan_device():
 
 @contextmanager
 def _bridge_device():
-    with nettestlib.bridge_device() as bridge:
+    with bridge_device() as bridge:
         yield bridge.devName
 
 
@@ -49,7 +50,7 @@ def _bridge_device():
         (_vlan_device, {}),
         (_bridge_device, {}),
     ],
-    ids=['nic', 'bond', 'vlan', 'bridge']
+    ids=['nic', 'bond', 'vlan', 'bridge'],
 )
 def test_report(device_ctx, device_ctx_args):
     with device_ctx(**device_ctx_args) as dev:
@@ -65,6 +66,6 @@ def test_report(device_ctx, device_ctx_args):
             'rxErrors',
             'txErrors',
             'speed',
-            'duplex'
+            'duplex',
         }
         assert expected_stat_names == set(stats[dev])

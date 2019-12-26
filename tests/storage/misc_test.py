@@ -47,10 +47,10 @@ from vdsm.common import commands
 from vdsm.common.proc import pidstat
 from vdsm.storage import fileUtils
 from vdsm.storage import misc
-from vdsm.storage import outOfProcess as oop
 
 from monkeypatch import MonkeyPatch
 from testValidation import checkSudo
+
 
 EXT_DD = "/bin/dd"
 
@@ -172,50 +172,6 @@ class Receiver(object):
         self.flag.set()
 
 
-class TestITMap(VdsmTestCase):
-
-    def testMoreArgsThanThreads(self):
-        def dummy(arg):
-            time.sleep(TIMEOUT)
-            return arg
-        data = frozenset([1, 2, 3, 4])
-        currentTime = time.time()
-        # we provide 3 thread slots and the input contain 4 vals, means we
-        # need to wait for 1 thread to finish before processing all input.
-        ret = frozenset(misc.itmap(dummy, data, 3))
-        afterTime = time.time()
-        # the time should take at least TIMEOUT seconds to wait for 1 of the
-        # first 3 to finish and another TIMEOUT seconds for the last operation,
-        # not more than 4 TIMEOUTs (and I'm large here..)
-        self.assertFalse(afterTime - currentTime > TIMEOUT * 4,
-                         msg=("Operation took too long (more than 2 second). "
-                              "starts: %s ends: %s") %
-                         (currentTime, afterTime))
-        # Verify the operation waits at least for 1 thread to finish
-        self.assertFalse(afterTime - currentTime < TIMEOUT * 2,
-                         msg="Operation was too fast, not all threads were "
-                             "initiated as desired (with 1 thread delay)")
-        self.assertEqual(ret, data)
-
-    def testMaxAvailableProcesses(self):
-        def dummy(arg):
-            return arg
-        # here we launch the maximum threads we can initiate in every
-        # outOfProcess operation + 1. it let us know that oop and itmap operate
-        # properly with their limitations
-        data = frozenset(range(oop.HELPERS_PER_DOMAIN + 1))
-        ret = frozenset(misc.itmap(dummy, data, misc.UNLIMITED_THREADS))
-        self.assertEqual(ret, data)
-
-    def testMoreThreadsThanArgs(self):
-        data = [1]
-        self.assertEqual(list(misc.itmap(int, data, 80)), data)
-
-    def testInvalidITMapParams(self):
-        data = 1
-        self.assertRaises(ValueError, lambda: next(misc.itmap(int, data, 0)))
-
-
 class TestParseHumanReadableSize(VdsmTestCase):
 
     def testValidInput(self):
@@ -301,15 +257,14 @@ class TestValidateInt(VdsmTestCase):
         self.assertRaises(expectedException, misc.validateInt, "2-1", "a")
 
 
-@pytest.mark.skipif(six.PY3, reason="name 'basestring' is not defined")
 @expandPermutations
 class TestValidateSize(VdsmTestCase):
 
     @permutations(
         # size, result
-        [("512", 1),
-         ("513", 2),
-         (u"1073741824", 2097152),
+        [("512", 512),
+         ("513", 513),
+         (u"1073741824", 1073741824),
          ])
     def test_valid_size(self, size, result):
         self.assertEqual(misc.validateSize(size, "size"), result)
@@ -435,19 +390,6 @@ class TestParseBool(VdsmTestCase):
         self.assertRaises(AttributeError, misc.parseBool, None)
 
 
-class TestAlignData(VdsmTestCase):
-
-    def test(self):
-        """
-        Test various inputs and see that they are correct.
-        """
-        self.assertEqual(misc._alignData(100, 100), (4, 25, 25))
-        self.assertEqual(misc._alignData(512, 512), (512, 1, 1))
-        self.assertEqual(misc._alignData(1, 1024), (1, 1, 1024))
-        self.assertEqual(misc._alignData(10240, 512), (512, 20, 1))
-        self.assertEqual(misc._alignData(1, 1), (1, 1, 1))
-
-
 class TestValidateDDBytes(VdsmTestCase):
 
     def testValidInputTrue(self):
@@ -486,7 +428,6 @@ class TestValidateDDBytes(VdsmTestCase):
                           ["I AM", "PRETENDING TO", "BE DD"], 32)
 
 
-@pytest.mark.skipif(six.PY3, reason="try to write text to binary file")
 class TestReadBlock(VdsmTestCase):
 
     def _createTempFile(self, neededFileSize, writeData):
@@ -512,8 +453,8 @@ class TestReadBlock(VdsmTestCase):
         """
         Test that when all arguments are correct the method works smoothly.
         """
-        writeData = "DON'T THINK OF IT AS DYING, said Death." + \
-                    "JUST THINK OF IT AS LEAVING EARLY TO AVOID THE RUSH."
+        writeData = (b"DON'T THINK OF IT AS DYING, said Death. "
+                     b"JUST THINK OF IT AS LEAVING EARLY TO AVOID THE RUSH.")
         # (C) Terry Pratchet - Good Omens
         dataLength = len(writeData)
 
@@ -526,8 +467,8 @@ class TestReadBlock(VdsmTestCase):
         timesInSize = int(size / dataLength) + 1
         relOffset = offset % dataLength
         expectedResultData = (writeData * timesInSize)
-        expectedResultData = \
-            (expectedResultData[relOffset:] + expectedResultData[:relOffset])
+        expectedResultData = (expectedResultData[relOffset:] +
+                              expectedResultData[:relOffset])
         expectedResultData = expectedResultData[:size]
         block = misc.readblock(path, offset, size)
 
@@ -556,8 +497,8 @@ class TestReadBlock(VdsmTestCase):
         See that correct exception is raised when trying to read more then the
         file has to offer.
         """
-        writeData = "History, contrary to popular theories, " + \
-                    "is kings and dates and battles."
+        writeData = (b"History, contrary to popular theories, "
+                     b"is kings and dates and battles.")
         # (C) Terry Pratchet - Small Gods
 
         offset = 512
@@ -671,8 +612,8 @@ class TestExecCmd(VdsmTestCase):
         Tests that execCmd correctly returns the standard output of the prog it
         executes.
         """
-        line = "All I wanted was to have some pizza, hang out with dad, " + \
-               "and not let your weirdness mess up my day"
+        line = ("All I wanted was to have some pizza, hang out with dad, "
+                "and not let your weirdness mess up my day")
         # (C) Nickolodeon - Invader Zim
         ret, stdout, stderr = commands.execCmd((EXT_ECHO, line))
         self.assertEqual(stdout[0].decode("ascii"), line)
@@ -696,7 +637,6 @@ class TestExecCmd(VdsmTestCase):
         ret, stdout, stderr = commands.execCmd(cmd, sudo=True)
         self.assertEqual(stdout[0].decode("ascii"), SUDO_USER)
 
-    @pytest.mark.skipif(six.PY3, reason="uses AsyncProc")
     def testNice(self):
         cmd = ["sleep", "10"]
         proc = commands.start(cmd, nice=10)
@@ -807,3 +747,34 @@ class TestDynamicBarrier(VdsmTestCase):
         barrier = misc.DynamicBarrier()
         self.assertTrue(barrier.enter())
         barrier.exit()
+
+
+@pytest.mark.parametrize("check_str,result", [
+    pytest.param(
+        u"The quick brown fox jumps over the lazy dog.", True, id="Ascii"),
+    pytest.param(u"\u05d0", False, id="Unicode"),
+    pytest.param(u"", True, id="Empty"),
+])
+def test_isAscii(check_str, result):
+    assert misc.isAscii(check_str) == result
+
+
+@pytest.mark.skipif(
+    six.PY2, reason="Bytes support both encode and decode calls")
+def test_checkBytes():
+    with pytest.raises(AttributeError):
+        misc.isAscii(b"bytes")
+
+
+@pytest.mark.parametrize("length, offset, expected", [
+    (100, 100, (4, 25, 25)),
+    (512, 512, (512, 1, 1)),
+    (1, 1024, (1, 1, 1024)),
+    (10240, 512, (512, 20, 1)),
+    (1, 1, (1, 1, 1)),
+])
+def test_align_data(length, offset, expected):
+    alignment = misc._alignData(length, offset)
+    assert alignment == expected
+    for value in alignment:
+        assert isinstance(value, int)

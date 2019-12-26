@@ -136,6 +136,12 @@ networkmanager_DATA = \
 	./etc/NetworkManager/conf.d/vdsm.conf \
 	$(NULL)
 
+dracutdir = $(exec_prefix)/lib/dracut/dracut.conf.d
+
+dracut_DATA = \
+	./usr/lib/dracut/dracut.conf.d/99-vdsm_protect_ifcfg.conf \
+	$(NULL)
+
 dhclientmondir = $(sysconfdir)/dhcp/dhclient.d
 dist_dhclientmon_SCRIPTS = \
 	./etc/dhcp/dhclient.d/dhclientmon.sh \
@@ -160,16 +166,6 @@ dist_systemdunit_DATA = \
 	./usr/lib/systemd/system/dev-hugepages1G.mount \
 	$(NULL)
 
-yumpluginconfdir = $(sysconfdir)/yum/pluginconf.d
-yumpluginconf_DATA = \
-	./etc/yum/pluginconf.d/vdsmupgrade.conf \
-	$(NULL)
-
-yumplugindir = $(datarootdir)/yum-plugins
-yumplugin_DATA = \
-	./usr/share/yum-plugins/vdsmupgrade.py \
-	$(NULL)
-
 CLEANFILES = \
 	$(sudoers_DATA) \
 	$(systemdunit_DATA) \
@@ -184,12 +180,11 @@ EXTRA_DIST = \
 	$(modprobe_DATA) \
 	$(modulesload_DATA) \
 	$(networkmanager_DATA) \
+	$(dracut_DATA) \
 	$(sysctl_DATA) \
 	$(vdsmconfrotate_DATA) \
 	$(vdsm_DATA) \
 	$(vdsm_autounattend_DATA) \
-	$(yumpluginconf_DATA) \
-	$(yumplugin_DATA) \
 	./etc/sudoers.d/50_vdsm.in \
 	./etc/vdsm/logger.conf.in \
 	./etc/vdsm/mom.conf.in \
@@ -214,6 +209,7 @@ install-data-local: install-libvirtpasswordDATA
 	$(MKDIR_P) $(DESTDIR)$(vdsmrepo)/mnt
 	$(MKDIR_P) $(DESTDIR)$(vdsmtsdir)/keys
 	$(MKDIR_P) $(DESTDIR)$(vdsmtsdir)/certs
+	$(MKDIR_P) $(DESTDIR)$(vdsmtsdir)/libvirt-migrate
 	$(MKDIR_P) $(DESTDIR)$(vdsmtsdir)/libvirt-spice
 	$(MKDIR_P) $(DESTDIR)$(vdsmlogdir)
 	$(MKDIR_P) $(DESTDIR)$(vdsmlogdir)/import

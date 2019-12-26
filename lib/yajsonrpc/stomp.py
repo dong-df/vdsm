@@ -1,4 +1,4 @@
-# Copyright 2014-2017 Red Hat, Inc.
+# Copyright 2014-2019 Red Hat, Inc.
 # Copyright (C) 2014 Saggi Mizrahi, Red Hat Inc.
 #
 # This program is free software; you can redistribute it and/or modify
@@ -24,7 +24,7 @@ from collections import deque
 from vdsm.common import api
 from vdsm.common import pki
 from vdsm.common import time
-from vdsm.sslutils import CLIENT_PROTOCOL, SSLSocket, SSLContext
+from vdsm.sslutils import SSLSocket, SSLContext
 import re
 
 DEFAULT_INTERVAL = 30
@@ -40,6 +40,7 @@ NR_RETRIES = 1
 # This is the value used by engine
 GRACE_PERIOD_FACTOR = 0.2
 
+# https://stomp.github.io/stomp-specification-1.2.html#Value_Encoding
 _RE_ESCAPE_SEQUENCE = re.compile(br"\\(.)")
 
 _RE_ENCODE_CHARS = re.compile(br"[\r\n\\:]")
@@ -52,7 +53,7 @@ _EC_DECODE_MAP = {
 }
 
 _EC_ENCODE_MAP = {
-    b":": b"\c",
+    b":": b"\\c",
     b"\\": b"\\\\",
     b"\r": b"\\r",
     b"\n": b"\\n",
@@ -84,8 +85,9 @@ class Headers(object):
     HEARTBEAT = "heart-beat"
 
 
-COMMANDS = tuple([command for command in dir(Command)
-                  if not command.startswith('_')])
+COMMANDS = tuple(getattr(Command, command)
+                 for command in dir(Command)
+                 if not command.startswith('_'))
 
 
 class AckMode(object):
@@ -95,57 +97,57 @@ class AckMode(object):
 class StompError(RuntimeError):
     def __init__(self, frame, message):
         self.frame = frame
-        self.message = message
+        self.msg = message
 
     def __str__(self):
-        return "Error in frame %s: %s" % (self.frame, self.message)
+        return "Error in frame %s: %s" % (self.frame, self.msg)
 
 
-class Disconnected(RuntimeError):
-    pass
-
-
-class _HeartBeatFrame(object):
+class _HeartbeatFrame(object):
     def encode(self):
-        return "\n"
+        return b"\n"
+
 
 # There is no reason to have multiple instances
-_heartBeatFrame = _HeartBeatFrame()
+_heartbeat_frame = _HeartbeatFrame()
 
 
 class Frame(object):
     __slots__ = ("headers", "command", "body")
 
-    def __init__(self, command="", headers=None, body=None):
+    def __init__(self, command, headers=None, body=None):
         self.command = command
         if headers is None:
             headers = {}
 
         self.headers = headers
         if isinstance(body, six.text_type):
-            body = body.encode('utf-8')
+            body = body.encode("utf-8")
 
         self.body = body
 
+    # https://stomp.github.io/stomp-specification-1.2.html#Augmented_BNF
     def encode(self):
         body = self.body
         # We do it here so we are sure header is up to date
         if body is not None:
-            self.headers["content-length"] = len(body)
+            self.headers[Headers.CONTENT_LENGTH] = str(len(body))
 
-        data = [self.command, '\n']
+        data = [encode_value(self.command), b"\n"]
+
         for key, value in six.viewitems(self.headers):
-            data.append(encodeValue(key))
-            data.append(":")
-            data.append(encodeValue(value))
-            data.append("\n")
+            data.append(encode_value(key))
+            data.append(b":")
+            data.append(encode_value(value))
+            data.append(b"\n")
 
-        data.append('\n')
+        data.append(b"\n")
+
         if body is not None:
             data.append(body)
 
-        data.append("\0")
-        return ''.join(data)
+        data.append(b"\0")
+        return b"".join(data)
 
     def __repr__(self):
         return "<StompFrame command=%s>" % (repr(self.command))
@@ -154,11 +156,15 @@ class Frame(object):
         return Frame(self.command, self.headers.copy(), self.body)
 
 
-def decodeValue(s):
+def decode_value(s):
+    if not isinstance(s, six.binary_type):
+        raise ValueError(
+            "Unable to decode non-binary value: {!r}".format(repr(s)))
+
     # Make sure to leave this check before decoding as ':' can appear in the
     # value after decoding using \c
     if b":" in s:
-        raise ValueError("Contains illigal charachter `:`")
+        raise ValueError("'{}' contains illegal character ':'".format(s))
 
     try:
         s = _RE_ESCAPE_SEQUENCE.sub(
@@ -166,20 +172,23 @@ def decodeValue(s):
             s,
         )
     except KeyError as e:
-        raise ValueError("Containes invalid escape squence `\\%s`" % e.args[0])
+        raise ValueError(
+            "'{}' contains invalid escape sequence '\\{}'".format(
+                s, e.args[0]))
 
-    if six.PY2 or (six.PY3 and isinstance(s, bytes)):
-        s = s.decode('utf-8')
-    return s
+    return s.decode("utf-8")
 
 
-def encodeValue(s):
-    if six.PY3 or (six.PY2 and isinstance(s, unicode)):
-        s = s.encode('utf-8')
+def encode_value(s):
+    if isinstance(s, six.text_type):
+        s = s.encode("utf-8")
+    # TODO: Remove handling ints as 'decode_value'
+    #       doesn't do the reverse conversion
     elif isinstance(s, int):
-        s = str(s)
-    elif not isinstance(s, str):
-        raise ValueError('Unable to encode non-string values')
+        s = str(s).encode("utf-8")
+    elif not isinstance(s, six.binary_type):
+        raise ValueError(
+            "Unable to encode non-string value: {!r}".format(repr(s)))
 
     return _RE_ENCODE_CHARS.sub(lambda m: _EC_ENCODE_MAP[m.group(0)], s)
 
@@ -188,6 +197,7 @@ class Parser(object):
     _STATE_CMD = "Parsing command"
     _STATE_HEADER = "Parsing headers"
     _STATE_BODY = "Receiving body"
+    _FRAME_TERMINATOR = b"\x00" if six.PY2 else 0
 
     def __init__(self):
         self._states = {
@@ -196,7 +206,7 @@ class Parser(object):
             self._STATE_BODY: self._parse_body}
         self._frames = deque()
         self._change_state(self._STATE_CMD)
-        self._contentLength = -1
+        self._content_length = -1
         self._flush()
 
     def _change_state(self, new_state):
@@ -204,7 +214,7 @@ class Parser(object):
         self._state_cb = self._states[new_state]
 
     def _flush(self):
-        self._buffer = ""
+        self._buffer = b""
 
     def _write_buffer(self, buff):
         self._buffer += buff
@@ -222,39 +232,39 @@ class Parser(object):
         return res
 
     def _parse_command(self):
-        cmd = self._handle_terminator('\n')
+        cmd = self._handle_terminator(b"\n")
         if cmd is None:
             return False
 
-        if len(cmd) > 0 and cmd[-1] == '\r':
+        if len(cmd) > 0 and cmd[-1:] == b"\r":
             cmd = cmd[:-1]
 
-        if cmd == "":
+        if cmd == b"":
             return True
 
-        cmd = decodeValue(cmd)
-        self._tmpFrame = Frame(cmd)
+        cmd = decode_value(cmd)
+        self._tmp_frame = Frame(cmd)
 
         self._change_state(self._STATE_HEADER)
         return True
 
     def _parse_header(self):
-        header = self._handle_terminator('\n')
+        header = self._handle_terminator(b"\n")
         if header is None:
             return False
 
-        if len(header) > 0 and header[-1] == '\r':
+        if len(header) > 0 and header[-1:] == b"\r":
             header = header[:-1]
 
-        headers = self._tmpFrame.headers
-        if header == "":
-            self._contentLength = int(headers.get('content-length', -1))
+        headers = self._tmp_frame.headers
+        if header == b"":
+            self._content_length = int(headers.get(Headers.CONTENT_LENGTH, -1))
             self._change_state(self._STATE_BODY)
             return True
 
-        key, value = header.split(":", 1)
-        key = decodeValue(key)
-        value = decodeValue(value)
+        key, value = header.split(b":", 1)
+        key = decode_value(key)
+        value = decode_value(value)
 
         # If a client or a server receives repeated frame header entries, only
         # the first header entry SHOULD be used as the value of header entry.
@@ -264,43 +274,43 @@ class Parser(object):
 
         return True
 
-    def _pushFrame(self):
-        self._frames.append(self._tmpFrame)
+    def _push_frame(self):
+        self._frames.append(self._tmp_frame)
         self._change_state(self._STATE_CMD)
-        self._tmpFrame = None
-        self._contentLength = -1
+        self._tmp_frame = None
+        self._content_length = -1
 
     def _parse_body(self):
-        if self._contentLength >= 0:
+        if self._content_length >= 0:
             return self._parse_body_length()
         else:
             return self._parse_body_terminator()
 
     def _parse_body_terminator(self):
-        body = self._handle_terminator('\0')
+        body = self._handle_terminator(b"\0")
         if body is None:
             return False
 
-        self._tmpFrame.body = body
-        self._pushFrame()
+        self._tmp_frame.body = body
+        self._push_frame()
         return True
 
     def _parse_body_length(self):
         buf = self._get_buffer()
-        cl = self._contentLength
+        cl = self._content_length
         ndata = len(buf)
         if ndata < (cl + 1):
             return False
 
-        if buf[cl] != "\0":
-            raise RuntimeError("Frame end is missing \\0")
+        if buf[cl] != self._FRAME_TERMINATOR:
+            raise RuntimeError("Frame doesn't end with NULL byte")
 
         self._flush()
         self._write_buffer(buf[cl + 1:])
         body = buf[:cl]
 
-        self._tmpFrame.body = body
-        self._pushFrame()
+        self._tmp_frame.body = body
+        self._push_frame()
 
         return True
 
@@ -313,7 +323,7 @@ class Parser(object):
         while self._state_cb():
             pass
 
-    def popFrame(self):
+    def pop_frame(self):
         try:
             return self._frames.popleft()
         except IndexError:
@@ -412,7 +422,7 @@ class AsyncDispatcher(object):
             todo = pending()
 
         while parser.pending > 0:
-            self._frame_handler.handle_frame(self, parser.popFrame())
+            self._frame_handler.handle_frame(self, parser.pop_frame())
 
         if self._incoming_heartbeat_in_milis:
             self._update_incoming_heartbeat()
@@ -441,7 +451,7 @@ class AsyncDispatcher(object):
         self._frame_handler.handle_timeout(self)
 
     def popFrame(self):
-        return self._parser.popFrame()
+        return self._parser.pop_frame()
 
     def _update_outgoing_heartbeat(self):
         self._lastOutgoingTimeStamp = self._clock()
@@ -517,7 +527,7 @@ class AsyncDispatcher(object):
             return True
 
         if (self.next_check_interval() == 0):
-            self._frame_handler.queue_frame(_heartBeatFrame)
+            self._frame_handler.queue_frame(_heartbeat_frame)
             return True
 
         return False
@@ -526,7 +536,7 @@ class AsyncDispatcher(object):
         return not self._on_timeout
 
     def _milis(self):
-        return int(round(self._clock() * 1000))
+        return int(round(self._clock() * 1000))  # pylint: disable=W1633
 
     def handle_close(self, dispatcher):
         if not self._on_timeout:
@@ -598,7 +608,7 @@ class StompConnection(object):
 
     def _create_ssl_context(self):
         return SSLContext(key_file=pki.KEY_FILE, cert_file=pki.CERT_FILE,
-                          ca_certs=pki.CA_FILE, protocol=CLIENT_PROTOCOL)
+                          ca_certs=pki.CA_FILE)
 
     def send_raw(self, msg):
         self._async_client.queue_frame(msg)

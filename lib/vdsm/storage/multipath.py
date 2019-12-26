@@ -36,12 +36,12 @@ from vdsm.common import cmdutils
 from vdsm.common import commands
 from vdsm.common import supervdsm
 from vdsm.common import udevadm
+from vdsm.common.compat import subprocess
 from vdsm.config import config
 from vdsm.storage import devicemapper
 from vdsm.storage import hba
 from vdsm.storage import iscsi
 from vdsm.storage import managedvolumedb
-from vdsm.storage import misc
 
 DEV_ISCSI = "iSCSI"
 DEV_FCP = "FCP"
@@ -101,11 +101,14 @@ def resize_devices():
     The slaves can be bigger if the LUN size has been increased on the storage
     server after the initial discovery.
     """
-    for dmId, guid in getMPDevsIter():
-        try:
-            _resize_if_needed(guid)
-        except Exception:
-            log.exception("Could not resize device %s", guid)
+    log.info("Resizing multipath devices")
+    with utils.stopwatch(
+            "Resizing multipath devices", level=logging.INFO, log=log):
+        for dmId, guid in getMPDevsIter():
+            try:
+                _resize_if_needed(guid)
+            except Exception:
+                log.exception("Could not resize device %s", guid)
 
 
 def _resize_if_needed(guid):
@@ -127,27 +130,40 @@ def _resize_if_needed(guid):
 
     log.info("Resizing map %r (map_size=%d, slave_size=%d)",
              guid, map_size, slave_size)
-    supervdsm.getProxy().resizeMap(name)
+    resize_map(name)
     return True
 
 
-def _resize_map(name):
+def resize_map(name):
     """
     Invoke multipathd to resize a device
     Must run as root
 
     Raises Error if multipathd failed to resize the map.
     """
+    if os.geteuid() != 0:
+        return supervdsm.getProxy().multipath_resize_map(name)
+
     log.debug("Resizing map %r", name)
     cmd = [_MULTIPATHD.cmd, "resize", "map", name]
     with utils.stopwatch("Resized map %r" % name, log=log):
-        rc, out, err = commands.execCmd(cmd, raw=True, execCmdLogger=log)
-        # multipathd reports some errors using non-zero exit code and stderr
-        # (need to be root), but the command may return 0, and the result is
-        # reported using stdout.
-        if rc != 0 or out != "ok\n":
-            raise Error("Resizing map %r failed: out=%r err=%r"
-                        % (name, out, err))
+        p = commands.start(
+            cmd,
+            sudo=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        out, err = commands.communicate(p)
+
+        out = out.decode("utf-8")
+        err = err.decode("utf-8")
+
+        # multipathd reports some errors using non-zero exit code and
+        # stderr (need to be root), but the command may return 0, and
+        # the result is reported using stdout.
+        if p.returncode != 0 or out != "ok\n":
+            e = cmdutils.Error(cmd, p.returncode, out, err)
+            raise Error("Resizing map {!r} failed: {}".format(name, e))
 
 
 def deduceType(a, b):
@@ -184,7 +200,10 @@ def read_int(path):
     return int(data)
 
 
-def getScsiSerial(physdev):
+def get_scsi_serial(physdev):
+    if os.geteuid() != 0:
+        return supervdsm.getProxy().multipath_get_scsi_serial(physdev)
+
     blkdev = os.path.join("/dev", physdev)
     cmd = [_SCSI_ID.cmd,
            "--page=0x80",
@@ -192,12 +211,20 @@ def getScsiSerial(physdev):
            "--export",
            "--replace-whitespace",
            "--device=" + blkdev]
-    (rc, out, err) = misc.execCmd(cmd)
-    if rc == 0:
-        for line in out:
+
+    try:
+        out = commands.run(cmd)
+    except cmdutils.Error as e:
+        # Currently we haven't proper cleanup of LVs when we disconnect SD.
+        # This can result in keeping multipath devices without any valid path.
+        # For such devices scsi_id fails. Until we have proper cleanup in
+        # place, we ignore these failing devices.
+        log.debug("Ignoring scsi_id failure for device %s: %e", blkdev, e)
+    else:
+        for line in out.decode("utf-8").splitlines():
             if line.startswith("ID_SERIAL="):
-                return line.split("=")[1]
-    return ""
+                return line.split("=", 1)[1]
+    return ""  # Fallback if command failed or no ID_SERIAL found
 
 HBTL = namedtuple("HBTL", "host bus target lun")
 
@@ -228,10 +255,7 @@ def getHBTL(physdev):
 def pathListIter(filterGuids=()):
     filterLen = len(filterGuids) if filterGuids else -1
     devsFound = 0
-
     knownSessions = {}
-
-    svdsm = supervdsm.getProxy()
     pathStatuses = devicemapper.getPathsStatus()
 
     for dmId, guid in getMPDevsIter():
@@ -247,7 +271,7 @@ def pathListIter(filterGuids=()):
             "guid": guid,
             "dm": dmId,
             "capacity": str(getDeviceSize(dmId)),
-            "serial": svdsm.getScsiSerial(dmId),
+            "serial": get_scsi_serial(dmId),
             "paths": [],
             "connections": [],
             "devtypes": [],
@@ -308,7 +332,7 @@ def pathListIter(filterGuids=()):
                     pathInfo["lun"] = 0
                 else:
                     log.error("Error: %s while trying to get hbtl of device: "
-                              "%s", str(e.message), slave)
+                              "%s", e, slave)
                     raise
             else:
                 pathInfo["lun"] = hbtl.lun

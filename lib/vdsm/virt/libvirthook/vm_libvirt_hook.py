@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 
 # Copyright 2016-2019 Red Hat, Inc.
 #
@@ -24,12 +24,22 @@ from __future__ import absolute_import
 import sys
 import xml.etree.ElementTree as ET
 
+import six
+
 from vdsm.virt.vmdevices import storage
 
 
+# dynamic_ownership workaround (required for 4.2 incoming migrations)
+# not needed once we only support https://bugzilla.redhat.com/1666795
 def _process_domxml(tree):
-    for disk_type in (storage.DISK_TYPE.BLOCK, storage.DISK_TYPE.FILE,):
-        xpath = "./devices//disk[@type='%s']//source" % (disk_type,)
+    for xpath in (
+            "./devices//disk[@type='%s']//source" %
+            (storage.DISK_TYPE.BLOCK,),
+            "./devices//disk[@type='%s']//source" %
+            (storage.DISK_TYPE.FILE,),
+            "./devices//disk[@type='%s']//source[@protocol='gluster']" %
+            (storage.DISK_TYPE.NETWORK,)
+    ):
         for element in tree.findall(xpath):
             storage.disable_dynamic_ownership(element)
 
@@ -39,7 +49,8 @@ def main(domain, event, phase, stdin=sys.stdin, stdout=sys.stdout):
         sys.exit(0)
     tree = ET.parse(stdin)
     _process_domxml(tree)
-    tree.write(stdout)
+    encoding = None if six.PY2 else 'unicode'
+    tree.write(stdout, encoding=encoding)
 
 
 if __name__ == '__main__':

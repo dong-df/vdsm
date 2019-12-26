@@ -24,22 +24,23 @@ from __future__ import division
 import time
 import pytest
 from vdsm.common import concurrent
+from vdsm.common.units import MiB
 from vdsm.storage import clusterlock
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 
 from vdsm.storage.compat import sanlock
 
-LS_NAME = "sd-uuid"
+LS_NAME = b"sd-uuid"
 LS_PATH = "ids"
 LS_OFF = 0
 HOST_ID = 1
-LEASE = clusterlock.Lease("SDM", "leases", 1024**2)
+LEASE = clusterlock.Lease("SDM", "leases", MiB)
 
 
 @pytest.fixture
 def lock():
-    sanlock = clusterlock.SANLock(LS_NAME, LS_PATH, LEASE)
+    sanlock = clusterlock.SANLock(LS_NAME.decode("utf-8"), LS_PATH, LEASE)
     sanlock.initLock(LEASE)
     return sanlock
 

@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2017 Red Hat, Inc.
+# Copyright 2015-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,24 +20,27 @@
 
 from __future__ import absolute_import
 from __future__ import division
-import logging
+
 import errno
+import logging
+
 import six
 
 from vdsm.network import dns
-from vdsm.network.ip.address import ipv6_supported
+from vdsm.network import nmstate
 from vdsm.network.ip import dhclient
+from vdsm.network.ip.address import ipv6_supported
 from vdsm.network.ipwrapper import getLinks
 from vdsm.network.link import dpdk
 from vdsm.network.link import iface as link_iface
 from vdsm.network.netconfpersistence import RunningConfig
 
-from .addresses import getIpAddrs, getIpInfo, is_ipv6_local_auto
 from . import bonding
 from . import bridges
 from . import nics
-from .routes import get_routes, get_gateway, is_default_route
+from .addresses import getIpAddrs, getIpInfo, is_ipv6_local_auto
 from .qos import report_network_qos
+from .routes import get_routes, get_gateway, is_default_route
 
 
 # By default all networks are 'legacy', it can be optionaly changed to 'ovs' in
@@ -63,33 +66,127 @@ def _get(vdsmnets=None):
     devices_info = _devices_report(ipaddrs, routes)
     nets_info = _networks_report(vdsmnets, routes, ipaddrs, devices_info)
 
-    _update_dhcp_info(nets_info, devices_info)
+    add_qos_info_to_devices(nets_info, devices_info)
+
+    flat_devs_info = _get_flat_devs_info(devices_info)
+    devices = _get_dev_names(nets_info, flat_devs_info)
+    extra_info = {}
+    if nmstate.is_nmstate_backend():
+        extra_info.update(_get_devices_info_from_nmstate(devices))
+    else:
+        extra_info.update(dhclient.dhcp_info(devices))
+
+    _update_caps_info(nets_info, flat_devs_info, extra_info)
 
     networking_report = {'networks': nets_info}
     networking_report.update(devices_info)
-
-    networking_report['nameservers'] = dns.get_host_nameservers()
+    if nmstate.is_nmstate_backend():
+        networking_report['nameservers'] = nmstate.show_nameservers()
+    else:
+        networking_report['nameservers'] = dns.get_host_nameservers()
     networking_report['supportsIPv6'] = ipv6_supported()
 
     return networking_report
 
 
-def _update_dhcp_info(nets_info, devices_info):
-    """Update DHCP info for both networks and devices"""
+def add_qos_info_to_devices(nets_info, devices_info):
+    """ Update Qos data from networks on corresponding nic/bond """
 
-    net_ifaces = {net_info['iface'] for net_info in six.viewvalues(nets_info)}
-    flat_devs_info = {
+    qos_list = _get_qos_info_from_net(nets_info)
+    qos_list and _add_qos_info_to_southbound(qos_list, devices_info)
+
+
+def _get_qos_info_from_net(nets_info):
+    return [
+        dict(
+            host_qos=attrs['hostQos'],
+            southbound=attrs['southbound'],
+            net_name=net,
+        )
+        for net, attrs in six.viewitems(nets_info)
+        if 'hostQos' in attrs
+    ]
+
+
+def _add_qos_info_to_southbound(qos_list, devices_info):
+    for qos_dict in qos_list:
+        southbound = qos_dict['southbound']
+        host_qos = qos_dict['host_qos']
+        net_name = qos_dict['net_name']
+        vlan = '-1'
+
+        if southbound in devices_info['vlans']:
+            southbound, vlan = southbound.rsplit('.', 1)
+
+        if southbound in devices_info['nics']:
+            devices = devices_info['nics']
+        elif southbound in devices_info['bondings']:
+            devices = devices_info['bondings']
+        else:
+            logging.warning(
+                'Qos exists on network {},'
+                'but no corresponding nic/bond device ({})'
+                'was found'.format(net_name, southbound)
+            )
+            continue
+
+        devices_sb_info = devices[southbound]
+        sb_qos_info = devices_sb_info.get('qos')
+
+        if not sb_qos_info:
+            sb_qos_info = devices_sb_info['qos'] = []
+
+        qos_info = dict(hostQos=host_qos, vlan=int(vlan))
+
+        sb_qos_info.append(qos_info)
+
+    _sort_devices_qos_by_vlan(devices_info, 'nics')
+    _sort_devices_qos_by_vlan(devices_info, 'bondings')
+
+
+def _sort_devices_qos_by_vlan(devices_info, iface_type):
+    for iface_attrs in six.viewvalues(devices_info[iface_type]):
+        if 'qos' in iface_attrs:
+            iface_attrs['qos'].sort(key=lambda k: (k['vlan']))
+
+
+def _get_devices_info_from_nmstate(devices):
+    return {
+        ifname: {
+            dhclient.DHCP4: nmstate.is_dhcp_enabled(
+                ifstate, nmstate.Interface.IPV4
+            ),
+            dhclient.DHCP6: nmstate.is_dhcp_enabled(
+                ifstate, nmstate.Interface.IPV6
+            ),
+            'ipv6autoconf': nmstate.is_autoconf_enabled(ifstate),
+        }
+        for ifname, ifstate in six.viewitems(
+            nmstate.show_interfaces(filter=devices)
+        )
+    }
+
+
+def _update_caps_info(nets_info, flat_devs_info, extra_info):
+    for net_info in six.viewvalues(nets_info):
+        net_info.update(extra_info[net_info['iface']])
+
+    for devname, devinfo in six.viewitems(flat_devs_info):
+        devinfo.update(extra_info[devname])
+
+
+def _get_flat_devs_info(devices_info):
+    return {
         devname: devinfo
         for sub_devs in six.viewvalues(devices_info)
         for devname, devinfo in six.viewitems(sub_devs)
     }
-    dhcp_info = dhclient.dhcp_info(net_ifaces | frozenset(flat_devs_info))
 
-    for net_info in six.viewvalues(nets_info):
-        net_info.update(dhcp_info[net_info['iface']])
 
-    for devname, devinfo in six.viewitems(flat_devs_info):
-        devinfo.update(dhcp_info[devname])
+def _get_dev_names(nets_info, flat_devs_info):
+    return {
+        net_info['iface'] for net_info in six.viewvalues(nets_info)
+    } | frozenset(flat_devs_info)
 
 
 def _networks_report(vdsmnets, routes, ipaddrs, devices_info):
@@ -138,8 +235,10 @@ def _devices_report(ipaddrs, routes):
             devinfo.update(bonding.get_bond_agg_info(dev.name))
             devinfo.update(LEGACY_SWITCH)
         elif dev.isVLAN():
-            devinfo = devs_report['vlans'][dev.name] = {'iface': dev.device,
-                                                        'vlanid': dev.vlanid}
+            devinfo = devs_report['vlans'][dev.name] = {
+                'iface': dev.device,
+                'vlanid': dev.vlanid,
+            }
         else:
             continue
         devinfo.update(_devinfo(dev, routes, ipaddrs))
@@ -224,17 +323,20 @@ def libvirt_vdsm_nets(nets):
 def _devinfo(link, routes, ipaddrs):
     gateway = get_gateway(routes, link.name)
     ipv4addr, ipv4netmask, ipv4addrs, ipv6addrs = getIpInfo(
-        link.name, ipaddrs, gateway)
+        link.name, ipaddrs, gateway
+    )
 
-    return {'addr': ipv4addr,
-            'ipv4addrs': ipv4addrs,
-            'ipv6addrs': ipv6addrs,
-            'ipv6autoconf': is_ipv6_local_auto(link.name),
-            'gateway': gateway,
-            'ipv6gateway': get_gateway(routes, link.name, family=6),
-            'mtu': link.mtu,
-            'netmask': ipv4netmask,
-            'ipv4defaultroute': is_default_route(gateway, routes)}
+    return {
+        'addr': ipv4addr,
+        'ipv4addrs': ipv4addrs,
+        'ipv6addrs': ipv6addrs,
+        'ipv6autoconf': is_ipv6_local_auto(link.name),
+        'gateway': gateway,
+        'ipv6gateway': get_gateway(routes, link.name, family=6),
+        'mtu': link.mtu,
+        'netmask': ipv4netmask,
+        'ipv4defaultroute': is_default_route(gateway, routes),
+    }
 
 
 def _getNetInfo(iface, bridged, routes, ipaddrs):
@@ -243,8 +345,12 @@ def _getNetInfo(iface, bridged, routes, ipaddrs):
     data = {}
     try:
         if bridged:
-            data.update({'ports': bridges.ports(iface),
-                         'stp': bridges.stp_state(iface)})
+            data.update(
+                {
+                    'ports': bridges.ports(iface),
+                    'stp': bridges.stp_state(iface),
+                }
+            )
         else:
             # ovirt-engine-3.1 expects to see the "interface" attribute iff the
             # network is bridgeless. Please remove the attribute and this
@@ -253,17 +359,24 @@ def _getNetInfo(iface, bridged, routes, ipaddrs):
 
         gateway = get_gateway(routes, iface)
         ipv4addr, ipv4netmask, ipv4addrs, ipv6addrs = getIpInfo(
-            iface, ipaddrs, gateway)
+            iface, ipaddrs, gateway
+        )
 
-        data.update({'iface': iface, 'bridged': bridged,
-                     'addr': ipv4addr, 'netmask': ipv4netmask,
-                     'ipv4addrs': ipv4addrs,
-                     'ipv6addrs': ipv6addrs,
-                     'ipv6autoconf': is_ipv6_local_auto(iface),
-                     'gateway': gateway,
-                     'ipv6gateway': get_gateway(routes, iface, family=6),
-                     'ipv4defaultroute': is_default_route(gateway, routes),
-                     'mtu': link_iface.iface(iface).mtu()})
+        data.update(
+            {
+                'iface': iface,
+                'bridged': bridged,
+                'addr': ipv4addr,
+                'netmask': ipv4netmask,
+                'ipv4addrs': ipv4addrs,
+                'ipv6addrs': ipv6addrs,
+                'ipv6autoconf': is_ipv6_local_auto(iface),
+                'gateway': gateway,
+                'ipv6gateway': get_gateway(routes, iface, family=6),
+                'ipv4defaultroute': is_default_route(gateway, routes),
+                'mtu': link_iface.iface(iface).mtu(),
+            }
+        )
     except (IOError, OSError) as e:
         if e.errno == errno.ENOENT or e.errno == errno.ENODEV:
             logging.info('Obtaining info for net %s.', iface, exc_info=True)
@@ -302,8 +415,12 @@ class NetInfo(object):
     def getNetworkForIface(self, iface):
         """ Return the network attached to nic/bond """
         for network, netdict in six.iteritems(self.networks):
-            if ('ports' in netdict and iface in netdict['ports'] or
-                    'iface' in netdict and iface == netdict['iface']):
+            if (
+                'ports' in netdict
+                and iface in netdict['ports']
+                or 'iface' in netdict
+                and iface == netdict['iface']
+            ):
                 return network
 
     def getBridgedNetworkForIface(self, iface):
@@ -317,11 +434,15 @@ class NetInfo(object):
         return bondAttrs['slaves']
 
     def getBondingForNic(self, nic):
-        bondings = [b for (b, attrs) in six.iteritems(self.bondings) if
-                    nic in attrs['slaves']]
+        bondings = [
+            b
+            for (b, attrs) in six.iteritems(self.bondings)
+            if nic in attrs['slaves']
+        ]
         if bondings:
-            assert len(bondings) == 1, \
-                "Unexpected configuration: More than one bonding per nic"
+            assert (
+                len(bondings) == 1
+            ), "Unexpected configuration: More than one bonding per nic"
             return bondings[0]
         return None
 
@@ -361,8 +482,11 @@ class NetInfo(object):
             elif sb in self.nics:
                 lnics = [sb]
             vlanid = self.networks[network].get('vlanid')
-            vlan = ('%s.%s' % (bonding or lnics[0], vlanid)
-                    if vlanid is not None else None)
+            vlan = (
+                '%s.%s' % (bonding or lnics[0], vlanid)
+                if vlanid is not None
+                else None
+            )
 
         return lnics, vlan, vlanid, bonding
 

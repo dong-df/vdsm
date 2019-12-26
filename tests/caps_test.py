@@ -30,12 +30,14 @@ from testlib import VdsmTestCase as TestCaseBase
 from monkeypatch import MonkeyPatch
 
 from vdsm.host import caps
+from vdsm import cpuinfo
 from vdsm import numa
 from vdsm import machinetype
 from vdsm import osinfo
 from vdsm.common import cache
 from vdsm.common import commands
 from vdsm.common import cpuarch
+from vdsm.common import libvirtconnection
 
 
 def _getTestData(testFileName):
@@ -48,6 +50,34 @@ def _getTestData(testFileName):
 
 def _getCapsNumaDistanceTestData(testFileName):
     return (0, _getTestData(testFileName).splitlines(False), [])
+
+
+def _getLibvirtConnStub():
+    class ConnStub:
+        def getCapabilities(self):
+            return "<capabilities><host><cpu>" \
+                   "<counter name='tsc' frequency='1234000000'/>" \
+                   "</cpu></host></capabilities>"
+    return ConnStub()
+
+
+def _getLibvirtConnStubEmpty():
+    class ConnStub:
+        def getCapabilities(self):
+            return "<capabilities><host><cpu>" \
+                   "</cpu></host></capabilities>"
+    return ConnStub()
+
+
+def _getLibvirtConnStubForTscScaling(scaling):
+    class ConnStub:
+        def getCapabilities(self):
+            return "<capabilities><host><cpu>" \
+                   "<counter name='tsc' frequency='1234000000' scaling='" + \
+                   scaling + \
+                   "'/>" \
+                   "</cpu></host></capabilities>"
+    return ConnStub()
 
 
 class TestCaps(TestCaseBase):
@@ -252,3 +282,58 @@ class TestCaps(TestCaseBase):
         self.assertEqual(t.sockets, 1)
         self.assertEqual(t.online_cpus,
                          ['0', '1', '2', '3', '4', '5', '6', '7'])
+
+    @MonkeyPatch(libvirtconnection, 'get', _getLibvirtConnStub)
+    def test_getTscFrequency_libvirt(self):
+        freq = caps._getTscFrequency()
+        self.assertEqual(freq, "1234")
+
+    @MonkeyPatch(libvirtconnection, 'get', _getLibvirtConnStubEmpty)
+    def test_getTscFrequency_no_counter(self):
+        freq = caps._getTscFrequency()
+        self.assertEqual(freq, "")
+
+    @MonkeyPatch(commands, 'run', lambda x: b'crypto.fips_enabled = 1\n')
+    def test_getFipsEnabledOn(self):
+        self.assertTrue(caps._getFipsEnabled())
+
+    @MonkeyPatch(commands, 'run', lambda x: b'crypto.fips_enabled = 0\n')
+    def test_getFipsEnabledOff(self):
+        self.assertFalse(caps._getFipsEnabled())
+
+    # A hacky way to throw an exception from a lambda
+    @MonkeyPatch(commands, 'run',
+                 lambda x: (_ for _ in ()).throw(Exception("A problem")))
+    def test_getFipsEnabledOffWhenError(self):
+        self.assertFalse(caps._getFipsEnabled())
+
+    @MonkeyPatch(libvirtconnection, 'get',
+                 lambda: _getLibvirtConnStubForTscScaling('yes'))
+    def test_getTscScalingYes(self):
+        scaling = caps._getTscScaling()
+        self.assertTrue(scaling)
+
+    @MonkeyPatch(libvirtconnection, 'get',
+                 lambda: _getLibvirtConnStubForTscScaling('no'))
+    def test_getTscScalingNo(self):
+        scaling = caps._getTscScaling()
+        self.assertFalse(scaling)
+
+    @MonkeyPatch(cpuinfo, 'flags', lambda: ['flag_1', 'flag_2', 'flag_3'])
+    @MonkeyPatch(machinetype, 'cpu_features',
+                 lambda: ['flag_3', 'feature_1', 'feature_2'])
+    @MonkeyPatch(machinetype, 'compatible_cpu_models', lambda: [])
+    def test_getFlagsAndFeatures(self):
+        flags = caps._getFlagsAndFeatures()
+        expected = ['flag_1', 'flag_2', 'flag_3', 'feature_1', 'feature_2']
+        self.assertEqual(5, len(flags))
+        self.assertTrue(all([x in flags for x in expected]))
+
+    @MonkeyPatch(cpuinfo, 'flags', lambda: ['flag_1', 'flag_2', 'flag_3'])
+    @MonkeyPatch(machinetype, 'cpu_features', lambda: [])
+    @MonkeyPatch(machinetype, 'compatible_cpu_models', lambda: [])
+    def test_getFlagsAndFeaturesEmptyFeatures(self):
+        flags = caps._getFlagsAndFeatures()
+        expected = ['flag_1', 'flag_2', 'flag_3']
+        self.assertEqual(3, len(flags))
+        self.assertTrue(all([x in flags for x in expected]))

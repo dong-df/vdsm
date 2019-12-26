@@ -43,17 +43,12 @@ SUBDIRS += \
 	extra_ipv4_addrs \
 	fileinject \
 	fakevmstats \
-	floppy \
 	httpsisoboot \
 	macbind \
 	nestedvt \
-	numa \
-	pincpu \
-	promisc \
 	scratchpad \
 	smbios \
 	spiceoptions \
-	vmdisk \
 	$(NULL)
 endif
 

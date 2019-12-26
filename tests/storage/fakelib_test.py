@@ -24,6 +24,7 @@ from contextlib import contextmanager
 import os
 
 from vdsm import utils
+from vdsm.common.units import MiB
 from vdsm.storage import blockSD
 from vdsm.storage import exception as se
 from vdsm.storage import constants as sc
@@ -42,9 +43,6 @@ from storage.storagetestlib import (
     FakeSD,
     FakeVolume,
 )
-
-
-MB = 1024 ** 2
 
 
 class TestFakeLVMSimpleVG(VdsmTestCase):
@@ -200,12 +198,12 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
     def test_lv_create_round_up_size(self):
         with self.base_config() as lvm:
             vg = lvm.getVG(self.VG_NAME)
-            extent_size_mb = int(vg.extent_size) // MB
+            extent_size_mb = int(vg.extent_size) // MiB
             odd_size_mb = extent_size_mb - 1
             lvm.createLV(self.VG_NAME, self.LV_NAME, odd_size_mb)
             rounded_up_size_mb = utils.round(odd_size_mb, extent_size_mb)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            self.assertEqual(int(lv.size), rounded_up_size_mb * MB)
+            self.assertEqual(int(lv.size), rounded_up_size_mb * MiB)
 
     def test_lv_no_activate(self):
         """
@@ -271,8 +269,8 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
                          initialTags=(sc.TAG_VOL_UNINIT,))
             deltags = (sc.TAG_VOL_UNINIT,)
             addtags = ("FOO",)
-            lvm.changeLVTags(self.VG_NAME, self.LV_NAME,
-                             delTags=deltags, addTags=addtags)
+            lvm.changeLVsTags(self.VG_NAME, (self.LV_NAME,),
+                              delTags=deltags, addTags=addtags)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
             self.assertEqual(addtags, lv.tags)
 
@@ -346,11 +344,11 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
                          activate=False)
             vg = lvm.getVG(self.VG_NAME)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            extent_size_mb = int(vg.extent_size) // MB
-            new_size_mb = int(lv.size) // MB + extent_size_mb
+            extent_size_mb = int(vg.extent_size) // MiB
+            new_size_mb = int(lv.size) // MiB + extent_size_mb
             lvm.extendLV(self.VG_NAME, self.LV_NAME, new_size_mb)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            self.assertEqual(int(lv.size), new_size_mb * MB)
+            self.assertEqual(int(lv.size), new_size_mb * MiB)
 
     def test_extend_lv_resize_not_needed(self):
         with self.base_config() as lvm:
@@ -358,12 +356,12 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
                          activate=False)
             vg = lvm.getVG(self.VG_NAME)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            extent_size_mb = int(vg.extent_size) // MB
-            orig_size_mb = int(lv.size) // MB
+            extent_size_mb = int(vg.extent_size) // MiB
+            orig_size_mb = int(lv.size) // MiB
             new_size_mb = orig_size_mb - extent_size_mb
             lvm.extendLV(self.VG_NAME, self.LV_NAME, new_size_mb)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            self.assertEqual(int(lv.size), orig_size_mb * MB)
+            self.assertEqual(int(lv.size), orig_size_mb * MiB)
 
     def test_extend_lv_round_up_to_extent_size(self):
         with self.base_config() as lvm:
@@ -371,12 +369,12 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
                          activate=False)
             vg = lvm.getVG(self.VG_NAME)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            extent_size_mb = int(vg.extent_size) // MB
-            new_size_mb = int(lv.size) // MB + 1
-            expected_size_mb = int(lv.size) // MB + extent_size_mb
+            extent_size_mb = int(vg.extent_size) // MiB
+            new_size_mb = int(lv.size) // MiB + 1
+            expected_size_mb = int(lv.size) // MiB + extent_size_mb
             lvm.extendLV(self.VG_NAME, self.LV_NAME, new_size_mb)
             lv = lvm.getLV(self.VG_NAME, self.LV_NAME)
-            self.assertEqual(int(lv.size), expected_size_mb * MB)
+            self.assertEqual(int(lv.size), expected_size_mb * MiB)
 
     def test_lv_io(self):
         with self.base_config() as lvm:
@@ -384,7 +382,7 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
             lvm.createLV(self.VG_NAME, self.LV_NAME, self.LV_SIZE_MB,
                          activate=True)
             lv_path = lvm.lvPath(self.VG_NAME, self.LV_NAME)
-            self.assertEqual(MB * self.LV_SIZE_MB,
+            self.assertEqual(MiB * self.LV_SIZE_MB,
                              os.stat(lv_path).st_size)
             with open(lv_path, 'w') as f:
                 f.write(msg)
@@ -402,7 +400,7 @@ class TestFakeLVMSimpleVG(VdsmTestCase):
     def test_lvsbytag(self):
         with self.base_config() as lvm:
             lvm.createLV(self.VG_NAME, self.LV_NAME, self.LV_SIZE_MB)
-            lvm.changeLVTags(self.VG_NAME, self.LV_NAME, addTags=('foo',))
+            lvm.changeLVsTags(self.VG_NAME, (self.LV_NAME,), addTags=('foo',))
             lvs = lvm.lvsByTag(self.VG_NAME, 'foo')
             self.assertEqual(1, len(lvs))
             self.assertEqual(self.LV_NAME, lvs[0].name)
@@ -423,11 +421,10 @@ class TestFakeLVMGeneral(VdsmTestCase):
     @permutations([
         [se.VolumeGroupDoesNotExist, 'getVG', ['vg']],
         [se.CannotActivateLogicalVolume, 'activateLVs', ['vg', ['lv']]],
-        [se.MissingTagOnLogicalVolume, 'addtag', ['vg', 'lv', 'tag']],
         [se.CannotCreateLogicalVolume, 'createLV', ['vg', 'lv', 1024]],
         [se.LogicalVolumeDoesNotExistError, 'getLV', ['vg', 'lv']],
         [se.InaccessiblePhysDev, 'getPV', ['pv']],
-        [se.LogicalVolumeReplaceTagError, 'changeLVTags', ['vg', 'lv']],
+        [se.LogicalVolumeReplaceTagError, 'changeLVsTags', ['vg', '(lv,)']],
     ])
     def test_bad_args(self, exception, fn, args):
         with namedTemporaryDir() as tmpdir:
@@ -445,7 +442,7 @@ class TestFakeLVMGeneral(VdsmTestCase):
                          blockSD.VG_METADATASIZE)
             lvm.createLV(vg_name, lv_name, sc.VG_EXTENT_SIZE_MB - 1)
             lv = lvm.getLV(vg_name, lv_name)
-            self.assertEqual(sc.VG_EXTENT_SIZE_MB * MB, int(lv.size))
+            self.assertEqual(sc.VG_EXTENT_SIZE_MB * MiB, int(lv.size))
 
 
 class TestFakeResourceManager(VdsmTestCase):

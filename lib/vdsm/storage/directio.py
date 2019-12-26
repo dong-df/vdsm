@@ -27,6 +27,8 @@ import os
 from contextlib import closing
 from contextlib import contextmanager
 
+from vdsm.common.units import KiB
+
 log = logging.getLogger('storage.directio')
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -124,11 +126,14 @@ class DirectFile(object):
             libc.free(pbuff)
 
     def read(self, n=-1):
-        if (n < 0):
+        if n < 0:
             return self.readall()
 
-        if (n % 512):
-            raise ValueError("You can only read in 512 multiplies")
+        # TODO: This code is wrong, we should use block size here,
+        #  which should be set in __init__.
+        #  This is part of 4k support for block storage which is not done yet.
+        if n % 512:
+            raise ValueError("You can only read in 512 multiples")
 
         with self._createAlignedBuffer(n) as pbuff:
             numRead = libc.read(self._fd, pbuff, n)
@@ -141,7 +146,8 @@ class DirectFile(object):
             return ptr[:numRead]
 
     def readall(self):
-        buffsize = 1024
+        # TODO: This is pretty bad buffer size, needs to be improved.
+        buffsize = KiB
         res = io.BytesIO()
         with closing(res):
             while True:
@@ -152,8 +158,11 @@ class DirectFile(object):
 
     def write(self, data):
         length = len(data)
+        # TODO: This code is wrong, we should use block size here,
+        #  which should be set in __init__.
+        #  This is part of 4k support for block storage which is not done yet.
         if length % 512:
-            raise ValueError("You can only write in 512 multiplies")
+            raise ValueError("You can only write in 512 multiples")
         pdata = ctypes.c_char_p(data)
         with self._createAlignedBuffer(length) as pbuff:
             ctypes.memmove(pbuff, pdata, len(data))

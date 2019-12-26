@@ -52,8 +52,8 @@ class LocalFsStorageDomainManifest(fileSD.FileStorageDomainManifest):
 class LocalFsStorageDomain(fileSD.FileStorageDomain):
     manifestClass = LocalFsStorageDomainManifest
 
-    supported_block_size = (sc.BLOCK_SIZE_512,)
-    supported_alignment = (sc.ALIGNMENT_1M,)
+    supported_block_size = (
+        sc.BLOCK_SIZE_AUTO, sc.BLOCK_SIZE_512, sc.BLOCK_SIZE_4K)
 
     @property
     def supportsMailbox(self):
@@ -65,10 +65,9 @@ class LocalFsStorageDomain(fileSD.FileStorageDomain):
         if os.path.abspath(typeSpecificArg) != typeSpecificArg:
             raise se.StorageDomainIllegalRemotePath(typeSpecificArg)
 
-        fileSD.validateDirAccess(domPath)
-        fileSD.validateFileSystemFeatures(sdUUID, domPath)
+        cls.validate_version(version)
 
-        sd.validateDomainVersion(version)
+        fileSD.validateDirAccess(domPath)
 
         # Make sure there are no remnants of other domain
         mdpat = os.path.join(domPath, "*", sd.DOMAIN_META_DATA)
@@ -78,7 +77,7 @@ class LocalFsStorageDomain(fileSD.FileStorageDomain):
     @classmethod
     def create(cls, sdUUID, domainName, domClass, remotePath, storageType,
                version, block_size=sc.BLOCK_SIZE_512,
-               alignment=sc.ALIGNMENT_1M):
+               max_hosts=sc.HOSTS_4K_1M):
         """
         Create new storage domain
 
@@ -91,15 +90,11 @@ class LocalFsStorageDomain(fileSD.FileStorageDomain):
             version (int): DOMAIN_VERSIONS
             block_size (int): Underlying storage block size.
                 Supported value is BLOCK_SIZE_512
-            alignment (int): Sanlock alignment to use for this storage domain.
-                Supported value is ALIGN_1M
+            max_hosts (int): Maximum number of hosts accessing this domain,
+                default to sc.HOSTS_4K_1M.
         """
-        cls.log.info("sdUUID=%s domainName=%s remotePath=%s "
-                     "domClass=%s, block_size=%s, alignment=%s",
-                     sdUUID, domainName, remotePath, domClass,
-                     block_size, alignment)
-
-        cls._validate_block_and_alignment(block_size, alignment, version)
+        cls._validate_block_size(block_size, version)
+        cls.validate_version(version)
 
         if not misc.isAscii(domainName) and not sd.supportsUnicode(version):
             raise se.UnicodeArgumentException()
@@ -110,6 +105,12 @@ class LocalFsStorageDomain(fileSD.FileStorageDomain):
         mntPoint = os.path.join(sc.REPO_MOUNT_DIR, mntPath)
 
         cls._preCreateValidation(sdUUID, mntPoint, remotePath, version)
+
+        storage_block_size = cls._detect_block_size(sdUUID, mntPoint)
+        block_size = cls._validate_storage_block_size(
+            block_size, storage_block_size)
+
+        alignment = clusterlock.alignment(block_size, max_hosts)
 
         domainDir = os.path.join(mntPoint, sdUUID)
         cls._prepareMetadata(domainDir, sdUUID, domainName, domClass,

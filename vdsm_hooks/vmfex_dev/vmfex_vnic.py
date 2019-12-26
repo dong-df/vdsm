@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 #
 # Copyright 2013 Red Hat, Inc.
 #
@@ -18,6 +18,7 @@
 #
 # Refer to the README and COPYING files for full details of the license
 #
+
 """
 Modify a network interface definition so that it uses a Cisco VM-FEX Port
 Profile with a Virtual Function from a pool. It gets triggered and used by two
@@ -25,7 +26,10 @@ different events:
     * before_device_create
     * before_nic_hotplug
 """
+
+from __future__ import absolute_import
 from __future__ import print_function
+
 from xml.dom import minidom
 import fcntl
 import os

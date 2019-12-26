@@ -23,6 +23,8 @@ import os
 import logging
 import threading
 
+import six
+
 from vdsm.config import config
 from vdsm.storage import exception as se
 from vdsm.storage.task import Task, Job, TaskCleanType
@@ -77,31 +79,24 @@ class TaskManager:
         task.addJob(Job(jobName, func, *args))
         self.log.debug("scheduled job %s for task %s ", jobName, task.id)
 
-    def __getTask(self, taskID):
+    def _getTask(self, taskID):
         Task.validateID(taskID)
         t = self._tasks.get(taskID, None)
         if t is None:
             raise se.UnknownTask(taskID)
         return t
 
-    def prepareForShutdown(self):
-        """ Prepare to shutdown. Stop all threads and asynchronous tasks
+    def prepareForShutdown(self, wait=False):
+        """ Prepare to shutdown and stop all threads.
         """
-        self.log.debug("Request to stop all tasks")
-
-        # Clear the task queue and terminate all pooled threads
-        for t in self._tasks:
-            if hasattr(t, 'stop'):
-                t.stop()
-            self.log.info(str(t))
-
-        self.tp.joinAll(waitForTasks=False, waitForThreads=False)
+        self.log.debug("Request to stop all threads (wait=%s)", wait)
+        self.tp.joinAll(waitForThreads=wait)
 
     def getTaskStatus(self, taskID):
         """ Internal return Task status for a given task.
         """
         self.log.debug("Entry. taskID: %s", taskID)
-        t = self.__getTask(taskID)
+        t = self._getTask(taskID)
         status = t.deprecated_getStatus()
         self.log.debug("Return. Response: %s", status)
         return status
@@ -144,7 +139,7 @@ class TaskManager:
         Remove Tasks from managed tasks list
         """
         self.log.debug("Entry.")
-        for taskID, task in self._tasks.items():
+        for taskID, task in list(six.iteritems(self._tasks)):
             if not tag or tag in task.getTags():
                 self._tasks.pop(taskID, None)
         self.log.debug("Return")
@@ -153,7 +148,7 @@ class TaskManager:
         """ Stop a task according to given uuid.
         """
         self.log.debug("Entry. taskID: %s", taskID)
-        t = self.__getTask(taskID)
+        t = self._getTask(taskID)
         t.stop(force=force)
         self.log.debug("Return.")
         return True
@@ -161,7 +156,7 @@ class TaskManager:
     def revertTask(self, taskID):
         self.log.debug("Entry. taskID: %s", taskID)
         # TODO: Should we stop here implicitly ???
-        t = self.__getTask(taskID)
+        t = self._getTask(taskID)
         t.rollback()
         self.log.debug("Return.")
 
@@ -170,7 +165,7 @@ class TaskManager:
         """
         self.log.debug("Entry. taskID: %s", taskID)
         # TODO: Should we stop here implicitly ???
-        t = self.__getTask(taskID)
+        t = self._getTask(taskID)
         t.clean()
         del self._tasks[taskID]
         self.log.debug("Return.")
@@ -179,7 +174,7 @@ class TaskManager:
         """ Return task's data according to given uuid.
         """
         self.log.debug("Entry. taskID: %s", taskID)
-        t = self.__getTask(taskID)
+        t = self._getTask(taskID)
         info = t.getInfo()
         self.log.debug("Return. Response: %s", info)
         return info

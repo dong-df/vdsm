@@ -217,7 +217,7 @@ class Drive(core.Base):
                            'readonly': str(readonly)}
                 if bootOrder:
                     diskDev['bootOrder'] = bootOrder
-                vm.log.warn('Found unknown drive: %s', diskDev)
+                vm.log.warning('Found unknown drive: %s', diskDev)
                 vm.conf['devices'].append(diskDev)
 
     def __init__(self, log, **kwargs):
@@ -941,6 +941,17 @@ def disable_dynamic_ownership(element):
     seclabel.set('relabel', 'no')
     seclabel.set('model', 'dac')
     element.append(seclabel)
+
+
+def is_payload_drive(drive):
+    """
+    Return true iff the given disk device is a payload device.
+
+    Arguments:
+      drive: 'Drive' instance
+    """
+    return (hasattr(drive, 'specParams') and
+            'vmPayload' in drive.specParams)
 
 
 def _getSourceXML(drive):

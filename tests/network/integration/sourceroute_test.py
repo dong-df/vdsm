@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2018 Red Hat, Inc.
+# Copyright 2014-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,7 +25,7 @@ from contextlib import contextmanager
 import os
 import unittest
 
-from network import TESTS_STATIC_PATH
+import network as network_tests
 from network.compat import mock
 from network.nettestlib import dummy_device
 
@@ -42,6 +42,10 @@ IPV4_GW = '192.168.99.2'
 IPV4_MASK = 29
 IPv4_NET = '192.168.99.0/29'
 IPV4_TABLE = '3232260865'
+
+TESTS_STATIC_PATH = os.path.join(
+    os.path.dirname(network_tests.__file__), 'static'
+)
 
 
 def _routeShowTableAll(table):
@@ -62,13 +66,13 @@ class TestFilters(unittest.TestCase):
 
 
 class TestSourceRoute(unittest.TestCase):
-
     def test_sourceroute_add_remove_and_read(self):
         with dummy_device() as nic:
             addrAdd(nic, IPV4_ADDRESS, IPV4_MASK)
 
-            with create_sourceroute(device=nic, ip=IPV4_ADDRESS,
-                                    mask=IPV4_MASK, gateway=IPV4_GW):
+            with create_sourceroute(
+                device=nic, ip=IPV4_ADDRESS, mask=IPV4_MASK, gateway=IPV4_GW
+            ):
                 dsroute = DynamicSourceRoute(nic, None, None, None)
                 routes, rules = dsroute.current_srconfig()
 
@@ -92,8 +96,9 @@ class TestSourceRoute(unittest.TestCase):
         with dummy_device() as nic:
             addrAdd(nic, IPV4_ADDRESS, IPV4_MASK)
 
-            with create_sourceroute(device=nic, ip=IPV4_ADDRESS,
-                                    mask=IPV4_MASK, gateway=IPV4_GW):
+            with create_sourceroute(
+                device=nic, ip=IPV4_ADDRESS, mask=IPV4_MASK, gateway=IPV4_GW
+            ):
                 sourceroute.add(nic, IPV4_ADDRESS, IPV4_MASK, IPV4_GW)
 
 

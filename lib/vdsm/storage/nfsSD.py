@@ -22,6 +22,7 @@ from __future__ import absolute_import
 
 import os
 
+from vdsm.storage import clusterlock
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fileSD
@@ -36,7 +37,6 @@ class NfsStorageDomain(fileSD.FileStorageDomain):
 
     # This storage domain supports only 512b block size and 1M alignment.
     supported_block_size = (sc.BLOCK_SIZE_512,)
-    supported_alignment = (sc.ALIGNMENT_1M,)
 
     @classmethod
     def _preCreateValidation(cls, sdUUID, domPath, typeSpecificArg,
@@ -46,14 +46,13 @@ class NfsStorageDomain(fileSD.FileStorageDomain):
         if storageType == sd.NFS_DOMAIN and ":" not in typeSpecificArg:
             raise se.StorageDomainIllegalRemotePath(typeSpecificArg)
 
-        sd.validateDomainVersion(version)
+        cls.validate_version(version)
 
         # Make sure the underlying file system is mounted
         if not mount.isMounted(domPath):
             raise se.StorageDomainFSNotMounted(domPath)
 
         fileSD.validateDirAccess(domPath)
-        fileSD.validateFileSystemFeatures(sdUUID, domPath)
 
         # Make sure there are no remnants of other domain
         mdpat = os.path.join(domPath, "*", sd.DOMAIN_META_DATA)
@@ -63,7 +62,7 @@ class NfsStorageDomain(fileSD.FileStorageDomain):
     @classmethod
     def create(cls, sdUUID, domainName, domClass, remotePath, storageType,
                version, block_size=sc.BLOCK_SIZE_512,
-               alignment=sc.ALIGNMENT_1M):
+               max_hosts=sc.HOSTS_4K_1M):
         """
         Create new storage domain
 
@@ -76,16 +75,11 @@ class NfsStorageDomain(fileSD.FileStorageDomain):
             version (int): DOMAIN_VERSIONS,
             block_size (int): Underlying storage block size.
                 Supported value is BLOCK_SIZE_512
-            alignment (int): Sanlock alignment in bytes to use for
-                this storage domain.
-                Supported value is ALIGN_1M
+            max_hosts (int): Maximum number of hosts accessing this domain,
+                default to sc.HOSTS_4K_1M.
         """
-        cls.log.info("sdUUID=%s domainName=%s remotePath=%s "
-                     "domClass=%s, block_size=%s, alignment=%s",
-                     sdUUID, domainName, remotePath, domClass,
-                     block_size, alignment)
-
-        cls._validate_block_and_alignment(block_size, alignment, version)
+        cls._validate_block_size(block_size, version)
+        cls.validate_version(version)
 
         remotePath = fileUtils.normalize_path(remotePath)
 
@@ -99,6 +93,12 @@ class NfsStorageDomain(fileSD.FileStorageDomain):
 
         cls._preCreateValidation(sdUUID, mntPoint, remotePath, storageType,
                                  version)
+
+        storage_block_size = cls._detect_block_size(sdUUID, mntPoint)
+        block_size = cls._validate_storage_block_size(
+            block_size, storage_block_size)
+
+        alignment = clusterlock.alignment(block_size, max_hosts)
 
         domainDir = os.path.join(mntPoint, sdUUID)
         cls._prepareMetadata(domainDir, sdUUID, domainName, domClass,

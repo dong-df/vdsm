@@ -22,7 +22,6 @@ from __future__ import division
 from contextlib import contextmanager
 from functools import wraps
 import json
-import re
 import os.path
 
 import netaddr
@@ -35,24 +34,20 @@ from vdsm.network import netswitch
 from vdsm.network.ip import dhclient
 from vdsm.network.ipwrapper import (
     routeExists, ruleExists, addrFlush, LinkType, getLinks, routeShowTable,
-    linkDel, linkSet, addrAdd)
+    linkSet, addrAdd)
 from vdsm.network import kernelconfig
-from vdsm.network.netconfpersistence import PersistentConfig, RunningConfig
 from vdsm.network.link.bond.sysfs_driver import BONDING_MASTERS
 from vdsm.network.netinfo.bonding import BONDING_SLAVES
 from vdsm.network.netinfo.misc import NET_CONF_PREF
 from vdsm.network.netinfo.nics import operstate, OPERSTATE_UNKNOWN
 from vdsm.network.netinfo.routes import getRouteDeviceTo
 from vdsm.network.netlink import monitor
-from vdsm.network.configurators.ifcfg import stop_devices, NET_CONF_BACK_DIR
 from vdsm.network import sourceroute
 from vdsm.network import sysctl
-from vdsm.network import tc
 
 from vdsm.common.cmdutils import CommandPath
 from vdsm.common import commands
 from vdsm.common.proc import pgrep
-from vdsm.tool import service
 from vdsm.utils import RollbackContext
 
 from hookValidation import ValidatesHook
@@ -60,7 +55,7 @@ from hookValidation import ValidatesHook
 from modprobe import RequireDummyMod, RequireVethMod
 from testlib import (VdsmTestCase as TestCaseBase, namedTemporaryDir,
                      expandPermutations, permutations)
-from testValidation import brokentest, slowtest, ValidateRunningAsRoot
+from testValidation import slowtest, ValidateRunningAsRoot
 from network.nettestlib import Dummy, veth_pair, dnsmasq_run, running
 from network import dhcp
 from .utils import SUCCESS, getProxy
@@ -311,15 +306,6 @@ class NetworkTest(TestCaseBase):
             active_opts = self._get_active_bond_opts(bondName)
             self.assertTrue(set(options.split()) <= set(active_opts))
 
-    def _assert_exact_bond_opts(self, bond, opts):
-        """:param opts: list of strings e.g. ['miimon=150', 'mode=4']"""
-        # TODO: we should try and call this logic always during
-        # TODO: assertBondExists and be stricter. Will probably need to fix a
-        # TODO: few tests
-        self.assertEqual(
-            set(self._get_active_bond_opts(bond)) - set(["mode=0"]),
-            set(opts) - set(["mode=0"]))
-
     def _get_active_bond_opts(self, bondName):
         netinfo = self.vdsm_net.netinfo
         active_options = [opt + '=' + val for (opt, val)
@@ -406,430 +392,8 @@ class NetworkTest(TestCaseBase):
         self.assertEqual(running_config['bonds'], kernel_config['bonds'])
 
     @cleanupNet
-    @RequireVethMod
-    @ValidateRunningAsRoot
-    @brokentest('This test fails because of #1261457')
-    def test_getVdsStats(self):
-        """This Test will send an ARP request on a created veth interface
-        and checks that the TX bytes is in range between 42 and 384 bytes
-        the range is set due to DHCP packets that may corrupt the statistics"""
-        # TODO disable DHCP service on the veth
-        ARP_REQUEST_SIZE = 42
-        DHCP_PACKET_SIZE = 342
-
-        def assertTestDevStatsReported():
-            status, msg, hostStats = self.vdsm_net.getVdsStats()
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertIn('network', hostStats)
-            self.assertIn(
-                left, hostStats['network'], 'could not find veth %s' % left)
-
-        def getStatsFromInterface(iface):
-            status, msg, hostStats = self.vdsm_net.getVdsStats()
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertIn('network', hostStats)
-            self.assertIn(iface, hostStats['network'])
-            self.assertIn('tx', hostStats['network'][iface])
-            self.assertIn('rx', hostStats['network'][iface])
-            self.assertIn('sampleTime', hostStats['network'][iface])
-            return (int(hostStats['network'][iface]['tx']),
-                    hostStats['network'][iface]['sampleTime'])
-
-        def assertStatsInRange():
-            curTxStat, curTime = getStatsFromInterface(left)
-            self.assertTrue(
-                curTime > prevTime,
-                'sampleTime is not monotonically increasing')
-
-            diff = (curTxStat - prevTxStat)
-            self.assertTrue(ARP_REQUEST_SIZE <= diff <=
-                            (ARP_REQUEST_SIZE + DHCP_PACKET_SIZE),
-                            '%s is out of range' % diff)
-
-        with veth_pair() as (left, right):
-            # disabling IPv6 on Interface for removal of Router Solicitation
-            sysctl.disable_ipv6(left)
-            sysctl.disable_ipv6(right)
-            linkSet(left, ['up'])
-            linkSet(right, ['up'])
-
-            # Vdsm scans for new devices every 15 seconds
-            self.retryAssert(
-                assertTestDevStatsReported, timeout=20)
-
-            prevTxStat, prevTime = getStatsFromInterface(left)
-            # running ARP from the interface
-            try:
-                commands.run([_ARPPING_COMMAND.cmd, '-D', '-I', left,
-                              '-c', '1', IP_ADDRESS_IN_NETWORK])
-            except Exception as e:
-                raise SkipTest('Could not run arping: %s' % e)
-
-            # wait for Vdsm to update statistics
-            self.retryAssert(assertStatsInRange, timeout=3)
-
-    @cleanupNet
-    @permutations([[True], [False]])
-    def testSafeNetworkConfig(self, bridged):
-        """
-        Checks that setSafeNetworkConfig saves
-        the configuration between restart.
-        """
-        with dummyIf(1) as nics:
-            nic, = nics
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: {'nic': nic, 'bridged': bridged}}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-
-            self.assertNetworkExists(NETWORK_NAME, bridged=bridged)
-
-            self.vdsm_net.save_config()
-
-            self.vdsm_net.restoreNetConfig()
-
-            self.assertNetworkExists(NETWORK_NAME, bridged=bridged)
-
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: {'remove': True}}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-
-            self.vdsm_net.save_config()
-
-    @requiresUnifiedPersistence("with ifcfg persistence, this test is "
-                                "irrelevant")
-    @cleanupNet
-    @RequireVethMod
-    @ValidateRunningAsRoot
-    def testRestoreToBlockingDHCP(self):
-        """
-        Test that restoration of dhcp based network is done synchronously.
-        With ifcfg persistence, this is what happens thanks to initscripts,
-        regardless of vdsm. Hence, this test is irrelevant there.
-        """
-        with veth_pair() as (server, client):
-            addrAdd(server, IP_ADDRESS, IP_CIDR)
-            linkSet(server, ['up'])
-            dhcp_async_net = {'nic': client, 'bridged': False,
-                              'bootproto': 'dhcp', 'blockingdhcp': False}
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: dhcp_async_net}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-
-            self.assertNetworkExists(NETWORK_NAME)
-
-            self.vdsm_net.save_config()
-
-            # Take dhcp down so restoration will take place.
-            dhclient.kill(client)
-
-            # Attempt to restore network without dhcp server.
-            # As we expect blockingdhcp to be set, it should fail the setup.
-            self.vdsm_net.restoreNetConfig()
-            self.assertNetworkDoesntExist(NETWORK_NAME)
-
-            # cleanup
-            PersistentConfig().delete()
-
-    @requiresUnifiedPersistence("with ifcfg persistence, "
-                                "restoreNetConfig selective restoration"
-                                "is not supported")
-    @cleanupNet
-    def testRestoreNetworksOnlyRestoreUnchangedDevices(self):
-        BOND_UNCHANGED = 'bond100'
-        BOND_MISSING = 'bond102'
-        IP_ADD_UNCHANGED = '240.0.0.100'
-        VLAN_UNCHANGED = 100
-        NET_UNCHANGED = NETWORK_NAME + '100'
-        NET_CHANGED = NETWORK_NAME + '108'
-        NET_MISSING = NETWORK_NAME + '116'
-        IP_ADDR_NET_CHANGED = '240.0.0.108'
-        IP_ADDR_MISSING = '204.0.0.116'
-        IP_NETMASK = '255.255.255.248'
-        IP_GATEWAY = '240.0.0.102'
-        nets = {
-            NET_UNCHANGED: {
-                'bootproto': 'none', 'ipaddr': IP_ADD_UNCHANGED,
-                'vlan': str(VLAN_UNCHANGED), 'netmask': IP_NETMASK,
-                'gateway': IP_GATEWAY,
-                'bonding': BOND_UNCHANGED, 'defaultRoute': True},
-            NET_CHANGED: {
-                'bootproto': 'none',
-                'ipaddr': IP_ADDR_NET_CHANGED,
-                'vlan': str(VLAN_UNCHANGED + 1),
-                'netmask': IP_NETMASK, 'bonding': BOND_UNCHANGED,
-                'defaultRoute': False},
-            NET_MISSING: {
-                'bootproto': 'none',
-                'ipaddr': IP_ADDR_MISSING,
-                'vlan': str(VLAN_UNCHANGED + 2),
-                'netmask': IP_NETMASK, 'bonding': BOND_MISSING},
-        }
-
-        def _assert_all_nets_exist():
-            self.vdsm_net.refreshNetinfo()
-            self.assertNetworkExists(NET_UNCHANGED)
-            self.assertNetworkExists(NET_CHANGED)
-            self.assertNetworkExists(NET_MISSING)
-            self.assertBondExists(BOND_UNCHANGED, [nic_a])
-            self.assertBondExists(BOND_MISSING, [nic_b])
-
-        with dummyIf(2) as nics:
-            nic_a, nic_b = nics
-            bonds = {BOND_UNCHANGED: {'nics': [nic_a]},
-                     BOND_MISSING: {'nics': [nic_b]}
-                     }
-            status, msg = self.setupNetworks(nets, bonds, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            _assert_all_nets_exist()
-            try:
-                self.vdsm_net.save_config()
-
-                addrFlush(NET_CHANGED)
-                linkDel(NET_MISSING)
-                linkDel(BOND_MISSING)
-                self.vdsm_net.refreshNetinfo()
-                self.assertEqual(
-                    self.vdsm_net.netinfo.networks[NET_CHANGED]['addr'], '')
-                self.assertNotIn(NET_MISSING, self.vdsm_net.netinfo.networks)
-                self.assertNotIn(BOND_MISSING, self.vdsm_net.netinfo.bondings)
-
-                with nonChangingOperstate(NET_UNCHANGED):
-                    self.vdsm_net.restoreNetConfig()
-
-                _assert_all_nets_exist()
-                # no ifcfg backups should be left now that all ifcfgs are owned
-                # by vdsm
-                self.assertEqual([], os.listdir(NET_CONF_BACK_DIR))
-                # another 'boot' should restore nothing
-                with nonChangingOperstate(NET_UNCHANGED):
-                    with nonChangingOperstate(NET_CHANGED):
-                        with nonChangingOperstate(NET_MISSING):
-                            self.vdsm_net.restoreNetConfig()
-            finally:
-                self.setupNetworks(
-                    {NET_UNCHANGED: {'remove': True},
-                     NET_CHANGED: {'remove': True},
-                     NET_MISSING: {'remove': True}},
-                    {BOND_MISSING: {'remove': True},
-                     BOND_UNCHANGED: {'remove': True}},
-                    NOCHK)
-                self.vdsm_net.save_config()
-                self.assertNetworkDoesntExist(NET_UNCHANGED)
-                self.assertNetworkDoesntExist(NET_CHANGED)
-                self.assertNetworkDoesntExist(NET_MISSING)
-                self.assertBondDoesntExist(BOND_MISSING, [nic_b])
-                self.assertBondDoesntExist(BOND_UNCHANGED, [nic_a])
-
-    @requiresUnifiedPersistence("with ifcfg persistence, "
-                                "restoreNetConfig selective restoration"
-                                "is not supported")
-    @cleanupNet
-    def testSelectiveRestoreDuringUpgrade(self):
-        BOND_UNCHANGED = 'bond100'
-        BOND_CHANGED = 'bond101'
-        IP_MGMT = '240.0.0.100'
-        NET_MGMT = NETWORK_NAME + '100'
-        NET_UNCHANGED = NETWORK_NAME + '108'
-        NET_CHANGED = NETWORK_NAME + '116'
-        NET_ADDITIONAL = NETWORK_NAME + '124'
-        IP_ADDR_UNCHANGED = '240.0.0.108'
-        IP_ADDR_CHANGED = '204.0.0.116'
-        IP_ADDR_ADDITIONAL = '204.0.0.124'
-        IP_NETMASK = '255.255.255.248'
-        IP_GATEWAY = '240.0.0.102'
-        nets = {
-            NET_MGMT: {
-                'bootproto': 'none', 'ipaddr': IP_MGMT, 'gateway': IP_GATEWAY,
-                'netmask': IP_NETMASK, 'defaultRoute': True},
-            NET_UNCHANGED: {
-                'bootproto': 'none',
-                'ipaddr': IP_ADDR_UNCHANGED,
-                'netmask': IP_NETMASK, 'bonding': BOND_UNCHANGED,
-                'defaultRoute': False},
-            NET_CHANGED: {
-                'bootproto': 'none',
-                'ipaddr': IP_ADDR_CHANGED,
-                'netmask': IP_NETMASK, 'bonding': BOND_CHANGED},
-        }
-        net_additional_attrs = {
-            'bootproto': 'none', 'ipaddr': IP_ADDR_ADDITIONAL,
-            'netmask': IP_NETMASK}
-
-        def _assert_all_nets_exist():
-            self.vdsm_net.refreshNetinfo()
-            self.assertNetworkExists(NET_MGMT)
-            self.assertNetworkExists(NET_UNCHANGED)
-            self.assertNetworkExists(NET_CHANGED)
-            self.assertBondExists(BOND_UNCHANGED, [nic_b])
-            self.assertBondExists(BOND_CHANGED, [nic_c], options='mode=4')
-
-        def _simulate_boot(change_bond=False, after_upgrade=False):
-            device_names = (NET_UNCHANGED, BOND_UNCHANGED, nic_b, NET_CHANGED,
-                            BOND_CHANGED, nic_c)
-            if after_upgrade:
-                stop_devices((NET_CONF_PREF + name for name in device_names))
-            for dev in device_names:
-                with open(NET_CONF_PREF + dev) as f:
-                    content = f.read()
-                if after_upgrade:
-                    # all non-management devices are down and have ONBOOT=no
-                    # from older vdsm versions.
-                    content = re.sub('ONBOOT=yes', 'ONBOOT=no', content)
-                if change_bond and dev == BOND_CHANGED:
-                    # also test the case that a bond is different from it's
-                    # backup
-                    content = re.sub('mode=4', 'mode=0', content)
-                with open(NET_CONF_PREF + dev, 'w') as f:
-                    f.write(content)
-
-        def _verify_running_config_intact():
-            self.assertEqual({NET_MGMT, NET_CHANGED, NET_UNCHANGED,
-                              NET_ADDITIONAL},
-                             set(self.vdsm_net.config.networks.keys()))
-            self.assertEqual({BOND_CHANGED, BOND_UNCHANGED},
-                             set(self.vdsm_net.config.bonds.keys()))
-
-        with dummyIf(4) as nics:
-            nic_a, nic_b, nic_c, nic_d = nics
-            nets[NET_MGMT]['nic'] = nic_a
-            net_additional_attrs['nic'] = nic_d
-            bonds = {BOND_UNCHANGED: {'nics': [nic_b]},
-                     BOND_CHANGED: {'nics': [nic_c], 'options': "mode=4"}
-                     }
-            status, msg = self.setupNetworks(nets, bonds, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            _assert_all_nets_exist()
-            try:
-                self.vdsm_net.save_config()
-
-                _simulate_boot(change_bond=True, after_upgrade=True)
-
-                with nonChangingOperstate(NET_MGMT):
-                    self.vdsm_net.restoreNetConfig()
-                # no ifcfg backups should be left now that all ifcfgs are owned
-                # by vdsm
-                self.assertEqual([], os.listdir(NET_CONF_BACK_DIR))
-
-                status, msg = self.setupNetworks(
-                    {NET_ADDITIONAL: net_additional_attrs}, {}, NOCHK)
-                self.assertEqual(status, SUCCESS, msg)
-                _assert_all_nets_exist()
-                _verify_running_config_intact()
-                self.assertEqual({'ifcfg-%s' % NET_ADDITIONAL,
-                                  'ifcfg-%s' % nic_d},
-                                 set(os.listdir(NET_CONF_BACK_DIR)))
-
-                # another 'boot' should restore nothing,
-                # except remove NET_ADDITIONAL
-                _simulate_boot()
-                with nonChangingOperstate(NET_MGMT):
-                    with nonChangingOperstate(NET_UNCHANGED):
-                        with nonChangingOperstate(NET_CHANGED):
-                            self.vdsm_net.restoreNetConfig()
-
-                _assert_all_nets_exist()
-                self.assertEqual([], os.listdir(NET_CONF_BACK_DIR))
-
-            finally:
-                status, msg = self.setupNetworks(
-                    {NET_MGMT: {'remove': True},
-                     NET_UNCHANGED: {'remove': True},
-                     NET_CHANGED: {'remove': True}},
-                    {BOND_CHANGED: {'remove': True},
-                     BOND_UNCHANGED: {'remove': True}},
-                    NOCHK)
-                self.assertEqual(status, SUCCESS, msg)
-                self.vdsm_net.save_config()
-                self.assertNetworkDoesntExist(NET_MGMT)
-                self.assertNetworkDoesntExist(NET_UNCHANGED)
-                self.assertNetworkDoesntExist(NET_CHANGED)
-                self.assertNetworkDoesntExist(NET_ADDITIONAL)
-                self.assertBondDoesntExist(BOND_UNCHANGED, [nic_b])
-                self.assertBondDoesntExist(BOND_CHANGED, [nic_c])
-
-    @requiresUnifiedPersistence("with ifcfg persistence, "
-                                "restoreNetConfig selective restoration"
-                                "is not supported")
-    @cleanupNet
-    def testUpgradeUnsupportedIfcfgConfig(self):
-        with dummyIf(1) as nics:
-            nic, = nics
-            NET_ATTRS = {'nic': nic}
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: NET_ATTRS}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkExists(NETWORK_NAME)
-
-            # Inject the unsupported config, simulating "old" config.
-            unsupported_netattrs = {'IPV6_AUTOCONF': 'no',
-                                    'PEERNTP': 'yes',
-                                    'IPV6INIT': 'no'}
-            rconfig = RunningConfig()
-            rconfig.networks[NETWORK_NAME].update(unsupported_netattrs)
-            rconfig.save()
-
-            # Process the upgrade step.
-            service.service_restart('vdsm-network')
-
-            # Following the restart, the connection to supervdsm must be
-            # re-established.
-            self.vdsm_net = getProxy(reconnect=True)
-            self.vdsm_net.refreshNetinfo()
-            self._assert_kernel_config_matches_running_config()
-
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: {'remove': True}}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkDoesntExist(NETWORK_NAME)
-
-    @cleanupNet
-    @permutations([[True], [False]])
-    def testVolatileConfig(self, bridged):
-        """
-        Checks that the network doesn't persist over restart
-        """
-        with dummyIf(1) as nics:
-            nic, = nics
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: {'nic': nic, 'bridged': bridged}}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-
-            self.assertNetworkExists(NETWORK_NAME, bridged=bridged)
-
-            self.vdsm_net.restoreNetConfig()
-
-            self.assertNetworkDoesntExist(NETWORK_NAME)
-
-    @permutations([[True], [False]])
-    @cleanupNet
-    def testStaticSourceRouting(self, bridged=True):
-        with dummyIf(1) as nics:
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME:
-                    {'nic': nics[0], 'bridged': bridged, 'ipaddr': IP_ADDRESS,
-                     'netmask': IP_MASK, 'gateway': IP_GATEWAY}},
-                {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkExists(NETWORK_NAME, bridged)
-
-            deviceName = NETWORK_NAME if bridged else nics[0]
-            ip_addr = self.vdsm_net.netinfo.networks[NETWORK_NAME]['addr']
-            self.assertSourceRoutingConfiguration(deviceName, ip_addr)
-
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: {'remove': True}}, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-
-            # Assert that routes and rules don't exist
-            source_route = _get_source_route(deviceName, ip_addr)
-            for route in source_route._buildRoutes():
-                self.assertRouteDoesNotExist(route)
-            for rule in source_route._buildRules():
-                self.assertRuleDoesNotExist(rule)
-
-    @cleanupNet
     @ValidatesHook('before_network_setup', 'testBeforeNetworkSetup.py', True,
-                   "#!/usr/bin/python2\n"
+                   "#!/usr/bin/python3\n"
                    "import json\n"
                    "import os\n"
                    "\n"
@@ -1085,35 +649,6 @@ class NetworkTest(TestCaseBase):
             finally:
                 addrFlush(nic)
 
-    @cleanupNet
-    def testReconfigureBrNetWithVanishedPort(self):
-        """Test for re-defining a bridged network for which the device
-        providing connectivity to the bridge had been removed from it"""
-        with dummyIf(1) as nics:
-            nic, = nics
-            network = {NETWORK_NAME: {'nic': nic, 'bridged': True}}
-            status, msg = self.setupNetworks(network, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkExists(NETWORK_NAME)
-
-            # Remove the nic from the bridge
-            linkSet(nic, ['nomaster'])
-            self.vdsm_net.refreshNetinfo()
-            self.assertEqual(len(
-                self.vdsm_net.netinfo.networks[NETWORK_NAME]['ports']), 0)
-
-            # Attempt to reconfigure the network
-            status, msg = self.setupNetworks(network, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertEqual(
-                self.vdsm_net.netinfo.networks[NETWORK_NAME]['ports'], [nic])
-
-            # cleanup
-            network[NETWORK_NAME] = {'remove': True}
-            status, msg = self.setupNetworks(network, {}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkDoesntExist(NETWORK_NAME)
-
     @slowtest
     @cleanupNet
     def testHonorBlockingDhcp(self):
@@ -1226,39 +761,6 @@ class NetworkTest(TestCaseBase):
             # cleanup
             self.setupNetworks({NETWORK_NAME: {'remove': True}}, {}, NOCHK)
 
-    @permutations([[True], [False]])
-    @cleanupNet
-    def testSetupNetworkOutboundQos(self, bridged):
-        hostQos = {
-            'out': {
-                'ls': {
-                    'm1': 4 * 1000 ** 2,  # 4Mbit/s
-                    'd': 100 * 1000,  # 100 microseconds
-                    'm2': 3 * 1000 ** 2},  # 3Mbit/s
-                'ul': {
-                    'm2': 8 * 1000 ** 2}}}  # 8Mbit/s
-        with dummyIf(1) as nics:
-            nic, = nics
-            attrs = {'vlan': VLAN_ID, 'nic': nic, 'bridged': bridged,
-                     'hostQos': hostQos}
-            status, msg = self.setupNetworks({NETWORK_NAME: attrs}, {}, NOCHK)
-
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkExists(NETWORK_NAME, hostQos=hostQos)
-
-            # Cleanup
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME: dict(remove=True)}, {}, NOCHK)
-            self.assertEqual([], list(tc._filters(nic)),
-                             'Failed to cleanup tc filters')
-            self.assertEqual([], list(tc.classes(nic)),
-                             'Failed to cleanup tc classes')
-            # Real devices always get a qdisc, dummies don't, so 0 after
-            # deletion.
-            self.assertEqual(0, len(list(tc.qdiscs(nic))),
-                             'Failed to cleanup tc hfsc and ingress qdiscs')
-            self.assertEqual(status, SUCCESS, msg)
-
     @cleanupNet
     def testSetupNetworksRemoveSlavelessBond(self):
         with dummyIf(2) as nics:
@@ -1280,30 +782,6 @@ class NetworkTest(TestCaseBase):
             self.assertEqual(status, SUCCESS, msg)
             self.assertNetworkDoesntExist(NETWORK_NAME)
             self.assertBondDoesntExist(BONDING_NAME, nics)
-
-    @cleanupNet
-    def testSetupNetworksRemoveBondWithKilledEnslavedNics(self):
-
-        dummy = Dummy()
-        dummy.create()
-        nics = [dummy.devName]
-        try:
-            status, msg = self.setupNetworks(
-                {NETWORK_NAME:
-                    {'bonding': BONDING_NAME, 'bridged': False}},
-                {BONDING_NAME: {'nics': nics}}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertNetworkExists(NETWORK_NAME)
-            self.assertBondExists(BONDING_NAME, nics)
-        finally:
-            dummy.remove()
-
-        status, msg = self.setupNetworks(
-            {NETWORK_NAME: {'remove': True}},
-            {BONDING_NAME: {'remove': True}}, NOCHK)
-        self.assertEqual(status, SUCCESS, msg)
-        self.assertNetworkDoesntExist(NETWORK_NAME)
-        self.assertBondDoesntExist(BONDING_NAME, nics)
 
     @requiresUnifiedPersistence("with ifcfg persistence, "
                                 "restoreNetConfig doesn't restore "
@@ -1363,54 +841,6 @@ class NetworkTest(TestCaseBase):
             self.assertNetworkDoesntExist(NETWORK_NAME)
             self.assertBondDoesntExist(BONDING_NAME, nics)
             self.vdsm_net.save_config()
-
-    @cleanupNet
-    @ValidateRunningAsRoot
-    def test_setupNetworks_bond_with_custom_option(self):
-        with dummyIf(2) as nics:
-            status, msg = self.setupNetworks(
-                {},
-                {BONDING_NAME: {'nics': nics,
-                                'options': 'custom=foo:bar mode=4'}},
-                NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertBondExists(BONDING_NAME, nics)
-
-            # custom property has to be persisted, but not reported by netinfo.
-            self._assert_exact_bond_opts(BONDING_NAME, ['mode=4'])
-            bond = self.vdsm_net.config.bonds.get(BONDING_NAME)
-            self.assertSetEqual(set(['mode=4', 'custom=foo:bar']),
-                                set(bond.get('options').split()))
-
-            status, msg = self.setupNetworks(
-                {}, {BONDING_NAME: {'remove': True}}, NOCHK)
-            self.assertEqual(status, SUCCESS, msg)
-            self.assertBondDoesntExist(BONDING_NAME, nics)
-
-    @cleanupNet
-    @ValidateRunningAsRoot
-    def test_drop_initial_bond_slaves_ip_config(self):
-        with dummyIf(2) as nics:
-            nic_1, nic_2 = nics
-            sysctl.disable_ipv6(nic_1, False)
-            addrAdd(nic_1, IP_ADDRESS, IP_CIDR)
-            addrAdd(nic_1, IPv6_ADDRESS, IPv6_CIDR, family=6)
-            try:
-                status, msg = self.setupNetworks(
-                    {}, {BONDING_NAME: {'nics': [nic_1, nic_2]}}, NOCHK)
-                self.assertEqual(status, SUCCESS, msg)
-
-                ipv4addrs = self.vdsm_net.netinfo.nics[nic_1]['ipv4addrs']
-                ipv6addrs = self.vdsm_net.netinfo.nics[nic_1]['ipv6addrs']
-                self.assertNotIn(IP_ADDRESS_AND_CIDR, ipv4addrs)
-                self.assertNotIn(IPv6_ADDRESS_AND_CIDR, ipv6addrs)
-
-                status, msg = self.setupNetworks(
-                    {}, {BONDING_NAME: {'remove': True}}, NOCHK)
-                self.assertEqual(status, SUCCESS, msg)
-                self.assertBondDoesntExist(BONDING_NAME, nics)
-            finally:
-                addrFlush(nic_1)
 
     @contextmanager
     def _create_external_ifcfg_bond(self, bond_name, nics, vlan_id):

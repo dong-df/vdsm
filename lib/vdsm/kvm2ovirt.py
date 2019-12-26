@@ -1,4 +1,4 @@
-# Copyright 2016-2017 Red Hat, Inc.
+# Copyright 2016-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,13 +21,13 @@ from __future__ import absolute_import
 
 import argparse
 from contextlib import contextmanager
-import itertools
 import libvirt
+import six
 import sys
 import os
 import threading
 
-from ovirt_imageio_common import directio
+from ovirt_imageio_common import directio  # pylint: disable=import-error
 
 from vdsm.common import concurrent
 from vdsm.common import libvirtconnection
@@ -249,7 +249,7 @@ def main(argv=None):
                                             get_password(options))
 
     write_output('preparing for copy')
-    disks = itertools.izip(options.source, options.dest, options.storagetype)
+    disks = six.moves.zip(options.source, options.dest, options.storagetype)
     for diskno, (src, dst, fmt) in enumerate(disks, start=1):
         if fmt == 'volume':
             handle_volume(con, diskno, src, dst, options)

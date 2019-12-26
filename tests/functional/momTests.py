@@ -33,7 +33,7 @@ import testValidation
 from testlib import VdsmTestCase as TestCaseBase
 from nose.plugins.skip import SkipTest
 from vdsm.common.define import errCode
-from utils import VdsProxy, SUCCESS
+from .utils import getProxy, SUCCESS
 
 
 def skipNoMOM(method):
@@ -58,7 +58,7 @@ class MOMTest(TestCaseBase):
     BalloonRatio = namedtuple('BalloonRatio', 'initial, low, high')
 
     def setUp(self):
-        self.s = VdsProxy()
+        self.s = getProxy()
 
     @testValidation.ValidateRunningAsRoot
     @skipNoMOM
@@ -94,7 +94,7 @@ class MOMTest(TestCaseBase):
         self.assertEqual(status, SUCCESS, msg)
 
         # Filter all vms' statistics to get balloon operation candidates.
-        candidateStats = filter(self._statsOK, statsList)
+        candidateStats = [s for s in statsList if self._statsOK(s)]
 
         # Set the balloon target to initial value before shrink
         # or grow operation.
@@ -116,7 +116,7 @@ class MOMTest(TestCaseBase):
         self.assertEqual(status, SUCCESS, msg)
 
         # Filter all vms' statistics to get balloon operation candidates.
-        candidateStats = filter(self._statsOK, statsList)
+        candidateStats = [s for s in statsList if self._statsOK(s)]
 
         # Set the balloon target to initial value before shrink
         # or grow operation.
@@ -144,7 +144,7 @@ class MOMTest(TestCaseBase):
                 raise SkipTest('The policy file %s is missing.' %
                                file_name)
             else:
-                raise SkipTest(e.message)
+                raise SkipTest(str(e))
 
         status, msg = self.s.setMOMPolicy(testPolicyStr)
         self.assertEqual(status, SUCCESS, msg)

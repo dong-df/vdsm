@@ -1,4 +1,4 @@
-# Copyright 2016-2018 Red Hat, Inc.
+# Copyright 2016-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,6 +27,7 @@ import six
 from .netinfo import bonding, bridges
 from vdsm.common.conv import tobool
 from vdsm.network import dns
+from vdsm.network.ip.address import IPAddressData
 from vdsm.network.ip.address import prefix2netmask
 from vdsm.network.link import bond
 from vdsm.network.link import iface
@@ -72,8 +73,11 @@ def _entities_to_canonicalize(entities):
 
     :param entities: Network or Bond requested configuration dicts
     """
-    return ((name, attrs) for name, attrs in six.viewitems(entities)
-            if not _canonicalize_remove(attrs))
+    return (
+        (name, attrs)
+        for name, attrs in six.viewitems(entities)
+        if not _canonicalize_remove(attrs)
+    )
 
 
 def canonicalize_external_bonds_used_by_nets(nets, bonds):
@@ -87,7 +91,7 @@ def canonicalize_external_bonds_used_by_nets(nets, bonds):
                 bonds[bondname] = {
                     'nics': list(bond_dev.slaves),
                     'options': bonding.bondOptsForIfcfg(bond_dev.options),
-                    'switch': netattrs['switch']
+                    'switch': netattrs['switch'],
                 }
 
 
@@ -138,8 +142,10 @@ def _canonicalize_stp(data):
         try:
             data['stp'] = bridges.stp_booleanize(stp)
         except ValueError:
-            raise ConfigNetworkError(ne.ERR_BAD_PARAMS, '"%s" is not '
-                                     'a valid bridge STP value.' % stp)
+            raise ConfigNetworkError(
+                ne.ERR_BAD_PARAMS,
+                '"%s" is not ' 'a valid bridge STP value.' % stp,
+            )
 
 
 def _canonicalize_bridge_opts(data):
@@ -155,8 +161,9 @@ def bridge_opts_str_to_dict(opts_str):
 
 
 def bridge_opts_dict_to_sorted_str(opts_dict):
-    opts_pairs = ['{}={}'.format(key, val)
-                  for key, val in six.viewitems(opts_dict)]
+    opts_pairs = [
+        '{}={}'.format(key, val) for key, val in six.viewitems(opts_dict)
+    ]
     opts_pairs.sort()
     return ' '.join(opts_pairs)
 
@@ -176,7 +183,8 @@ def _canonicalize_ipv4_netmask(data):
     if prefix:
         if 'netmask' in data:
             raise ConfigNetworkError(
-                ne.ERR_BAD_PARAMS, 'Both PREFIX and NETMASK supplied')
+                ne.ERR_BAD_PARAMS, 'Both PREFIX and NETMASK supplied'
+            )
         try:
             data['netmask'] = prefix2netmask(int(prefix))
         except ValueError as ve:
@@ -188,6 +196,14 @@ def _canonicalize_ipv6(data):
         data['dhcpv6'] = False
     if 'ipv6autoconf' not in data:
         data['ipv6autoconf'] = False
+    ipv6_addr = data.get('ipv6addr')
+    if ipv6_addr:
+        data['ipv6addr'] = _compress_ipv6_address(ipv6_addr)
+
+
+def _compress_ipv6_address(ipv6_addr):
+    wrapped_ipv6_address = IPAddressData(ipv6_addr, device=None)
+    return wrapped_ipv6_address.address_with_prefixlen
 
 
 def _canonicalize_switch_type_net(data):
@@ -215,8 +231,10 @@ def _canonicalize_ip_default_route(nets):
 
         custom_default_route = _rget(data, ('custom', 'default_route'))
         if custom_default_route is not None:
-            logging.warning('Custom property default_route is deprecated. '
-                            'please use default route role.')
+            logging.warning(
+                'Custom property default_route is deprecated. '
+                'please use default route role.'
+            )
             data['defaultRoute'] = tobool(custom_default_route)
 
         if data['defaultRoute']:
@@ -225,7 +243,8 @@ def _canonicalize_ip_default_route(nets):
     if len(default_route_nets) > 1:
         raise ne.ConfigNetworkError(
             ne.ERR_BAD_PARAMS,
-            'Only a single default route network is allowed.')
+            'Only a single default route network is allowed.',
+        )
     elif default_route_nets:
         existing_net_with_default_route = _net_with_default_route_from_config()
         if existing_net_with_default_route:

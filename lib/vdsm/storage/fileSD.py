@@ -33,14 +33,15 @@ from contextlib import contextmanager
 import six
 
 from vdsm import utils
+from vdsm.common import concurrent
 from vdsm.common import supervdsm
 from vdsm.common.compat import glob_escape
+from vdsm.common.units import MiB
 from vdsm.storage import clusterlock
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fileUtils
 from vdsm.storage import fileVolume
-from vdsm.storage import misc
 from vdsm.storage import mount
 from vdsm.storage import outOfProcess as oop
 from vdsm.storage import sd
@@ -48,7 +49,6 @@ from vdsm.storage import xlease
 from vdsm.storage.persistent import PersistentDict, DictValidator
 
 from vdsm import constants
-from vdsm.utils import stripNewLines
 from vdsm.storage.constants import LEASE_FILEEXT, UUID_GLOB_PATTERN
 
 REMOTE_PATH = "REMOTE_PATH"
@@ -68,12 +68,11 @@ FILE_SPECIAL_VOLUME_SIZES_MIB.update({
     sd.XLEASES: 0,
 })
 
-# Specific stat(2) block size as defined in the man page
-ST_BYTES_PER_BLOCK = 512
-
 _MOUNTLIST_IGNORE = ('/' + sd.BLOCKSD_DIR, '/' + sd.GLUSTERSD_DIR)
 
-getProcPool = oop.getGlobalProcPool
+
+def getProcPool():
+    return oop.getProcessPool(sc.GLOBAL_OOP)
 
 
 def validateDirAccess(dirPath):
@@ -93,25 +92,6 @@ def validateDirAccess(dirPath):
         raise
 
     return True
-
-
-def validateFileSystemFeatures(sdUUID, mountDir):
-    try:
-        # Don't unlink this file, we don't have the cluster lock yet as it
-        # requires direct IO which is what we are trying to test for. This
-        # means that unlinking the file might cause a race. Since we don't
-        # care what the content of the file is, just that we managed to
-        # open it O_DIRECT.
-        testFilePath = os.path.join(mountDir, "__DIRECT_IO_TEST__")
-        oop.getProcessPool(sdUUID).directTouch(testFilePath)
-    except OSError as e:
-        if e.errno == errno.EINVAL:
-            log = logging.getLogger("storage.fileSD")
-            log.error("Underlying file system doesn't support"
-                      "direct IO")
-            raise se.StorageDomainTargetUnsupported()
-
-        raise
 
 
 def getDomUuidFromMetafilePath(metafile):
@@ -135,19 +115,17 @@ class FileMetadataRW(object):
 
     def readlines(self):
         try:
-            return stripNewLines(self._oop.directReadLines(self._metafile))
+            data = self._oop.readFile(self._metafile, direct=True)
         except (IOError, OSError) as e:
             if e.errno != errno.ENOENT:
                 raise
             return []
+        else:
+            data = data.rstrip(b"\0")
+            return data.decode('utf-8').splitlines()
 
     def writelines(self, metadata):
-        for i, line in enumerate(metadata):
-            if isinstance(line, unicode):
-                line = line.encode('utf-8')
-            metadata[i] = line
-
-        metadata = [i + '\n' for i in metadata]
+        metadata = [line.encode('utf-8') + b'\n' for line in metadata]
         tmpFilePath = self._metafile + ".new"
         try:
             self._oop.writeLines(tmpFilePath, metadata)
@@ -158,8 +136,11 @@ class FileMetadataRW(object):
         self._oop.os.rename(tmpFilePath, self._metafile)
 
 
-FileSDMetadata = lambda metafile: DictValidator(
-    PersistentDict(FileMetadataRW(metafile)), FILE_SD_MD_FIELDS)
+def FileSDMetadata(metafile):
+    return DictValidator(
+        PersistentDict(
+            FileMetadataRW(metafile)),
+        FILE_SD_MD_FIELDS)
 
 
 class FileStorageDomainManifest(sd.StorageDomainManifest):
@@ -199,6 +180,14 @@ class FileStorageDomainManifest(sd.StorageDomainManifest):
     def getMonitoringPath(self):
         return self.metafile
 
+    def getVolumeSize(self, imgUUID, volUUID):
+        volPath = os.path.join(
+            self.mountpoint, self.sdUUID, 'images', imgUUID, volUUID)
+        stat = self.oop.os.stat(volPath)
+        return sd.VolumeSize(
+            apparentsize=stat.st_size,
+            truesize=stat.st_blocks * sc.STAT_BYTES_PER_BLOCK)
+
     def getVSize(self, imgUUID, volUUID):
         """ Returns file volume size in bytes. """
         volPath = os.path.join(self.mountpoint, self.sdUUID, 'images',
@@ -211,7 +200,7 @@ class FileStorageDomainManifest(sd.StorageDomainManifest):
                                imgUUID, volUUID)
         stat = self.oop.os.stat(volPath)
 
-        return stat.st_blocks * ST_BYTES_PER_BLOCK
+        return stat.st_blocks * sc.STAT_BYTES_PER_BLOCK
 
     def getLeasesFilePath(self):
         return os.path.join(self.getMDPath(), sd.LEASES)
@@ -393,10 +382,11 @@ class FileStorageDomain(sd.StorageDomain):
     def __init__(self, domainPath):
         manifest = self.manifestClass(domainPath)
 
-        # We perform validation here since filesystem features are relevant to
-        # construction of an actual Storage Domain.  Direct users of
-        # FileStorageDomainManifest should call this explicitly if required.
-        validateFileSystemFeatures(manifest.sdUUID, manifest.mountpoint)
+        storage_block_size = self._detect_block_size(
+            manifest.sdUUID, manifest.mountpoint)
+        self._validate_storage_block_size(
+            manifest.block_size, storage_block_size)
+
         sd.StorageDomain.__init__(self, manifest)
         self.imageGarbageCollector()
         self._registerResourceNamespaces()
@@ -414,15 +404,14 @@ class FileStorageDomain(sd.StorageDomain):
 
     def prepareMailbox(self):
         for mailboxFile in (sd.INBOX, sd.OUTBOX):
-            mailboxByteSize = (FILE_SPECIAL_VOLUME_SIZES_MIB[mailboxFile] *
-                               constants.MEGAB)
+            mailboxByteSize = FILE_SPECIAL_VOLUME_SIZES_MIB[mailboxFile] * MiB
             mailboxFilePath = os.path.join(self.domaindir,
                                            sd.DOMAIN_META_DATA, mailboxFile)
 
             try:
                 mailboxStat = self.oop.os.stat(mailboxFilePath)
             except OSError as e:
-                if e.errno != os.errno.ENOENT:
+                if e.errno != errno.ENOENT:
                     raise
                 prevMailboxFileSize = None
             else:
@@ -451,19 +440,23 @@ class FileStorageDomain(sd.StorageDomain):
         procPool.fileUtils.createdir(metadataDir, 0o775)
 
         special_volumes = cls.manifestClass.special_volumes(version)
-        for name, size_mb in FILE_SPECIAL_VOLUME_SIZES_MIB.iteritems():
+        for name, size_mb in six.iteritems(FILE_SPECIAL_VOLUME_SIZES_MIB):
             if name in special_volumes:
                 try:
                     procPool.truncateFile(
                         os.path.join(metadataDir, name),
-                        size_mb * constants.MEGAB, METADATA_PERMISSIONS)
+                        size_mb * MiB, METADATA_PERMISSIONS)
                 except Exception as e:
                     raise se.StorageDomainMetadataCreationError(
                         "create meta file '%s' failed: %s" % (name, str(e)))
 
         if cls.supports_external_leases(version):
             xleases_path = os.path.join(metadataDir, sd.XLEASES)
-            cls.format_external_leases(sdUUID, xleases_path)
+            cls.format_external_leases(
+                sdUUID,
+                xleases_path,
+                alignment=alignment,
+                block_size=block_size)
 
         metaFile = os.path.join(metadataDir, sd.METADATA)
 
@@ -786,7 +779,7 @@ class FileStorageDomain(sd.StorageDomain):
         """
         proc = oop.getProcessPool(self.sdUUID)
         path = self.external_leases_path()
-        size = FILE_SPECIAL_VOLUME_SIZES_MIB[sd.XLEASES] * constants.MEGAB
+        size = FILE_SPECIAL_VOLUME_SIZES_MIB[sd.XLEASES] * MiB
         self.log.info("Creating external leases volume %s", path)
         try:
             proc.truncateFile(path, size, METADATA_PERMISSIONS, creatExcl=True)
@@ -842,6 +835,38 @@ class FileStorageDomain(sd.StorageDomain):
                 continue
             vol.setMetadata(vol_md)
 
+    # Validating file system features
+
+    @classmethod
+    def _detect_block_size(cls, sd_id, mountpoint):
+        """
+        Detect filesystem block size and validate direct I/O usage.
+
+        There is no way to get the underlying block size, but ioprocess can
+        detect it by writing to storage using direct I/O.
+
+        Raises:
+            se.StorageDomainTargetUnsupported if the underlying storage does
+                not support direct I/O.
+            OSError if probing block size failed because of another error.
+            ioprocess.Timeout if writing to storage timed out.
+
+        Returns:
+            the detected block size (1, 512, 4096)
+        """
+        log = logging.getLogger("storage.fileSD")
+        iop = oop.getProcessPool(sd_id)
+        try:
+            block_size = iop.probe_block_size(mountpoint)
+        except OSError as e:
+            if e.errno != errno.EINVAL:
+                raise
+            raise se.StorageDomainTargetUnsupported(
+                "Failed to probe block size on {}: {}".format(mountpoint, e))
+
+        log.debug("Detected domain %s block size %s", sd_id, block_size)
+        return block_size
+
 
 def _getMountsList(pattern="*"):
     fileDomPattern = os.path.join(sc.REPO_MOUNT_DIR, pattern)
@@ -867,10 +892,9 @@ def scanDomains(pattern="*"):
 
     def collectMetaFiles(mountPoint):
         try:
-            # removes the path to the data center's mount directory from
-            # the mount point.
-            if mountPoint.startswith(sc.REPO_MOUNT_DIR):
-                client_name = mountPoint[len(sc.REPO_MOUNT_DIR):]
+            # /rhev/*/mnt/server:_path -> server:_path
+            # /rhev/*/mnt/glusterSD/server:_path -> glusterSD/server:_path
+            client_name = mountPoint.replace(sc.REPO_MOUNT_DIR, "").lstrip("/")
 
             # Since glob treats values between brackets as character ranges,
             # and since IPV6 addresses contain brackets, we should escape the
@@ -900,11 +924,12 @@ def scanDomains(pattern="*"):
     # We Use 30% of the available slots.
     # TODO: calculate it right, now we use same value of max process per
     #       domain.
-    for res in misc.itmap(collectMetaFiles, mntList, oop.HELPERS_PER_DOMAIN):
-        if res is None:
+    for res in concurrent.tmap(
+            collectMetaFiles, mntList, max_workers=oop.HELPERS_PER_DOMAIN):
+        if res.value is None:
             continue
 
-        yield res
+        yield res.value
 
 
 def getStorageDomainsList():

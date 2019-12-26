@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2017 Red Hat, Inc.
+# Copyright 2014-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,7 +27,7 @@ import hashlib
 import operator
 import os
 import uuid
-import xml.etree.cElementTree as etree
+import xml.etree.ElementTree as etree
 
 import libvirt
 import six
@@ -163,7 +163,7 @@ def __device_tree_hash(libvirt_devices):
     """
     current_hash = hashlib.sha256()
     for _, xml in _each_device_xml(libvirt_devices):
-        current_hash.update(xml)
+        current_hash.update(xml.encode('utf-8'))
 
     return current_hash.hexdigest()
 
@@ -271,8 +271,9 @@ def physical_function_net_name(pf_pci_name):
     the network interface name associated with it (e.g. enp2s0f0)
     """
     devices = list_by_caps()
-    libvirt_device_names = [name for name, device in six.iteritems(devices)
-                            if device['params'].get('parent') == pf_pci_name]
+    libvirt_device_names = [name for name, device in six.iteritems(devices) if
+                            device['params'].get('parent') == pf_pci_name and
+                            device['params'].get('capability') == 'net']
     if len(libvirt_device_names) > 1:
         raise Exception('could not determine network name for %s. Possible'
                         'devices: %s' % (pf_pci_name, libvirt_device_names))
@@ -328,6 +329,17 @@ def _process_mdev_params(device_xml):
         except AttributeError:
             supported_types[name] = {}
             continue
+        device_path = device_xml.find('./path').text
+        description_path = os.path.join(device_path, 'mdev_supported_types',
+                                        name, 'description')
+        # The presence of description file is optional and we also
+        # shouldn't fail if it can't be read for any reason.
+        try:
+            description = open(description_path).read().strip()
+        except IOError:
+            pass
+        else:
+            supported_types[name]['description'] = description
 
     # Remove mdev types that we can't handle.
     supported_types = {k: v for k, v in supported_types.items() if v}
@@ -487,7 +499,10 @@ def _process_device_params(device_xml):
     """
     params = {}
 
-    devXML = etree.fromstring(device_xml.decode('ascii', errors='ignore'))
+    if six.PY2:
+        device_xml = device_xml.decode('ascii', errors='ignore')
+
+    devXML = etree.fromstring(device_xml)
 
     caps = devXML.find('capability')
     params['capability'] = caps.attrib['type']
@@ -731,10 +746,6 @@ def despawn_mdev(mdev_uuid):
     except IOError:
         # This is destroy flow, we can't really fail
         pass
-
-
-def get_mdev_uuid(vm_id):
-    return str(uuid.uuid3(_OVIRT_MDEV_NAMESPACE, vm_id))
 
 
 def _format_address(dev_type, address):

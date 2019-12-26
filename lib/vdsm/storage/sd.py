@@ -31,7 +31,9 @@ import six
 
 from vdsm import utils
 from vdsm.common import exception
+from vdsm.common.marks import deprecated
 from vdsm.common.threadlocal import vars
+from vdsm.common.units import MiB, GiB
 from vdsm.config import config
 from vdsm.storage import clusterlock
 from vdsm.storage import constants as sc
@@ -66,6 +68,11 @@ OUTBOX = "outbox"
 # volumes.
 XLEASES = "xleases"
 
+# The size of these volumes is calculated dynamically based on the
+# domain block size and alignment.
+LEASES_SLOTS = 2048
+XLEASES_SLOTS = 1024
+
 # Special volumes available since storage domain version 0
 SPECIAL_VOLUMES_V0 = (METADATA, LEASES, IDS, INBOX, OUTBOX)
 
@@ -73,11 +80,9 @@ SPECIAL_VOLUMES_V0 = (METADATA, LEASES, IDS, INBOX, OUTBOX)
 SPECIAL_VOLUMES_V4 = SPECIAL_VOLUMES_V0 + (XLEASES,)
 
 SPECIAL_VOLUME_SIZES_MIB = {
-    LEASES: 2048,
     IDS: 8,
     INBOX: 16,
     OUTBOX: 16,
-    XLEASES: 1024,
 }
 
 # Storage Domain Types
@@ -161,16 +166,23 @@ ImgsPar = namedtuple("ImgsPar", "imgs,parent")
 ISO_IMAGE_UUID = '11111111-1111-1111-1111-111111111111'
 BLANK_UUID = '00000000-0000-0000-0000-000000000000'
 
-# Blocks used for each lease (valid on all domain types)
-LEASE_BLOCKS = 2048
-
 UNICODE_MINIMAL_VERSION = 3
 
-# The LEASE_OFFSET is used by SANLock to not overlap with safelease in
-# orfer to preserve the ability to acquire both locks (e.g.: during the
-# domain upgrade)
+# The LEASE_SLOT is used by Sanlock to not overlap with safelease in
+# order to preserve the ability to acquire both locks during the domain
+# upgrade from V1 to V3.
 SDM_LEASE_NAME = 'SDM'
-SDM_LEASE_OFFSET = 512 * 2048
+SDM_LEASE_SLOT = 1
+
+VolumeSize = namedtuple("VolumeSize", [
+    # The logical volume size in block storage and file size in file
+    # storage.
+    "apparentsize",
+
+    # The allocated size on storage. Same as apparentsize in block
+    # storage.
+    "truesize",
+])
 
 
 def getVolsOfImage(allVols, imgUUID):
@@ -182,7 +194,7 @@ def getVolsOfImage(allVols, imgUUID):
     allVols: The getAllVols() return dict.
     """
 
-    return dict((volName, vol) for volName, vol in allVols.iteritems()
+    return dict((volName, vol) for volName, vol in six.iteritems(allVols)
                 if imgUUID in vol.imgs)
 
 
@@ -202,11 +214,6 @@ def packLeaseParams(lockRenewalIntervalSec, leaseTimeSec,
                 DMDK_IO_OP_TIMEOUT_SEC: ioOpTimeoutSec}
 
     return DEFAULT_LEASE_PARAMS
-
-
-def validateDomainVersion(version):
-    if version not in sc.SUPPORTED_DOMAIN_VERSIONS:
-        raise se.UnsupportedDomainVersion(version)
 
 
 def validateSDDeprecatedStatus(status):
@@ -255,9 +262,9 @@ def name2class(name):
 
 def sizeStr2Int(size_str):
     if size_str.endswith("M") or size_str.endswith("m"):
-        size = int(size_str[:-1]) * (1 << 20)
+        size = int(size_str[:-1]) * MiB
     elif size_str.endswith("G") or size_str.endswith("g"):
-        size = int(size_str[:-1]) * (1 << 30)
+        size = int(size_str[:-1]) * GiB
     else:
         size = int(size_str)
 
@@ -329,8 +336,25 @@ class StorageDomainManifest(object):
         self.sdUUID = sdUUID
         self.domaindir = domaindir
         self.replaceMetadata(metadata)
-        self._domainLock = self._makeDomainLock()
         self._external_leases_lock = rwlock.RWLock()
+        self._alignment = metadata.get(DMDK_ALIGNMENT, sc.ALIGNMENT_1M)
+        self._block_size = metadata.get(DMDK_BLOCK_SIZE, sc.BLOCK_SIZE_512)
+
+        # Validate alignment and block size.
+
+        version = self.getVersion()
+        if version < 5:
+            if self.alignment != sc.ALIGNMENT_1M:
+                raise se.MetaDataValidationError(
+                    "Storage domain version {} does not support alignment {}"
+                        .format(version, self.alignment))
+
+            if self.block_size != sc.BLOCK_SIZE_512:
+                raise se.MetaDataValidationError(
+                    "Storage domain version {} does not support block size {}"
+                        .format(version, self.block_size))
+
+        self._domainLock = self._makeDomainLock()
 
     @classmethod
     def special_volumes(cls, version):
@@ -421,7 +445,19 @@ class StorageDomainManifest(object):
         return self._metadata[key]
 
     def getVersion(self):
-        return self.getMetaParam(DMDK_VERSION)
+        try:
+            version = self.getMetaParam(DMDK_VERSION)
+        except KeyError:
+            raise se.MetaDataKeyNotFoundError("key={}".format(DMDK_VERSION))
+        return version
+
+    @property
+    def alignment(self):
+        return self._alignment
+
+    @property
+    def block_size(self):
+        return self._block_size
 
     def resizePV(self, guid):
         pass
@@ -514,7 +550,7 @@ class StorageDomainManifest(object):
         """
         return clusterlock.Lease(SDM_LEASE_NAME,
                                  self.getLeasesFilePath(),
-                                 SDM_LEASE_OFFSET)
+                                 SDM_LEASE_SLOT * self.alignment)
 
     def acquireDomainLock(self, hostID):
         self.refresh()
@@ -552,13 +588,6 @@ class StorageDomainManifest(object):
         if not domVersion:
             domVersion = self.getVersion()
 
-        leaseParams = (
-            DEFAULT_LEASE_PARAMS[DMDK_LOCK_RENEWAL_INTERVAL_SEC],
-            DEFAULT_LEASE_PARAMS[DMDK_LEASE_TIME_SEC],
-            DEFAULT_LEASE_PARAMS[DMDK_LEASE_RETRIES],
-            DEFAULT_LEASE_PARAMS[DMDK_IO_OP_TIMEOUT_SEC],
-        )
-
         try:
             lockClass = self._domainLockTable[domVersion]
         except KeyError:
@@ -566,10 +595,23 @@ class StorageDomainManifest(object):
 
         # Note: lease and leaseParams are needed only for legacy locks
         # supporting only single lease, and ignored by modern lock managers
-        # like sanlock.
+        # like sanlock. On the contrary, kwargs are not needed by legacy locks
+        # and are used by modern locks like sanlock.
+
+        leaseParams = (
+            DEFAULT_LEASE_PARAMS[DMDK_LOCK_RENEWAL_INTERVAL_SEC],
+            DEFAULT_LEASE_PARAMS[DMDK_LEASE_TIME_SEC],
+            DEFAULT_LEASE_PARAMS[DMDK_LEASE_RETRIES],
+            DEFAULT_LEASE_PARAMS[DMDK_IO_OP_TIMEOUT_SEC],
+        )
+
+        kwargs = {
+            "alignment": self._alignment,
+            "block_size": self._block_size,
+        }
 
         return lockClass(self.sdUUID, self.getIdsFilePath(),
-                         self.getDomainLease(), *leaseParams)
+                         self.getDomainLease(), *leaseParams, **kwargs)
 
     def initDomainLock(self):
         """
@@ -667,7 +709,10 @@ class StorageDomainManifest(object):
         """
         path = self.external_leases_path()
         with self.external_leases_backend(self.sdUUID, path) as backend:
-            vol = xlease.LeasesVolume(backend)
+            vol = xlease.LeasesVolume(
+                backend,
+                alignment=self._alignment,
+                block_size=self._block_size)
             with utils.closing(vol):
                 yield vol
 
@@ -689,20 +734,27 @@ class StorageDomain(object):
     mdBackupDir = config.get('irs', 'md_backup_dir')
     manifestClass = StorageDomainManifest
 
-    # Those two variables contain block sizes and sanlock alignments
-    # supported by a storage domain. Values are validated by
-    # _validate_block_and_alignment function.
-    # Concrete storage domain types must override to define supported values.
     supported_block_size = ()
-    supported_alignment = ()
+    # Default supported domain versions unless overidden
+    supported_versions = sc.SUPPORTED_DOMAIN_VERSIONS
 
     def __init__(self, manifest):
         self._manifest = manifest
+        # Do not allow attaching SD with an unsupported version
+        self.validate_version(manifest.getVersion())
         self._lock = threading.Lock()
 
     @property
     def sdUUID(self):
         return self._manifest.sdUUID
+
+    @property
+    def alignment(self):
+        return self._manifest.alignment
+
+    @property
+    def block_size(self):
+        return self._manifest.block_size
 
     @property
     def domaindir(self):
@@ -730,10 +782,28 @@ class StorageDomain(object):
     def getMonitoringPath(self):
         return self._manifest.getMonitoringPath()
 
+    def getVolumeSize(self, imgUUID, volUUID):
+        """
+        Return VolumeSize named tuple for specified volume.
+        """
+        return self._manifest.getVolumeSize(imgUUID, volUUID)
+
+    @deprecated
     def getVSize(self, imgUUID, volUUID):
+        """
+        Return volume apparent size.
+
+        Deprecated - use getVolumeSize().apparentsize instead.
+        """
         return self._manifest.getVSize(imgUUID, volUUID)
 
+    @deprecated
     def getVAllocSize(self, imgUUID, volUUID):
+        """
+        Return volume true size.
+
+        Deprecated - use getVolumeSize().truesize instead.
+        """
         return self._manifest.getVAllocSize(imgUUID, volUUID)
 
     def deleteImage(self, sdUUID, imgUUID, volsImgs):
@@ -797,7 +867,7 @@ class StorageDomain(object):
 
     @classmethod
     def create(cls, sdUUID, domainName, domClass, typeSpecificArg, version,
-               block_size, alignment):
+               block_size=sc.BLOCK_SIZE_512, max_hosts=sc.HOSTS_4K_1M):
         """
         Create a storage domain. The initial status is unattached.
         The storage domain underlying storage must be visible (connected)
@@ -806,20 +876,47 @@ class StorageDomain(object):
         pass
 
     @classmethod
-    def _validate_block_and_alignment(cls, block_size, alignment, version):
-        # For domain version prior version 5 block size has to ve 512b and
-        # alignment has to be 1M.
+    def _validate_block_size(cls, block_size, version):
+        """
+        Validate that block size can be used with this storage domain class.
+        """
         if version < 5:
             if block_size != sc.BLOCK_SIZE_512:
                 raise se.InvalidParameterException('block_size', block_size)
-            if alignment != sc.ALIGNMENT_1M:
-                raise se.InvalidParameterException('alignment', alignment)
+        else:
+            if block_size not in cls.supported_block_size:
+                raise se.InvalidParameterException('block_size', block_size)
 
-        if block_size not in cls.supported_block_size:
-            raise se.InvalidParameterException('block_size', block_size)
+    @classmethod
+    def _validate_storage_block_size(cls, block_size, storage_block_size):
+        """
+        Validate that block size matches storage block size, returning the
+        block size that should be used with this storage.
+        """
+        # If we cannot detect the storage block size, use the user block size
+        # or fallback to safe default.
+        if storage_block_size == sc.BLOCK_SIZE_NONE:
+            if block_size != sc.BLOCK_SIZE_AUTO:
+                return block_size
+            else:
+                return sc.BLOCK_SIZE_512
 
-        if alignment not in cls.supported_alignment:
-            raise se.InvalidParameterException('alignment', alignment)
+        # If we can detect the storage block size and the user does not care
+        # about it, use it.
+        if block_size == sc.BLOCK_SIZE_AUTO:
+            return storage_block_size
+
+        # Otherwise verify that the user block size matches the storage block
+        # size.
+        if block_size == storage_block_size:
+            return block_size
+
+        raise se.StorageDomainBlockSizeMismatch(block_size, storage_block_size)
+
+    @classmethod
+    def validate_version(cls, version):
+        if version not in cls.supported_versions:
+            raise se.UnsupportedDomainVersion(version)
 
     def _registerResourceNamespaces(self):
         """
@@ -859,15 +956,16 @@ class StorageDomain(object):
         return cls.manifestClass.validateCreateVolumeParams(
             volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate)
 
-    def createVolume(self, imgUUID, size, volFormat, preallocate, diskType,
-                     volUUID, desc, srcImgUUID, srcVolUUID, initialSize=None):
+    def createVolume(self, imgUUID, capacity, volFormat, preallocate, diskType,
+                     volUUID, desc, srcImgUUID, srcVolUUID,
+                     initial_size=None):
         """
         Create a new volume
         """
         return self.getVolumeClass().create(
-            self._getRepoPath(), self.sdUUID, imgUUID, size, volFormat,
+            self._getRepoPath(), self.sdUUID, imgUUID, capacity, volFormat,
             preallocate, diskType, volUUID, desc, srcImgUUID, srcVolUUID,
-            initialSize=initialSize)
+            initial_size=initial_size)
 
     def getMDPath(self):
         return self._manifest.getMDPath()
@@ -1107,6 +1205,9 @@ class StorageDomain(object):
         info['role'] = self.getMetaParam(DMDK_ROLE)
         info['pool'] = self.getPools()
         info['version'] = str(self.getMetaParam(DMDK_VERSION))
+        info['block_size'] = self.block_size
+        info['alignment'] = self.alignment
+
         return info
 
     def getStats(self):
@@ -1243,7 +1344,9 @@ class StorageDomain(object):
         return cls.manifestClass.supports_external_leases(version)
 
     @classmethod
-    def format_external_leases(cls, lockspace, path):
+    def format_external_leases(
+            cls, lockspace, path, alignment=sc.ALIGNMENT_1M,
+            block_size=sc.BLOCK_SIZE_512):
         """
         Format the special xleases volume.
 
@@ -1260,7 +1363,11 @@ class StorageDomain(object):
         """
         with cls.manifestClass.external_leases_backend(
                 lockspace, path) as backend:
-            xlease.format_index(lockspace, backend)
+            xlease.format_index(
+                lockspace,
+                backend,
+                alignment=alignment,
+                block_size=block_size)
 
     def external_leases_path(self):
         return self._manifest.external_leases_path()
@@ -1305,7 +1412,11 @@ class StorageDomain(object):
             path = self.external_leases_path()
             backend = xlease.DirectFile(path)
             with utils.closing(backend):
-                xlease.rebuild_index(self.sdUUID, backend)
+                xlease.rebuild_index(
+                    self.sdUUID,
+                    backend,
+                    alignment=self._manifest.alignment,
+                    block_size=self._manifest.block_size)
 
     # Images
 

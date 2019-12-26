@@ -119,7 +119,7 @@ class ImageRequestHandler(BaseHTTPRequestHandler):
                 self._createEventWithCallback()
 
             # Optional header
-            volUUID = self.headers.getheader(self.HEADER_VOLUME)
+            volUUID = self.headers.get(self.HEADER_VOLUME)
 
             response = img.uploadToStream(methodArgs,
                                           operationEndCallback,
@@ -162,7 +162,7 @@ class ImageRequestHandler(BaseHTTPRequestHandler):
                 self._createEventWithCallback()
 
             # Optional header
-            volUUID = self.headers.getheader(self.HEADER_VOLUME)
+            volUUID = self.headers.get(self.HEADER_VOLUME)
 
             response = img.downloadFromStream(methodArgs,
                                               operationEndCallback,
@@ -186,9 +186,9 @@ class ImageRequestHandler(BaseHTTPRequestHandler):
 
     def _createImage(self):
         # Required headers
-        spUUID = self.headers.getheader(self.HEADER_POOL)
-        sdUUID = self.headers.getheader(self.HEADER_DOMAIN)
-        imgUUID = self.headers.getheader(self.HEADER_IMAGE)
+        spUUID = self.headers.get(self.HEADER_POOL)
+        sdUUID = self.headers.get(self.HEADER_DOMAIN)
+        imgUUID = self.headers.get(self.HEADER_IMAGE)
         if not all((spUUID, sdUUID, imgUUID)):
             raise RequestException(
                 httplib.BAD_REQUEST,
@@ -218,8 +218,7 @@ class ImageRequestHandler(BaseHTTPRequestHandler):
         return self._getInt(value)
 
     def _getRequiredHeader(self, headerName, missingError):
-        value = self.headers.getheader(
-            headerName)
+        value = self.headers.get(headerName)
         if not value:
             raise RequestException(
                 missingError,
@@ -259,7 +258,7 @@ class ImageRequestHandler(BaseHTTPRequestHandler):
 
     def _send_error_response(self, response):
         self.send_response(httplib.INTERNAL_SERVER_ERROR)
-        json_response = json.dumps(response)
+        json_response = json.dumps(response).encode("utf-8")
         self.send_header(self.HEADER_CONTENT_TYPE,
                          'application/json')
         self.send_header(self.HEADER_CONTENT_LENGTH,
@@ -325,13 +324,14 @@ class ThreadedServer(HTTPServer):
 class HttpDetector():
     log = logging.getLogger("HttpDetector")
     NAME = "http"
-    REQUIRED_SIZE = 5
+    HTTP_VERBS = (b"PUT /", b"GET /")
+    REQUIRED_SIZE = max(len(v) for v in HTTP_VERBS)
 
     def __init__(self, server):
         self.server = server
 
     def detect(self, data):
-        return data.startswith("PUT /") or data.startswith("GET /")
+        return data.startswith(HttpDetector.HTTP_VERBS)
 
     def handle_socket(self, client_socket, socket_address):
         self.server.add_socket(client_socket, socket_address)

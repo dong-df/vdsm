@@ -36,9 +36,9 @@ from contextlib import contextmanager
 
 import logging
 
-from vdsm import constants
 from vdsm import utils
 from vdsm.common import properties
+from vdsm.common.units import MiB
 from vdsm.config import config
 
 from vdsm.storage import constants as sc
@@ -184,41 +184,39 @@ def prepare(subchain):
 
 
 def _update_base_capacity(base_vol, top_vol):
-    top_size = top_vol.getSize()
-    base_size = base_vol.getSize()
+    top_capacity = top_vol.getCapacity()
+    base_capacity = base_vol.getCapacity()
     # TODO: raise if top < base raise some impossible state error.
-    if top_size <= base_size:
+    if top_capacity <= base_capacity:
         return
 
     if base_vol.getFormat() == sc.RAW_FORMAT:
         log.info("Updating base capacity, extending size of raw base "
-                 "volume to %d",
-                 top_size)
+                 "volume to %d", top_capacity)
         # extendSize can run on only SPM so only StorageDomain implement it.
         dom = sdCache.produce(base_vol.sdUUID)
         vol = dom.produceVolume(base_vol.imgUUID, base_vol.volUUID)
-        vol.extendSize(top_size)
+        vol.extendSize(top_capacity)
     else:
         log.info("Updating base capacity, setting size in metadata to "
-                 "%d for cow base volume",
-                 top_size)
-        base_vol.setSize(top_size)
+                 "%d for cow base volume", top_capacity)
+        base_vol.setCapacity(top_capacity)
 
 
 def _extend_base_allocation(base_vol, top_vol):
     if not (base_vol.is_block() and base_vol.getFormat() == sc.COW_FORMAT):
         return
 
-    base_alloc = base_vol.getVolumeSize(bs=1)
-    top_alloc = top_vol.getVolumeSize(bs=1)
-    vol_chunk_size = (config.getint('irs', 'volume_utilization_chunk_mb') *
-                      constants.MEGAB)
+    base_alloc = base_vol.getVolumeSize()
+    top_alloc = top_vol.getVolumeSize()
+    vol_chunk_size = config.getint('irs', 'volume_utilization_chunk_mb') * MiB
     potential_alloc = base_alloc + top_alloc + vol_chunk_size
     # TODO: add chunk_size only if top is leaf.
-    capacity = base_vol.getSize() * sc.BLOCK_SIZE
-    max_alloc = utils.round(capacity * sc.COW_OVERHEAD, constants.MEGAB)
+    capacity = base_vol.getCapacity()
+    max_alloc = utils.round(capacity * sc.COW_OVERHEAD, MiB)
     actual_alloc = min(potential_alloc, max_alloc)
-    actual_alloc_mb = (actual_alloc + constants.MEGAB - 1) / constants.MEGAB
+    actual_alloc = utils.round(actual_alloc, MiB)
+    actual_alloc_mb = actual_alloc // MiB
     dom = sdCache.produce(base_vol.sdUUID)
     dom.extendVolume(base_vol.volUUID, actual_alloc_mb)
 
@@ -331,4 +329,4 @@ def _shrink_base_volume(subchain, optimal_size):
     # while reduce is implemented on the Volume.
     sd = sdCache.produce(subchain.sd_id)
     base_vol = sd.produceVolume(subchain.img_id, subchain.base_id)
-    base_vol.reduce(optimal_size // sc.BLOCK_SIZE)
+    base_vol.reduce(optimal_size)

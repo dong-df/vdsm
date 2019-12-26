@@ -29,19 +29,21 @@ from contextlib import contextmanager
 import pytest
 
 from vdsm.common import exception
+from vdsm.common.units import KiB, MiB
 from vdsm.storage import blockdev
 from vdsm.storage import constants as sc
 from vdsm.storage import directio
 from vdsm.storage import exception as se
 
 from . import loopback
+from . marks import requires_root
 
 # Zeroing and discarding block device is instant, so we can use real lv size.
-FILE_SIZE = 128 * 1024**2
+FILE_SIZE = 128 * MiB
 
 # Read and write 128k chunks to keep the tests fast.
-DATA = b"x" * 128 * 1024
-ZERO = b"\0" * 128 * 1024
+DATA = b"x" * 128 * KiB
+ZERO = b"\0" * 128 * KiB
 
 
 @pytest.fixture
@@ -55,7 +57,7 @@ def loop_device(tmpdir):
 
 class TestZero:
 
-    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root")
+    @requires_root
     def test_entire_device(self, loop_device):
         # Write some data to the device.
         with directio.open(loop_device.path, "r+") as f:
@@ -74,7 +76,7 @@ class TestZero:
             data = f.read(len(ZERO))
             assert data == ZERO
 
-    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root")
+    @requires_root
     def test_size(self, loop_device):
         # Write some data to the device.
         with directio.open(loop_device.path, "r+") as f:
@@ -90,8 +92,11 @@ class TestZero:
             data = f.read(len(DATA))
             assert data == DATA
 
-    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root")
-    @pytest.mark.parametrize("size", [sc.BLOCK_SIZE, 250 * 4096])
+    @requires_root
+    @pytest.mark.parametrize("size", [
+        sc.BLOCK_SIZE_4K,
+        250 * sc.BLOCK_SIZE_4K
+    ])
     def test_special_volumes(self, size, loop_device):
         # Write some data to the device.
         with directio.open(loop_device.path, "r+") as f:
@@ -125,7 +130,7 @@ class TestZero:
             data = f.read(FILE_SIZE)
             assert data == b"x" * FILE_SIZE
 
-    @pytest.mark.parametrize("size", [1024**2 - 1, 1024**2 + 1])
+    @pytest.mark.parametrize("size", [MiB - 1, MiB + 1])
     def test_unaligned_size(self, size):
         with pytest.raises(se.InvalidParameterException):
             blockdev.zero("/no/such/path", size=size)
@@ -147,7 +152,7 @@ class TestDiscard:
             data = f.read(len(DATA))
             assert data == DATA
 
-    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root")
+    @requires_root
     def test_supported(self, loop_device):
         # Write some data to the device.
         with directio.open(loop_device.path, "r+") as f:

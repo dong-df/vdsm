@@ -30,13 +30,14 @@ import types
 import weakref
 
 from functools import partial
+import six
 
 from vdsm import constants
+from vdsm import utils
 from vdsm.config import config
+from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage.compat import ioprocess
-
-GLOBAL = 'Global'
 
 DEFAULT_TIMEOUT = config.getint("irs", "process_pool_timeout")
 IOPROC_IDLE_TIME = config.getint("irs", "max_ioprocess_idle_time")
@@ -72,7 +73,7 @@ def stop():
 
 def cleanIdleIOProcesses(clientName):
     now = elapsed_time()
-    for name, (eol, proc) in _procPool.items():
+    for name, (eol, proc) in list(six.iteritems(_procPool)):
         if (eol < now and name != clientName):
             log.debug("Removing idle ioprocess %s", name)
             del _procPool[name]
@@ -94,10 +95,6 @@ def getProcessPool(clientName):
 
         _procPool[clientName] = (elapsed_time() + IOPROC_IDLE_TIME, proc)
         return proc
-
-
-def getGlobalProcPool():
-    return getProcessPool(GLOBAL)
 
 
 class _IOProcessGlob(object):
@@ -184,7 +181,7 @@ class _IOProcessFileUtils(object):
 
     def padToBlockSize(self, path):
         size = _IOProcessOs(self._iop).stat(path).st_size
-        newSize = 512 * ((size + 511) / 512)
+        newSize = utils.round(size, sc.BLOCK_SIZE_4K)
         log.debug("Truncating file %s to %d bytes", path, newSize)
         truncateFile(self._iop, path, newSize)
 
@@ -318,27 +315,17 @@ class _IOProcessUtils(object):
                 raise
 
 
-def directTouch(ioproc, path, mode=0o777):
-    flags = os.O_CREAT | os.O_DIRECT
-    ioproc.touch(path, flags, mode)
-
-
-def directReadLines(ioproc, path):
-    fileStr = ioproc.readfile(path, direct=True)
-    return fileStr.splitlines(True)
-
-
 def readLines(ioproc, path):
     return ioproc.readlines(path)
 
 
 def writeLines(ioproc, path, lines):
-    data = ''.join(lines)
+    data = b''.join(lines)
     return writeFile(ioproc, path, data)
 
 
-def writeFile(ioproc, path, data):
-    return ioproc.writefile(path, data)
+def writeFile(ioproc, path, data, direct=False):
+    return ioproc.writefile(path, data, direct=direct)
 
 
 def simpleWalk(ioproc, path):
@@ -355,7 +342,7 @@ def simpleWalk(ioproc, path):
 
 
 def truncateFile(ioproc, path, size, mode=None, creatExcl=False):
-    ioproc.truncate(path, size, mode, creatExcl)
+    ioproc.truncate(path, size, mode if mode is not None else 0, creatExcl)
     if mode is not None:
         _IOProcessOs(ioproc).chmod(path, mode)
 
@@ -370,10 +357,14 @@ class _IOProcWrapper(types.ModuleType):
         self.os = _IOProcessOs(ioproc)
         self.utils = _IOProcessUtils(ioproc)
 
-        self.directReadLines = partial(directReadLines, ioproc)
         self.readLines = partial(readLines, ioproc)
         self.writeLines = partial(writeLines, ioproc)
         self.writeFile = partial(writeFile, ioproc)
         self.simpleWalk = partial(simpleWalk, ioproc)
-        self.directTouch = partial(directTouch, ioproc)
         self.truncateFile = partial(truncateFile, ioproc)
+
+    def readFile(self, path, direct=False):
+        return self._ioproc.readfile(path, direct=direct)
+
+    def probe_block_size(self, dir_path):
+        return self._ioproc.probe_block_size(dir_path)

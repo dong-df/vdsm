@@ -33,18 +33,18 @@ from monkeypatch import MonkeyPatch, MonkeyPatchScope
 
 from . import qemuio
 
-from testlib import make_config
-from testlib import namedTemporaryDir
 from vdsm.common import cmdutils
 from vdsm.common import commands
 from vdsm.common import constants
-from testlib import temporaryPath
 from vdsm.common import exception
-from vdsm.common.constants import GIB
-from vdsm.common.constants import MEGAB
+from vdsm.common.units import KiB, MiB, GiB
 from vdsm.storage import qemuimg
 
-CLUSTER_SIZE = 64 * 1024
+from testlib import make_config
+from testlib import namedTemporaryDir
+from testlib import temporaryPath
+
+CLUSTER_SIZE = 64 * KiB
 
 QEMU_IMG = qemuimg._qemuimg.cmd
 
@@ -72,7 +72,7 @@ class TestInfo:
 
     def _fake_info(self):
         return {
-            "virtual-size": 1048576,
+            "virtual-size": MiB,
             "filename": "leaf.img",
             "cluster-size": self.CLUSTER_SIZE,
             "format": "qcow2",
@@ -94,7 +94,7 @@ class TestInfo:
         with namedTemporaryDir() as tmpdir:
             base_path = os.path.join(tmpdir, 'base.img')
             leaf_path = os.path.join(tmpdir, 'leaf.img')
-            size = 1048576
+            size = MiB
             leaf_fmt = qemuimg.FORMAT.QCOW2
             with MonkeyPatchScope([(qemuimg, 'config', CONFIG)]):
                 op = qemuimg.create(base_path,
@@ -117,7 +117,7 @@ class TestInfo:
     def test_unsafe_info(self, unsafe):
         with namedTemporaryDir() as tmpdir:
             img = os.path.join(tmpdir, 'img.img')
-            size = 1048576
+            size = MiB
             op = qemuimg.create(img, size=size, format=qemuimg.FORMAT.QCOW2)
             op.run()
             info = qemuimg.info(img, unsafe=unsafe)
@@ -163,7 +163,7 @@ class TestInfo:
 
     def test_compat_reported_for_qcow2_only(self):
         data = {
-            "virtual-size": 1048576,
+            "virtual-size": MiB,
             "filename": "raw.img",
             "format": "raw",
             "actual-size": 0,
@@ -177,7 +177,7 @@ class TestInfo:
     def test_untrusted_image(self):
         with namedTemporaryDir() as tmpdir:
             img = os.path.join(tmpdir, 'untrusted.img')
-            size = 500 * 1024**3
+            size = 500 * GiB
             op = qemuimg.create(img, size=size, format=qemuimg.FORMAT.QCOW2)
             op.run()
             info = qemuimg.info(img, trusted_image=False)
@@ -201,24 +201,38 @@ class TestInfo:
 
 class TestCreate:
 
-    @pytest.mark.parametrize("image_format,allocation_mode,allocated_bytes", [
-        (qemuimg.FORMAT.RAW, qemuimg.PREALLOCATION.OFF, 0),
-        (qemuimg.FORMAT.RAW, qemuimg.PREALLOCATION.FALLOC, 16 * 1024 * 1024),
-        (qemuimg.FORMAT.RAW, qemuimg.PREALLOCATION.FULL, 16 * 1024 * 1024),
+    @pytest.mark.parametrize("preallocation", [
+        qemuimg.PREALLOCATION.FALLOC,
+        qemuimg.PREALLOCATION.FULL,
     ])
-    def test_allocate(self, image_format, allocation_mode, allocated_bytes):
-        size = 16 * 1024 * 1024
+    def test_preallocation(self, preallocation):
+        virtual_size = 10 * MiB
         with temporaryPath() as image:
-            op = qemuimg.create(image,
-                                size=size,
-                                format=image_format,
-                                preallocation=allocation_mode)
+            op = qemuimg.create(
+                image,
+                size=virtual_size,
+                format=qemuimg.FORMAT.RAW,
+                preallocation=preallocation)
             op.run()
-            allocated = os.stat(image).st_blocks * 512
-            assert allocated == allocated_bytes
+            check_raw_preallocated_image(image, virtual_size)
+
+    @pytest.mark.parametrize("preallocation", [
+        None,
+        qemuimg.PREALLOCATION.OFF
+    ])
+    def test_preallocation_off(self, preallocation):
+        virtual_size = 10 * MiB
+        with temporaryPath() as image:
+            op = qemuimg.create(
+                image,
+                size=virtual_size,
+                format=qemuimg.FORMAT.RAW,
+                preallocation=preallocation)
+            op.run()
+            check_raw_sparse_image(image, virtual_size)
 
     def test_no_format(self):
-        size = 4096
+        size = 4 * KiB
         with namedTemporaryDir() as tmpdir:
             image = os.path.join(tmpdir, "image")
             op = qemuimg.create(image, size=size)
@@ -241,7 +255,7 @@ class TestCreate:
     def test_qcow2_compat(self):
         with namedTemporaryDir() as tmpdir:
             image = os.path.join(tmpdir, "image")
-            size = 1024 * 1024 * 1024 * 10  # 10 GB
+            size = 10 * GiB
             op = qemuimg.create(image, format='qcow2', size=size)
             op.run()
 
@@ -253,7 +267,7 @@ class TestCreate:
     def test_qcow2_compat_version3(self):
         with namedTemporaryDir() as tmpdir:
             image = os.path.join(tmpdir, "image")
-            size = 1024 * 1024 * 1024 * 10  # 10 GB
+            size = 10 * GiB
             op = qemuimg.create(image, format='qcow2',
                                 qcow2Compat='1.1', size=size)
             op.run()
@@ -279,7 +293,7 @@ class TestCreate:
             path = os.path.join(tmpdir, 'test.qcow2')
             # Using unsafe=True to verify that it is possible to create an
             # image based on a non-existing backing file, like an inactive LV.
-            qemuimg.create(path, size=1048576, format=qemuimg.FORMAT.QCOW2,
+            qemuimg.create(path, size=MiB, format=qemuimg.FORMAT.QCOW2,
                            backing='no-such-file', unsafe=True)
 
 
@@ -383,8 +397,8 @@ class TestConvertCompressed:
         src_file = str(tmpdir.join("test.raw"))
         dst_file = str(tmpdir.join("test.qcow2"))
         with io.open(src_file, "wb") as f:
-            f.truncate(1 * GIB)
-            f.write(b"x" * MEGAB)
+            f.truncate(1 * GiB)
+            f.write(b"x" * MiB)
 
         src_file_size = qemuimg.info(src_file)["actualsize"]
         op = qemuimg.convert(
@@ -404,13 +418,13 @@ class TestConvertCompressed:
 
         op = qemuimg.create(
             src_file,
-            size=1 * GIB,
+            size=1 * GiB,
             format=qemuimg.FORMAT.QCOW2)
         op.run()
         qemuio.write_pattern(
             src_file,
             qemuimg.FORMAT.QCOW2,
-            len=1 * MEGAB,
+            len=1 * MiB,
             pattern=0xf0)
 
         src_file_size = qemuimg.info(src_file)["actualsize"]
@@ -439,10 +453,10 @@ class TestConvertUnorderedWrites:
     def test_single(self, tmpdir, format):
         src = str(tmpdir.join("src"))
         dst = str(tmpdir.join("dst"))
-        offset = 4 * 64 * 1024
+        offset = 4 * 64 * KiB
 
         op = qemuimg.create(
-            src, size=10 * 64 * 1024, format=format, qcow2Compat="1.1")
+            src, size=10 * 64 * KiB, format=format, qcow2Compat="1.1")
         op.run()
         qemuio.write_pattern(src, format, offset=offset)
 
@@ -461,12 +475,12 @@ class TestConvertUnorderedWrites:
         top = str(tmpdir.join("top"))
         dst = str(tmpdir.join("dst"))
 
-        base_offset = 4 * 64 * 1024
-        top_offset = 5 * 64 * 1024
+        base_offset = 4 * 64 * KiB
+        top_offset = 5 * 64 * KiB
 
         # Create base image with pattern.
         op = qemuimg.create(
-            base, size=10 * 64 * 1024, format=qemuimg.FORMAT.RAW)
+            base, size=10 * 64 * KiB, format=qemuimg.FORMAT.RAW)
         op.run()
         qemuio.write_pattern(base, qemuimg.FORMAT.RAW, offset=base_offset)
 
@@ -492,13 +506,12 @@ class TestConvertUnorderedWrites:
 
 class TestConvertPreallocation:
 
-    @pytest.mark.parametrize("preallocation,virtual_size,actual_size", [
-        (None, 10 * 1024**2, 0),
-        (qemuimg.PREALLOCATION.OFF, 10 * 1024**2, 0),
-        (qemuimg.PREALLOCATION.FALLOC, 10 * 1024**2, 10 * 1024**2),
-        (qemuimg.PREALLOCATION.FULL, 10 * 1024**2, 10 * 1024**2),
+    @pytest.mark.parametrize("preallocation", [
+        qemuimg.PREALLOCATION.FALLOC,
+        qemuimg.PREALLOCATION.FULL,
     ])
-    def test_raw_to_raw(self, preallocation, virtual_size, actual_size):
+    def test_raw_to_raw_preallocation(self, preallocation):
+        virtual_size = 10 * MiB
         with namedTemporaryDir() as tmpdir:
             src = os.path.join(tmpdir, 'src')
             dst = os.path.join(tmpdir, 'dst')
@@ -509,18 +522,32 @@ class TestConvertPreallocation:
             op = qemuimg.convert(src, dst, srcFormat="raw", dstFormat="raw",
                                  preallocation=preallocation)
             op.run()
+            check_raw_preallocated_image(dst, virtual_size)
 
-            stat = os.stat(dst)
-            assert stat.st_size == virtual_size
-            assert stat.st_blocks * 512 == actual_size
-
-    @pytest.mark.parametrize("preallocation,virtual_size,actual_size", [
-        (None, 10 * 1024**2, 0),
-        (qemuimg.PREALLOCATION.OFF, 10 * 1024**2, 0),
-        (qemuimg.PREALLOCATION.FALLOC, 10 * 1024**2, 10 * 1024**2),
-        (qemuimg.PREALLOCATION.FULL, 10 * 1024**2, 10 * 1024**2),
+    @pytest.mark.parametrize("preallocation", [
+        None,
+        qemuimg.PREALLOCATION.OFF
     ])
-    def test_qcow2_to_raw(self, preallocation, virtual_size, actual_size):
+    def test_raw_to_raw_preallocation_off(self, preallocation):
+        virtual_size = 10 * MiB
+        with namedTemporaryDir() as tmpdir:
+            src = os.path.join(tmpdir, 'src')
+            dst = os.path.join(tmpdir, 'dst')
+
+            with io.open(src, "wb") as f:
+                f.truncate(virtual_size)
+
+            op = qemuimg.convert(src, dst, srcFormat="raw", dstFormat="raw",
+                                 preallocation=preallocation)
+            op.run()
+            check_raw_sparse_image(dst, virtual_size)
+
+    @pytest.mark.parametrize("preallocation", [
+        qemuimg.PREALLOCATION.FALLOC,
+        qemuimg.PREALLOCATION.FULL,
+    ])
+    def test_qcow2_to_raw_preallocated(self, preallocation):
+        virtual_size = 10 * MiB
         with namedTemporaryDir() as tmpdir:
             src = os.path.join(tmpdir, 'src')
             dst = os.path.join(tmpdir, 'dst')
@@ -531,10 +558,25 @@ class TestConvertPreallocation:
             op = qemuimg.convert(src, dst, srcFormat="qcow2", dstFormat="raw",
                                  preallocation=preallocation)
             op.run()
+            check_raw_preallocated_image(dst, virtual_size)
 
-            stat = os.stat(dst)
-            assert stat.st_size == virtual_size
-            assert stat.st_blocks * 512 == actual_size
+    @pytest.mark.parametrize("preallocation", [
+        None,
+        qemuimg.PREALLOCATION.OFF
+    ])
+    def test_qcow2_to_raw_sparse(self, preallocation):
+        virtual_size = 10 * MiB
+        with namedTemporaryDir() as tmpdir:
+            src = os.path.join(tmpdir, 'src')
+            dst = os.path.join(tmpdir, 'dst')
+
+            op = qemuimg.create(src, size=virtual_size, format="qcow2")
+            op.run()
+
+            op = qemuimg.convert(src, dst, srcFormat="qcow2", dstFormat="raw",
+                                 preallocation=preallocation)
+            op.run()
+            check_raw_sparse_image(dst, virtual_size)
 
     def test_raw_invalid_preallocation(self):
         with pytest.raises(ValueError):
@@ -543,7 +585,7 @@ class TestConvertPreallocation:
                 preallocation=qemuimg.PREALLOCATION.METADATA)
 
     def test_raw_to_qcow2_metadata_prealloc(self):
-        virtual_size = 10 * 1024**2
+        virtual_size = 10 * MiB
         with namedTemporaryDir() as tmpdir:
             src = os.path.join(tmpdir, 'src')
             dst = os.path.join(tmpdir, 'dst')
@@ -562,15 +604,30 @@ class TestConvertPreallocation:
             assert disk_size < virtual_size
 
 
+def check_raw_sparse_image(path, virtual_size):
+    # Recent qemu-img always allocate the first block of an image;
+    # older versions allocate nothing.
+    # https://github.com/qemu/qemu/commit/3a20013fbb26
+    image_stat = os.stat(path)
+    allocated = image_stat.st_blocks * 512
+    filesystem_block_size = os.statvfs(path).f_bsize
+    assert image_stat.st_size == virtual_size
+    assert allocated <= filesystem_block_size
+
+
+def check_raw_preallocated_image(path, virtual_size):
+    image_stat = os.stat(path)
+    assert image_stat.st_size == virtual_size
+    assert image_stat.st_blocks * 512 == virtual_size
+
+
 class TestCheck:
 
     @MonkeyPatch(qemuimg, 'config', CONFIG)
     def test_check(self):
         with namedTemporaryDir() as tmpdir:
             path = os.path.join(tmpdir, 'test.qcow2')
-            op = qemuimg.create(path,
-                                size=1048576,
-                                format=qemuimg.FORMAT.QCOW2)
+            op = qemuimg.create(path, size=MiB, format=qemuimg.FORMAT.QCOW2)
             op.run()
             info = qemuimg.check(path)
             # The exact value depends on qcow2 internals
@@ -665,7 +722,7 @@ class TestCommit:
         (0, 3, True),
     ])
     def test_commit(self, qcow2_compat, base, top, use_base):
-        size = 1048576
+        size = MiB
         with namedTemporaryDir() as tmpdir:
             chain = []
             parent = None
@@ -689,7 +746,7 @@ class TestCommit:
             base_fmt = (qemuimg.FORMAT.RAW if base == 0 else
                         qemuimg.FORMAT.QCOW2)
             for i in range(base, top + 1):
-                offset = i * 1024
+                offset = i * KiB
                 pattern = 0xf0 + i
                 # The base volume must have the data from all the volumes
                 # merged into it.
@@ -697,7 +754,7 @@ class TestCommit:
                     base_vol,
                     base_fmt,
                     offset=offset,
-                    len=1024,
+                    len=KiB,
                     pattern=pattern)
 
                 if i > base:
@@ -710,7 +767,7 @@ class TestCommit:
 
     def test_commit_progress(self):
         with namedTemporaryDir() as tmpdir:
-            size = 1048576
+            size = MiB
             base = os.path.join(tmpdir, "base.img")
             make_image(base, size, qemuimg.FORMAT.RAW, 0, "1.1")
 
@@ -734,7 +791,7 @@ class TestMap:
     @pytest.mark.parametrize("qcow2_compat", ["0.10", "1.1"])
     def test_empty_image(self, qcow2_compat):
         with namedTemporaryDir() as tmpdir:
-            size = 1048576
+            size = MiB
             image = os.path.join(tmpdir, "base.img")
             op = qemuimg.create(image, size=size, format=self.FORMAT,
                                 qcow2Compat=qcow2_compat)
@@ -753,13 +810,14 @@ class TestMap:
             self.check_map(qemuimg.map(image), expected)
 
     @pytest.mark.parametrize("qcow2_compat", ["0.10", "1.1"])
-    @pytest.mark.parametrize("offset,length,expected_length", [
-        (64 * 1024, 4 * 1024, 65536),
-        (64 * 1024, 72 * 1024, 131072),
-    ])
-    def test_one_block(self, offset, length, expected_length, qcow2_compat):
+    def test_one_cluster(self, qcow2_compat):
         with namedTemporaryDir() as tmpdir:
-            size = 1048576
+            # Write full clusters so we dont fail when qemu change the
+            # implemention of writing partial cluster.
+            offset = 64 * KiB
+            length = 64 * KiB
+            size = MiB
+
             image = os.path.join(tmpdir, "base.img")
             op = qemuimg.create(image, size=size, format=self.FORMAT,
                                 qcow2Compat=qcow2_compat)
@@ -776,21 +834,21 @@ class TestMap:
                 # run 1 - empty
                 {
                     "start": 0,
-                    "length": offset,
+                    "length": length,
                     "data": False,
                     "zero": True,
                 },
                 # run 2 - data
                 {
                     "start": offset,
-                    "length": expected_length,
+                    "length": length,
                     "data": True,
                     "zero": False,
                 },
                 # run 3 - empty
                 {
-                    "start": offset + expected_length,
-                    "length": size - offset - expected_length,
+                    "start": offset + length,
+                    "length": size - offset - length,
                     "data": False,
                     "zero": True,
                 },
@@ -823,7 +881,7 @@ class TestAmend:
         with namedTemporaryDir() as tmpdir:
             base_path = os.path.join(tmpdir, 'base.img')
             leaf_path = os.path.join(tmpdir, 'leaf.img')
-            size = 1048576
+            size = MiB
             op_base = qemuimg.create(base_path, size=size,
                                      format=qemuimg.FORMAT.RAW)
             op_base.run()
@@ -846,7 +904,7 @@ class TestMeasure:
     def test_empty(self, tmpdir, compat, size, format, compressed):
         filename = str(tmpdir.join("test"))
         with io.open(filename, "wb") as f:
-            f.truncate(size * GIB)
+            f.truncate(size * GiB)
         self.check_measure(filename, compat, format, compressed)
 
     @pytest.mark.parametrize("format,compressed", [
@@ -859,8 +917,8 @@ class TestMeasure:
     def test_best_small(self, tmpdir, compat, size, format, compressed):
         filename = str(tmpdir.join("test"))
         with io.open(filename, "wb") as f:
-            f.truncate(size * GIB)
-            f.write(b"x" * MEGAB)
+            f.truncate(size * GiB)
+            f.write(b"x" * MiB)
         self.check_measure(filename, compat, format, compressed)
 
     @pytest.mark.parametrize("format,compressed", [
@@ -873,10 +931,10 @@ class TestMeasure:
     def test_big(self, tmpdir, compat, size, format, compressed):
         filename = str(tmpdir.join("test"))
         with io.open(filename, "wb") as f:
-            f.truncate(size * GIB)
-            f.write(b"x" * MEGAB)
-            f.seek(512 * MEGAB)
-            f.write(b"x" * MEGAB)
+            f.truncate(size * GiB)
+            f.write(b"x" * MiB)
+            f.seek(512 * MiB)
+            f.write(b"x" * MiB)
         self.check_measure(filename, compat, format, compressed)
 
     @pytest.mark.slow
@@ -889,8 +947,8 @@ class TestMeasure:
     def test_worst(self, tmpdir, compat, format, compressed):
         filename = str(tmpdir.join("test"))
         with io.open(filename, "wb") as f:
-            f.truncate(1 * GIB)
-            for off in range(0, GIB, CLUSTER_SIZE):
+            f.truncate(1 * GiB)
+            for off in range(0, GiB, CLUSTER_SIZE):
                 f.seek(off)
         self.check_measure(filename, compat, format, compressed)
 
@@ -904,9 +962,9 @@ class TestMeasure:
     def test_full(self, tmpdir, compat, format, compressed):
         filename = str(tmpdir.join("test"))
         with io.open(filename, "wb") as f:
-            f.truncate(1 * GIB)
+            f.truncate(1 * GiB)
             for _ in range(1024):
-                f.write(b"x" * MEGAB)
+                f.write(b"x" * MiB)
         self.check_measure(filename, compat, format, compressed)
 
     def check_measure(self, filename, compat, format, compressed):
@@ -949,24 +1007,24 @@ def make_image(path, size, format, index, qcow2_compat, backing=None):
                         qcow2Compat=qcow2_compat,
                         backing=backing)
     op.run()
-    offset = index * 1024
+    offset = index * KiB
     qemuio.write_pattern(
         path,
         format,
         offset=offset,
-        len=1024,
+        len=KiB,
         pattern=0xf0 + index)
 
 
 class MapMismatch(AssertionError):
 
     def __init__(self, message, expected, actual):
-        self.message = message
+        self.msg = message
         self.expected = expected
         self.actual = actual
 
     def __str__(self):
-        text = self.message + "\n"
+        text = self.msg + "\n"
         text += "\n"
         text += "Expected map:\n"
         text += pprint.pformat(self.expected) + "\n"

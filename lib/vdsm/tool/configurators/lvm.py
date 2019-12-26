@@ -1,4 +1,4 @@
-# Copyright 2017-2018 Red Hat, Inc.
+# Copyright 2017-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -29,6 +29,7 @@ import time
 
 from vdsm.tool import confmeta
 from vdsm.common import commands
+from vdsm.common import systemctl
 from vdsm.common.cmdutils import CommandPath
 
 from . import YES, NO
@@ -57,6 +58,8 @@ def configure():
         # lvmlocal.conf.
         _backup_file(_LVMLOCAL_CUR)
         _install_file(_LVMLOCAL_VDSM, _LVMLOCAL_CUR)
+    # TODO: remove disabling lvmetad once we don't support Fedora 30. On
+    # Fedora 31 and RHEL8 lvmetad is not supported anymore.
     if not _lvmetad_configured():
         _systemctl("mask", _LVMETAD_SERVICE, _LVMETAD_SOCKET)
         _systemctl("disable", _LVMETAD_SERVICE, _LVMETAD_SOCKET)
@@ -69,6 +72,8 @@ def isconfigured():
     /etc/lvm/lvmlocal.conf is using the correct version, or is marked as
     private. Otherwise return NO.
     """
+    # TODO: we don't need to check if lvmetad is disabled once we don't support
+    # Fedora 30. On Fedora 31 and RHEL8 lvmetad is not supported anymore.
     if _lvm_conf_configured() and _lvmetad_configured():
         _log("lvm is configured for vdsm")
         return YES
@@ -115,36 +120,23 @@ def _lvmetad_configured():
     """
     Return True if both lvmetad service and socket are masked and disabled,
     otherwise return False.
+
+    TODO: remove this function once we don't support Fedora 30. On Fedora 31
+    and RHEL8 lvmetad is not supported anymore.
     """
-    out = _systemctl("show", "--property=Names,LoadState,ActiveState",
-                     _LVMETAD_SERVICE, _LVMETAD_SOCKET)
+    pattern = "lvm2-lvmetad*"
+    properties = ("Names", "LoadState", "ActiveState")
+    units = systemctl.show(pattern, properties=properties)
 
-    # Convert systemctl output:
-    # Names=lvm2-lvmetad.service\nLoadState=masked\nActiveState=inactive\n\n
-    # Names=lvm2-lvmetad.socket\nLoadState=masked\nActiveState=inactive\n
-    # To:
-    # {
-    #     "lvm2-lvmetad.service": {
-    #         "LoadState": "masksed",
-    #         "ActiveState": "inactive"
-    #     },
-    #     "lvm2-lvmetad.socket": {
-    #         "LoadState": "masksed",
-    #         "ActiveState": "inactive"
-    #     },
-    # }
-    units = {}
-    for unit in out.strip().split("\n\n"):
-        info = dict(prop.split("=", 1) for prop in unit.split("\n"))
-        names = info.pop("Names")
-        for name in names.split(","):
-            units[name] = info
+    if not units:
+        # There's no lvmetad and thus nothing to configure
+        return True
 
-    not_configured = {}
-    for name, state in units.items():
+    not_configured = []
+    for unit in units:
         # ActiveState may be "inactive" or "failed", both are good.
-        if state["LoadState"] != "masked" or state["ActiveState"] == "active":
-            not_configured[name] = state
+        if unit["LoadState"] != "masked" or unit["ActiveState"] == "active":
+            not_configured.append(unit)
 
     if not_configured:
         _log("Units need configuration: %s", not_configured)

@@ -1,5 +1,5 @@
 # Copyright 2013 IBM, Inc.
-# Copyright 2017 Red Hat, Inc.
+# Copyright 2017, 2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,7 +24,6 @@ from __future__ import division
 System service management utlities.
 '''
 
-import os
 import functools
 import re
 import sys
@@ -43,23 +42,6 @@ _SYSTEMCTL = CommandPath("systemctl",
                          "/bin/systemctl",
                          "/usr/bin/systemctl",
                          )
-
-_INITCTL = CommandPath("initctl",
-                       "/sbin/initctl",
-                       )
-
-_SERVICE = CommandPath("service",
-                       "/sbin/service",
-                       "/usr/sbin/service",
-                       )
-
-_CHKCONFIG = CommandPath("chkconfig",
-                         "/sbin/chkconfig",
-                         )
-
-_UPDATERC = CommandPath("update-rc.d",
-                        "/usr/sbin/update-rc.d",
-                        )
 
 _srvNameAlts = {
     'iscsid': ['iscsid', 'open-iscsi'],
@@ -82,10 +64,10 @@ class ServiceError(UsageError):
     def __init__(self, message, out=None, err=None):
         self.out = out
         self.err = err
-        self.message = message
+        self.msg = message
 
     def __str__(self):
-        s = ["%s: %s" % (self.__class__.__name__, self.message)]
+        s = ["%s: %s" % (self.__class__.__name__, self.msg)]
         if self.out:
             s.append(self.out)
         if self.err:
@@ -114,13 +96,13 @@ else:
             if rc != 0:
                 raise ServiceOperationError(
                     "Error listing unit files", out, err)
-            fullName = srvName
+            fullName = srvName.encode('utf-8')
             # If unit file type was specified, don't override it.
             if srvName.count('.') < 1:
-                fullName = srvName + ".service"
+                fullName += b".service"
             for line in out.splitlines():
-                if fullName == line.split(" ", 1)[0]:
-                    return systemctlFun(fullName)
+                if fullName == line.split(b" ", 1)[0]:
+                    return systemctlFun(fullName.decode('utf-8'))
             raise ServiceNotExistError("%s is not native systemctl service" %
                                        srvName)
         return wrapper
@@ -171,178 +153,6 @@ else:
 def _isStopped(message):
     stopRegex = r"\bstopped\b|\bstop\b|\bwaiting\b|\bnot running\b"
     return bool(re.search(stopRegex, message, re.MULTILINE))
-
-try:
-    _INITCTL.cmd
-except OSError:
-    pass
-else:
-    def _initctlNative(initctlFun):
-        @functools.wraps(initctlFun)
-        def wrapper(srvName):
-            cmd = [_INITCTL.cmd, "usage", srvName]
-            rc, out, err = execCmd(cmd)
-            if rc != 0:
-                raise ServiceNotExistError("%s is not an Upstart service" %
-                                           srvName)
-
-            return initctlFun(srvName)
-        return wrapper
-
-    @_initctlNative
-    def _initctlStart(srvName):
-        cmd = [_INITCTL.cmd, "start", srvName]
-        alreadyRunRegex = r"\bis already running\b"
-        rc, out, err = execCmd(cmd)
-        if rc != 0:
-            # initctl returns an error if the job is already started
-            # here we ignore it and return 0 if the job is already running
-            rc = int(not re.search(alreadyRunRegex, err, re.MULTILINE))
-        return (rc, out, err)
-
-    @_initctlNative
-    def _initctlStop(srvName):
-        cmd = [_INITCTL.cmd, "stop", srvName]
-        alreadyStoppedRegex = r'\bUnknown instance\b'
-        rc, out, err = execCmd(cmd)
-        if rc != 0:
-            # initctl returns an error if the job is already stopped
-            # here we ignore it and return 0 if the job is already stopped
-            rc = int(not re.search(alreadyStoppedRegex, err, re.MULTILINE))
-        return (rc, out, err)
-
-    @_initctlNative
-    def _initctlStatus(srvName):
-        cmd = [_INITCTL.cmd, "status", srvName]
-        rc, out, err = execCmd(cmd)
-        if rc == 0:
-            # initctl rc is 0 even though the service is stopped
-            rc = _isStopped(out)
-        return (rc, out, err)
-
-    @_initctlNative
-    def _initctlRestart(srvName):
-        # "initctl restart someSrv" will not restart the service if it is
-        # already running, so we force it to do so
-        _initctlStop(srvName)
-        return _initctlStart(srvName)
-
-    @_initctlNative
-    def _initctlReload(srvName):
-        cmd = [_INITCTL.cmd, "reload", srvName]
-        rc, out, err = execCmd(cmd)
-        return (rc, out, err)
-
-    @_initctlNative
-    def _initctlDisable(srvName):
-        if not os.path.isfile("/etc/init/%s.conf" % srvName):
-            return 1, "", ""
-        with open("/etc/init/%s.override" % srvName, "a") as f:
-            f.write("manual\n")
-        return 0, "", ""
-
-    @_initctlNative
-    def _initctlIsManaged(srvName):
-        return (0, '', '')
-
-    _srvStartAlts.append(_initctlStart)
-    _srvStopAlts.append(_initctlStop)
-    _srvStatusAlts.append(_initctlStatus)
-    _srvRestartAlts.append(_initctlRestart)
-    _srvReloadAlts.append(_initctlReload)
-    _srvDisableAlts.append(_initctlDisable)
-    _srvIsManagedAlts.append(_initctlIsManaged)
-
-
-def _sysvNative(sysvFun):
-    @functools.wraps(sysvFun)
-    def wrapper(srvName):
-        srvPath = os.path.join(os.sep + 'etc', 'init.d', srvName)
-        if os.path.exists(srvPath):
-            return sysvFun(srvName)
-
-        raise ServiceNotExistError("%s is not a SysV service" % srvName)
-    return wrapper
-
-try:
-    _SERVICE.cmd
-except OSError:
-    pass
-else:
-    _sysvEnv = os.environ.copy()
-    _sysvEnv['SYSTEMCTL_SKIP_REDIRECT'] = '1'
-    _execSysvEnv = functools.partial(execCmd, env=_sysvEnv)
-
-    @_sysvNative
-    def _serviceStart(srvName):
-        cmd = [_SERVICE.cmd, srvName, "start"]
-        return _execSysvEnv(cmd)
-
-    @_sysvNative
-    def _serviceStop(srvName):
-        cmd = [_SERVICE.cmd, srvName, "stop"]
-        return _execSysvEnv(cmd)
-
-    @_sysvNative
-    def _serviceStatus(srvName):
-        cmd = [_SERVICE.cmd, srvName, "status"]
-        rc, out, err = _execSysvEnv(cmd)
-        if rc == 0:
-            # certain service rc is 0 even though the service is stopped
-            rc = _isStopped(out)
-        return (rc, out, err)
-
-    @_sysvNative
-    def _serviceRestart(srvName):
-        cmd = [_SERVICE.cmd, srvName, "restart"]
-        return _execSysvEnv(cmd)
-
-    @_sysvNative
-    def _serviceReload(srvName):
-        cmd = [_SERVICE.cmd, srvName, "reload"]
-        rc, out, err = _execSysvEnv(cmd)
-        status = service_status(srvName, False)
-        if (rc == 0) and (status != 0):
-            rc = 1
-            err = 'reload failed because service was not running'
-        return (rc, out, err)
-
-    @_sysvNative
-    def _serviceIsManaged(srvName):
-        return (0, '', '')
-
-    _srvStartAlts.append(_serviceStart)
-    _srvStopAlts.append(_serviceStop)
-    _srvRestartAlts.append(_serviceRestart)
-    _srvReloadAlts.append(_serviceReload)
-    _srvStatusAlts.append(_serviceStatus)
-    _srvIsManagedAlts.append(_serviceIsManaged)
-
-
-try:
-    _CHKCONFIG.cmd
-except OSError:
-    pass
-else:
-    @_sysvNative
-    def _chkconfigDisable(srvName):
-        cmd = [_CHKCONFIG.cmd, srvName, "off"]
-        return execCmd(cmd)
-
-    _srvDisableAlts.append(_chkconfigDisable)
-
-
-try:
-    _UPDATERC.cmd
-except OSError:
-    pass
-else:
-    @_sysvNative
-    def _updatercDisable(srvName):
-        cmd = [_UPDATERC.cmd, srvName, "disable"]
-        return execCmd(cmd)
-
-    _srvDisableAlts.append(_updatercDisable)
 
 
 def _runAlts(alts, srvName, *args, **kwarg):

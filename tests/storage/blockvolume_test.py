@@ -25,10 +25,8 @@ from contextlib import contextmanager
 
 import pytest
 
-from vdsm import constants
+from vdsm.common.units import MiB, GiB
 from vdsm.config import config
-from vdsm.constants import GIB
-from vdsm.constants import MEGAB
 from vdsm.storage import blockVolume
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -50,57 +48,61 @@ from testlib import make_uuid
 from testlib import permutations, expandPermutations
 from testlib import VdsmTestCase
 
+
 CONFIG = make_config([('irs', 'volume_utilization_chunk_mb', '1024')])
-GIB_IN_BLOCKS = GIB // sc.BLOCK_SIZE
 
 
 @expandPermutations
 class TestBlockVolumeSize(VdsmTestCase):
 
     @permutations([
-        # (preallocate, capacity in blocks, initial size in blocks),
-        #   allocation size in MB
-        # Preallocate, capacity 2048 blocks, No initial size.
-        #      Expected 1 Mb allocated
-        [(sc.PREALLOCATED_VOL, 2048, None), 1],
-        # Preallocate, capacity 2049 blocks, No initial size.
-        #      Expected 2 Mb allocated
-        [(sc.PREALLOCATED_VOL, 2049, None), 2],
-        # Preallocate, capacity 2097152 blocks, No initial size.
-        #      Expected 1024 Mb allocated
-        [(sc.PREALLOCATED_VOL, 2097152, None), 1024],
-        # Sparse, capacity 9999 blocks, No initial size.
-        #      Expected 1024 Mb allocated
-        [(sc.SPARSE_VOL, 9999, None),
-         config.getint("irs", "volume_utilization_chunk_mb")],
-        # Sparse, capacity 8388608 blocks, initial size 1860.
-        #      Expected 1 Mb allocated
-        [(sc.SPARSE_VOL, 8388608, 1860), 1],
-        # Sparse, capacity 8388608 blocks, initial size 1870.
-        #      Expected 2 Mb allocated
-        [(sc.SPARSE_VOL, 8388608, 1870), 2],
-        # Sparse, capacity 2097152 blocks, initial size 2359296.
-        #      Expected 1268 Mb allocated
-        [(sc.SPARSE_VOL, GIB_IN_BLOCKS,
-          BlockVolume.max_size(GIB, sc.COW_FORMAT) // sc.BLOCK_SIZE),
-         1268],
+        # (preallocate, format, capacity, initial size),
+        # allocation size in bytes
+        # Preallocate, raw, capacity 1 MiB, No initial size.
+        [(sc.PREALLOCATED_VOL, sc.RAW_FORMAT, MiB, None), MiB],
+        # Preallocate, raw, capacity 1 MiB + 1 byte, No initial size.
+        [(sc.PREALLOCATED_VOL, sc.RAW_FORMAT, MiB + 1, None), MiB + 1],
+        # Preallocate, raw, capacity 1 GiB, No initial size.
+        [(sc.PREALLOCATED_VOL, sc.RAW_FORMAT, GiB, None), GiB],
+        # Preallocate, cow, capacity 2 GiB, initial size GiB.
+        # Expected GiB allocated
+        [(sc.PREALLOCATED_VOL, sc.COW_FORMAT, 2 * GiB, GiB), GiB],
+        # Preallocate, cow, capacity 2 GiB, No initial size.
+        # Expected GiB allocated
+        [(sc.PREALLOCATED_VOL, sc.COW_FORMAT, GiB, None), GiB],
+        # Sparse, cow, capacity config.volume_utilization_chunk_mb - 1,
+        # No initial size.
+        # Expected 1024 MiB allocated (config.volume_utilization_chunk_mb)
+        [(sc.SPARSE_VOL, sc.COW_FORMAT, (config.getint(
+            "irs", "volume_utilization_chunk_mb") - 1) * MiB, None), GiB],
+        # Sparse, cow, capacity 4 GiB, initial size 952320 B.
+        [(sc.SPARSE_VOL, sc.COW_FORMAT, 4 * GiB, 952320),
+         int(952320 * blockVolume.QCOW_OVERHEAD_FACTOR)],
+        # Sparse, cow, capacity 4 GiB, initial size 1870.
+        [(sc.SPARSE_VOL, sc.COW_FORMAT, 4 * GiB, 957440),
+         int(957440 * blockVolume.QCOW_OVERHEAD_FACTOR)],
+        # Sparse, cow, capacity 1 GiB, initial size 2359296.
+        [(sc.SPARSE_VOL, sc.COW_FORMAT, GiB,
+          BlockVolume.max_size(GiB, sc.COW_FORMAT)),
+         int(BlockVolume.max_size(GiB, sc.COW_FORMAT) *
+             blockVolume.QCOW_OVERHEAD_FACTOR)],
     ])
     def test_block_volume_size(self, args, result):
         size = BlockVolume.calculate_volume_alloc_size(*args)
         self.assertEqual(size, result)
 
-    @permutations(
-        # preallocate
-        [[sc.PREALLOCATED_VOL],
-         [sc.SPARSE_VOL],
-         ])
-    def test_fail_invalid_block_volume_size(self, preallocate):
+    @permutations([
+        [sc.PREALLOCATED_VOL, sc.RAW_FORMAT],
+        [sc.PREALLOCATED_VOL, sc.COW_FORMAT],
+        [sc.SPARSE_VOL, sc.COW_FORMAT],
+    ])
+    def test_fail_invalid_block_volume_size(self, preallocate, vol_format):
         with self.assertRaises(se.InvalidParameterException):
-            max_size = BlockVolume.max_size(GIB, sc.COW_FORMAT)
-            max_size_blk = max_size // sc.BLOCK_SIZE
+            max_size = BlockVolume.max_size(GiB, vol_format)
             BlockVolume.calculate_volume_alloc_size(preallocate,
-                                                    GIB_IN_BLOCKS,
-                                                    max_size_blk + 1)
+                                                    vol_format,
+                                                    GiB,
+                                                    max_size + 1)
 
 
 @expandPermutations
@@ -122,25 +124,24 @@ class TestBlockVolumeManifest(VdsmTestCase):
 
     def test_max_size_raw(self):
         # verify that max size equals to virtual size.
-        self.assertEqual(BlockVolume.max_size(1 * GIB, sc.RAW_FORMAT),
-                         1 * GIB)
+        self.assertEqual(BlockVolume.max_size(1 * GiB, sc.RAW_FORMAT), 1 * GiB)
 
     def test_max_size_cow(self):
         # verify that max size equals to virtual size with estimated cow
         # overhead, aligned to vg extent size.
-        self.assertEqual(BlockVolume.max_size(10 * GIB, sc.COW_FORMAT),
+        self.assertEqual(BlockVolume.max_size(10 * GiB, sc.COW_FORMAT),
                          11811160064)
 
     def test_optimal_size_raw(self):
         # verify optimal size equals to virtual size.
-        with self.make_volume(size=GIB) as vol:
-            self.assertEqual(vol.optimal_size(), GIB)
+        with self.make_volume(size=GiB) as vol:
+            self.assertEqual(vol.optimal_size(), GiB)
 
     @MonkeyPatch(blockVolume, 'config', CONFIG)
     def test_optimal_size_cow_leaf_empty(self):
         # verify optimal size equals to actual size + one chunk.
-        with self.make_volume(size=GIB, format=sc.COW_FORMAT) as vol:
-            chunk_size = 1024 * constants.MEGAB
+        with self.make_volume(size=GiB, format=sc.COW_FORMAT) as vol:
+            chunk_size = GiB
             check = qemuimg.check(vol.getVolumePath(), qemuimg.FORMAT.QCOW2)
             actual_size = check['offset'] + chunk_size
             self.assertEqual(vol.optimal_size(), actual_size)
@@ -149,19 +150,19 @@ class TestBlockVolumeManifest(VdsmTestCase):
     @MonkeyPatch(blockVolume, 'config', CONFIG)
     def test_optimal_size_cow_leaf_not_empty(self):
         # verify that optimal size is limited to max size.
-        with self.make_volume(size=GIB, format=sc.COW_FORMAT) as vol:
+        with self.make_volume(size=GiB, format=sc.COW_FORMAT) as vol:
             qemuio.write_pattern(
                 path=vol.volumePath,
                 format=sc.fmt2str(vol.getFormat()),
-                len=200 * MEGAB)
-            max_size = vol.max_size(GIB, vol.getFormat())
+                len=200 * MiB)
+            max_size = vol.max_size(GiB, vol.getFormat())
             self.assertEqual(vol.optimal_size(), max_size)
 
     @permutations([
         # actual_size, optimal_size
-        (200 * MEGAB, 1024 * MEGAB),
-        (1023 * MEGAB, 1024 * MEGAB),
-        (1024 * MEGAB, 1024 * MEGAB + blockVolume.MIN_PADDING),
+        (200 * MiB, 256 * MiB),
+        (1023 * MiB, 1024 * MiB),
+        (1024 * MiB, 1024 * MiB + blockVolume.MIN_PADDING),
     ])
     def test_optimal_size_cow_internal(self, actual_size, optimal_size):
         def fake_check(path, format):
@@ -177,10 +178,10 @@ class TestBlockVolumeManifest(VdsmTestCase):
 
     @permutations([
         # capacity, virtual_size, expected_capacity
-        (0, 128 * MEGAB, 128 * MEGAB),  # failed resize, repair capacity
-        (128 * MEGAB, 256 * MEGAB, 256 * MEGAB),  # invalid size, repair cap
-        (128 * MEGAB, 128 * MEGAB, 128 * MEGAB),  # normal case, no change
-        (256 * MEGAB, 128 * MEGAB, 256 * MEGAB),  # cap > actual, no change
+        (0, 128 * MiB, 128 * MiB),  # failed resize, repair capacity
+        (128 * MiB, 256 * MiB, 256 * MiB),  # invalid size, repair cap
+        (128 * MiB, 128 * MiB, 128 * MiB),  # normal case, no change
+        (256 * MiB, 128 * MiB, 256 * MiB),  # cap > actual, no change
     ])
     def test_repair_capacity(self, capacity, virtual_size, expected_capacity):
         with self.make_volume(virtual_size, format=sc.COW_FORMAT) as vol:

@@ -1,4 +1,4 @@
-# Copyright 2015-2017 Red Hat, Inc.
+# Copyright 2015-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,8 +20,6 @@
 from __future__ import absolute_import
 from __future__ import division
 import fcntl
-import functools
-import json
 import os
 import shutil
 import signal
@@ -29,23 +27,28 @@ import struct
 import time
 from contextlib import contextmanager
 from multiprocessing import Process
+import logging
 
-from nose.plugins.skip import SkipTest
+import pytest
 
 from vdsm.common import cpuarch
 from vdsm.network import cmd
+from vdsm.network import nmstate
 from vdsm.network.ip import address
 from vdsm.network.ip import dhclient
 from vdsm.network.ipwrapper import (
-    addrAdd, linkSet, linkAdd, linkDel, IPRoute2Error, netns_add, netns_delete,
-    netns_exec)
+    addrAdd,
+    linkSet,
+    linkAdd,
+    linkDel,
+    IPRoute2Error,
+)
 from vdsm.network.link import iface as linkiface, bond as linkbond
 from vdsm.network.link.iface import random_iface_name
 from vdsm.network.lldpad import lldptool
 from vdsm.network.netinfo import routes
 from vdsm.network.netlink import monitor
 from vdsm.common.cache import memoized
-from vdsm.common.cmdutils import CommandPath
 from vdsm.common.proc import pgrep
 
 from . import dhcp
@@ -53,28 +56,9 @@ from . import firewall
 
 
 EXT_IP = "/sbin/ip"
-EXT_TC = "/sbin/tc"
-_IPERF3_BINARY = CommandPath('iperf3', '/usr/bin/iperf3')
-_SYSTEMCTL = CommandPath('systemctl', '/bin/systemctl', '/usr/bin/systemctl')
-
-
-class ExecError(RuntimeError):
-    def __init__(self, msg, out, err):
-        super(ExecError, self).__init__(msg)
-        self.out = out
-        self.err = err
-
-
-def check_call(cmds):
-    rc, out, err = cmd.exec_sync(cmds)
-    if rc != 0:
-        raise ExecError(
-            'Command %s returned non-zero exit status %s.' % (cmds, rc),
-            out, err)
 
 
 class Interface(object):
-
     def __init__(self, prefix='vdsm-', max_length=11):
         self.devName = random_iface_name(prefix, max_length)
 
@@ -85,36 +69,14 @@ class Interface(object):
         with monitor.Monitor(groups=('link',), timeout=2) as mon:
             linkSet(self.devName, ['down'])
             for event in mon:
-                if (event.get('name') == self.devName and
-                        event.get('state') == 'down'):
+                if (
+                    event.get('name') == self.devName
+                    and event.get('state') == 'down'
+                ):
                     return
 
     def __repr__(self):
         return "<{0} {1!r}>".format(self.__class__.__name__, self.devName)
-
-
-class Bridge(Interface):
-
-    def addDevice(self):
-        linkAdd(self.devName, 'bridge')
-        self.up()
-
-    def delDevice(self):
-        self._down()
-        linkDel(self.devName)
-
-    def addIf(self, dev):
-        linkSet(dev, ['master', self.devName])
-
-
-@contextmanager
-def bridge_device():
-    bridge = Bridge()
-    bridge.addDevice()
-    try:
-        yield bridge
-    finally:
-        bridge.delDevice()
 
 
 class Vlan(Interface):
@@ -125,13 +87,19 @@ class Vlan(Interface):
         super(Vlan, self).__init__(vlan_name, len(vlan_name))
 
     def addDevice(self):
-        linkAdd(self.devName, 'vlan', link=self.backing_device_name,
-                args=['id', str(self.tag)])
+        linkAdd(
+            self.devName,
+            'vlan',
+            link=self.backing_device_name,
+            args=['id', str(self.tag)],
+        )
         self.up()
 
     def delDevice(self):
         self._down()
         linkDel(self.devName)
+        if nmstate.is_nmstate_backend():
+            cmd.exec_sync(['nmcli', 'con', 'del', self.devName])
 
 
 @contextmanager
@@ -149,20 +117,11 @@ def vlan_device(link, tag=16):
             pass
 
 
-@contextmanager
-def network_namespace(name):
-    netns_add(name)
-    try:
-        yield name
-    finally:
-        netns_delete(name)
-
-
 def _listenOnDevice(fd, icmp):
     while True:
         packet = os.read(fd, 2048)
         # check if it is an IP packet
-        if (packet[12:14] == chr(0x08) + chr(0x00)):
+        if packet[12:14] == chr(0x08) + chr(0x00):
             if packet == icmp:
                 return
 
@@ -173,18 +132,19 @@ class Tap(Interface):
     _IFF_NO_PI = 0x1000
     arch = cpuarch.real()
     if arch in (cpuarch.X86_64, cpuarch.S390X):
-        _TUNSETIFF = 0x400454ca
+        _TUNSETIFF = 0x400454CA
     elif cpuarch.is_ppc(arch):
-        _TUNSETIFF = 0x800454ca
+        _TUNSETIFF = 0x800454CA
     else:
-        raise SkipTest("Unsupported Architecture %s" % arch)
+        pytest.skip("Unsupported Architecture %s" % arch)
 
     _deviceListener = None
 
     def addDevice(self):
         self._cloneDevice = open('/dev/net/tun', 'r+b', buffering=0)
-        ifr = struct.pack(b'16sH', self.devName.encode(), self._IFF_TAP |
-                          self._IFF_NO_PI)
+        ifr = struct.pack(
+            b'16sH', self.devName.encode(), self._IFF_TAP | self._IFF_NO_PI
+        )
         fcntl.ioctl(self._cloneDevice, self._TUNSETIFF, ifr)
         self.up()
 
@@ -193,8 +153,9 @@ class Tap(Interface):
         self._cloneDevice.close()
 
     def startListener(self, icmp):
-        self._deviceListener = Process(target=_listenOnDevice,
-                                       args=(self._cloneDevice.fileno(), icmp))
+        self._deviceListener = Process(
+            target=_listenOnDevice, args=(self._cloneDevice.fileno(), icmp)
+        )
         self._deviceListener.start()
 
     def isListenerAlive(self):
@@ -225,9 +186,14 @@ class Dummy(Interface):
     def create(self):
         try:
             linkAdd(self.devName, linkType='dummy')
+            if nmstate.is_nmstate_backend():
+                cmd.exec_sync(
+                    ['nmcli', 'dev', 'set', self.devName, 'managed', 'yes']
+                )
         except IPRoute2Error as e:
-            raise SkipTest('Failed to create a dummy interface %s: %s' %
-                           (self.devName, e))
+            pytest.skip(
+                'Failed to create a dummy interface %s: %s' % (self.devName, e)
+            )
         else:
             return self.devName
 
@@ -238,79 +204,29 @@ class Dummy(Interface):
         try:
             linkDel(self.devName)
         except IPRoute2Error as e:
-            raise SkipTest("Unable to delete the dummy interface %s: %s" %
-                           (self.devName, e))
+            pytest.skip(
+                "Unable to delete the dummy interface %s: %s"
+                % (self.devName, e)
+            )
+        finally:
+            if nmstate.is_nmstate_backend():
+                cmd.exec_sync(['nmcli', 'con', 'del', self.devName])
 
     def set_ip(self, ipaddr, netmask, family=4):
         try:
             addrAdd(self.devName, ipaddr, netmask, family)
         except IPRoute2Error as e:
-            message = ('Failed to add the IPv%s address %s/%s to device %s: %s'
-                       % (family, ipaddr, netmask, self.devName, e))
+            message = (
+                'Failed to add the IPv%s address %s/%s to device %s: %s'
+                % (family, ipaddr, netmask, self.devName, e)
+            )
             if family == 6:
-                message += ("; NetworkManager may have set the sysctl "
-                            "disable_ipv6 flag on the device, please see e.g. "
-                            "RH BZ #1102064")
-            raise SkipTest(message)
-
-
-class IperfServer(object):
-    """Starts iperf as an async process"""
-
-    def __init__(self, host, network_ns):
-        """host: the IP address for the server to listen on.
-        network_ns: an optional network namespace for the server to run in.
-        """
-        self._bind_to = host
-        self._net_ns = network_ns
-        self._popen = None
-
-    def start(self):
-        cmd = [_IPERF3_BINARY.cmd, '--server', '--bind', self._bind_to]
-        self._popen = netns_exec(self._net_ns, cmd)
-
-    def stop(self):
-        self._popen.terminate()
-        self._popen.wait()
-
-
-class IperfClient(object):
-    def __init__(self, server_ip, bind_to, test_time, threads=1):
-        """The client generates a machine readable json output that is set in
-        _raw_output upon completion, and can be read using the 'out' property.
-        server_ip: the ip of the corresponding iperf server
-        bind_to: IP address of the client
-        test_time: in seconds
-        """
-        self._server_ip = server_ip
-        self._bind_to = bind_to
-        self._test_time = test_time
-        self._threads = threads
-        self._raw_output = None
-
-    def start(self):
-        cmds = [_IPERF3_BINARY.cmd, '--client', self._server_ip,
-                '--version4',  # only IPv4
-                '--time', str(self._test_time), '--parallel',
-                str(self._threads), '--bind', self._bind_to,
-                '--zerocopy',  # use less cpu
-                '--json']
-        rc, self._raw_output, err = cmd.exec_sync(cmds)
-        if rc == 1 and 'No route to host' in self.out['error']:
-            # it seems that it takes some time for the routes to get updated
-            # on the os so that we don't get this error, hence the horrific
-            # sleep here.
-            # TODO: Investigate, understand, and remove this sleep.
-            time.sleep(3)
-            rc, self._raw_output, err = cmd.exec_sync(cmds)
-        if rc:
-            raise Exception('iperf3 client failed: cmd=%s, rc=%s, out=%s, '
-                            'err=%s' % (' '.join(cmds), rc, self._raw_output,
-                                        err))
-
-    @property
-    def out(self):
-        return json.loads(self._raw_output)
+                message += (
+                    "; NetworkManager may have set the sysctl "
+                    "disable_ipv6 flag on the device, please see e.g. "
+                    "RH BZ #1102064"
+                )
+            pytest.skip(message)
 
 
 @contextmanager
@@ -359,15 +275,22 @@ def veth_pair(prefix='veth_', max_length=15):
     left_side = random_iface_name(prefix, max_length)
     right_side = random_iface_name(prefix, max_length)
     try:
-        linkAdd(left_side, linkType='veth',
-                args=('peer', 'name', right_side))
+        linkAdd(left_side, linkType='veth', args=('peer', 'name', right_side))
+        if nmstate.is_nmstate_backend():
+            cmd.exec_sync(['nmcli', 'dev', 'set', left_side, 'managed', 'yes'])
+            cmd.exec_sync(
+                ['nmcli', 'dev', 'set', right_side, 'managed', 'yes']
+            )
     except IPRoute2Error as e:
-        raise SkipTest('Failed to create a veth pair: %s', e)
+        pytest.skip('Failed to create a veth pair: %s', e)
     try:
         yield left_side, right_side
     finally:
         # the peer device is removed by the kernel
         linkDel(left_side)
+        if nmstate.is_nmstate_backend():
+            cmd.exec_sync(['nmcli', 'con', 'del', left_side])
+            cmd.exec_sync(['nmcli', 'con', 'del', right_side])
 
 
 @contextmanager
@@ -383,96 +306,40 @@ def enable_lldp_on_ifaces(ifaces, rx_only):
             lldptool.disable_lldp_on_iface(interface)
 
 
-def requires_nm_stopped(message):
-    def decorator(function):
-        @functools.wraps(function)
-        def wrapper(*args, **kwargs):
-            if _nm_is_running():
-                raise SkipTest(message)
-            return function(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
-def _nm_is_running():
+def nm_is_running():
     return len(pgrep('NetworkManager')) > 0
 
 
-def check_tc():
-    dev = Bridge()
-    dev.addDevice()
-    try:
-        check_call([EXT_TC, 'qdisc', 'add', 'dev', dev.devName, 'ingress'])
-    except ExecError as e:
-        raise SkipTest("%r has failed: %s\nDo you have Traffic Control kernel "
-                       "modules installed?" % (EXT_TC, e.err))
-    finally:
-        dev.delDevice()
-
-
-def requires_tc(f):
-    @functools.wraps(f)
-    def wrapper(*a, **kw):
-        check_tc()
-        return f(*a, **kw)
-    return wrapper
-
-
-def _check_iperf():
-    if not os.access(_IPERF3_BINARY.cmd, os.X_OK):
-        raise SkipTest("Cannot run %r: %s\nDo you have iperf3 installed?"
-                       % _IPERF3_BINARY._cmd)
-
-
-def requires_iperf3(f):
-    @functools.wraps(f)
-    def wrapper(*a, **kw):
-        _check_iperf()
-        return f(*a, **kw)
-    return wrapper
-
-
-def requires_systemctl(function):
-    @functools.wraps(function)
-    def wrapper(*args, **kwargs):
-        _requires_systemctl()
-        return function(*args, **kwargs)
-    return wrapper
-
-
-def requires_systemdrun(function):
-    @functools.wraps(function)
-    def wrapper(*args, **kwargs):
-        _requires_root('systemd-run requires root')
-        _requires_systemctl()
-        return function(*args, **kwargs)
-    return wrapper
-
-
 @contextmanager
-def dnsmasq_run(interface, dhcp_range_from=None, dhcp_range_to=None,
-                dhcpv6_range_from=None, dhcpv6_range_to=None, router=None,
-                ipv6_slaac_prefix=None):
+def dnsmasq_run(
+    interface,
+    dhcp_range_from=None,
+    dhcp_range_to=None,
+    dhcpv6_range_from=None,
+    dhcpv6_range_to=None,
+    router=None,
+    ipv6_slaac_prefix=None,
+):
     """Manages the life cycle of dnsmasq as a DHCP/RA server."""
     server = dhcp.Dnsmasq()
-    server.start(interface, dhcp_range_from, dhcp_range_to,
-                 dhcpv6_range_from, dhcpv6_range_to, router,
-                 ipv6_slaac_prefix)
+    server.start(
+        interface,
+        dhcp_range_from,
+        dhcp_range_to,
+        dhcpv6_range_from,
+        dhcpv6_range_to,
+        router,
+        ipv6_slaac_prefix,
+    )
 
-    with firewall.allow_dhcp(interface):
-        try:
-            yield
-        finally:
-            server.stop()
-
-
-def requires_tun(f):
-    @functools.wraps(f)
-    def wrapper(*a, **kw):
-        if not os.path.exists("/dev/net/tun"):
-            raise SkipTest("This test requires tun device")
-        return f(*a, **kw)
-    return wrapper
+    try:
+        with firewall.allow_dhcp(interface):
+            try:
+                yield
+            finally:
+                server.stop()
+    except firewall.FirewallError as e:
+        pytest.skip('Failed to allow DHCP traffic in firewall: %s' % e)
 
 
 @contextmanager
@@ -487,9 +354,11 @@ def wait_for_ipv6(iface, wait_for_scopes=None):
             for event in mon:
                 logevents.append(event)
                 dev_name = event.get('label')
-                if (dev_name == iface and
-                        event.get('event') == 'new_addr' and
-                        event.get('scope') in wait_for_scopes):
+                if (
+                    dev_name == iface
+                    and event.get('event') == 'new_addr'
+                    and event.get('scope') in wait_for_scopes
+                ):
 
                     wait_for_scopes.remove(event.get('scope'))
                     if not wait_for_scopes:
@@ -499,7 +368,8 @@ def wait_for_ipv6(iface, wait_for_scopes=None):
         if e.args[0] == monitor.E_TIMEOUT:
             raise Exception(
                 'IPv6 addresses has not been caught within 20sec.\n'
-                'Event log: {}\n'.format(logevents))
+                'Event log: {}\n'.format(logevents)
+            )
         else:
             raise
 
@@ -511,6 +381,44 @@ def dhclient_run(iface, family=4):
         yield
     finally:
         dhclient.stop(iface, family)
+
+
+@contextmanager
+def dhcp_client_run(iface, family=4):
+    dhcp_client = (
+        dhcp_nm_client if nmstate.is_nmstate_backend() else dhclient_run
+    )
+    with dhcp_client(iface, family):
+        yield
+
+
+@contextmanager
+def dhcp_nm_client(iface, family=4):
+    cmd.exec_sync(
+        [
+            'nmcli',
+            'con',
+            'modify',
+            iface,
+            'ipv{}.method'.format(family),
+            'auto',
+        ]
+    )
+    cmd.exec_sync(['nmcli', 'con', 'up', iface])
+    try:
+        yield
+    finally:
+        cmd.exec_sync(
+            [
+                'nmcli',
+                'con',
+                'modify',
+                iface,
+                'ipv{}.method'.format(family),
+                'disabled',
+            ]
+        )
+        cmd.exec_sync(['nmcli', 'con', 'up', iface])
 
 
 @contextmanager
@@ -526,7 +434,7 @@ def restore_resolv_conf():
 
 def check_sysfs_bond_permission():
     if not has_sysfs_bond_permission():
-        raise SkipTest('This test requires sysfs bond write access')
+        pytest.skip('This test requires sysfs bond write access')
 
 
 @contextmanager
@@ -543,7 +451,8 @@ def preserve_default_route():
         yield
     finally:
         if ipv4_gateway and not routes.is_default_route(
-                ipv4_gateway, routes.get_routes()):
+            ipv4_gateway, routes.get_routes()
+        ):
             address.set_default_route(ipv4_gateway, family=4, dev=ipv4_device)
         if ipv6_gateway and not routes.is_ipv6_default_route(ipv6_gateway):
             address.set_default_route(ipv6_gateway, family=6, dev=ipv6_device)
@@ -570,16 +479,30 @@ def has_sysfs_bond_permission():
     return True
 
 
-def _requires_systemctl():
-    rc, _, err = cmd.exec_sync([_SYSTEMCTL.cmd, 'status', 'foo'])
-    run_chroot_err = 'Running in chroot, ignoring request'
-    if rc == 1 or run_chroot_err in err:
-        raise SkipTest('systemctl is not available')
+class KernelModule(object):
+    SYSFS_MODULE_PATH = '/sys/module'
+    CMD_MODPROBE = 'modprobe'
 
+    def __init__(self, name):
+        self._name = name
 
-def _requires_root(msg='This test must be run as root'):
-    if os.geteuid() != 0:
-        raise SkipTest(msg)
+    def exists(self):
+        return os.path.exists(
+            os.path.join(KernelModule.SYSFS_MODULE_PATH, self._name)
+        )
+
+    def load(self):
+        if not self.exists():
+            ret, out, err = cmd.exec_sync(
+                [KernelModule.CMD_MODPROBE, self._name]
+            )
+            if ret != 0:
+                logging.warning(
+                    'Unable to load %s module, out=%s, err=%s',
+                    self._name,
+                    out,
+                    err,
+                )
 
 
 def running_on_centos():

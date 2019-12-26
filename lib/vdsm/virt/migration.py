@@ -36,6 +36,7 @@ from vdsm import sslutils
 from vdsm import utils
 from vdsm import jsonrpcvdscli
 from vdsm.config import config
+from vdsm.common import xmlutils
 from vdsm.common.compat import pickle
 from vdsm.common.define import NORMAL, Mbytes
 from vdsm.common.network.address import normalize_literal_addr
@@ -99,7 +100,8 @@ class SourceThread(object):
                  mode=MODE_REMOTE, method=METHOD_ONLINE,
                  tunneled=False, dstqemu='', abortOnError=False,
                  consoleAddress=None, compressed=False,
-                 autoConverge=False, recovery=False, **kwargs):
+                 autoConverge=False, recovery=False, encrypted=False,
+                 **kwargs):
         self.log = vm.log
         self._vm = vm
         self._dst = dst
@@ -110,6 +112,7 @@ class SourceThread(object):
         # conversions should be handled properly in the API layer
         self._consoleAddress = consoleAddress
         self._dstqemu = dstqemu
+        self._encrypted = encrypted
         self._maxBandwidth = int(
             kwargs.get('maxBandwidth') or
             config.getint('vars', 'migration_max_bandwidth')
@@ -129,6 +132,7 @@ class SourceThread(object):
         self._migrationCanceledEvt = threading.Event()
         self._monitorThread = None
         self._destServer = None
+        self._legacy_payload_path = None
         if 'convergenceSchedule' in kwargs:
             self._convergence_schedule = kwargs['convergenceSchedule']
         else:
@@ -148,10 +152,9 @@ class SourceThread(object):
         abortOnError = conv.tobool(abortOnError)
         compressed = conv.tobool(compressed)
         autoConverge = conv.tobool(autoConverge)
-        self._migration_flags = self._calculate_migration_flags(tunneled,
-                                                                abortOnError,
-                                                                compressed,
-                                                                autoConverge)
+        self._migration_flags = self._calculate_migration_flags(
+            tunneled, abortOnError, compressed, autoConverge, encrypted
+        )
 
     def start(self):
         self._thread.start()
@@ -324,7 +327,9 @@ class SourceThread(object):
             try:
                 # Use r+ to avoid truncating the file, see BZ#1282239
                 with io.open(fname, "r+b") as f:
-                    pickle.dump(machineParams, f)
+                    # protocol=2 is needed for clusters < 4.4
+                    # (for Python 2 host compatibility)
+                    pickle.dump(machineParams, f, protocol=2)
             finally:
                 self._vm.cif.teardownVolumePath(self._dstparams)
 
@@ -415,15 +420,8 @@ class SourceThread(object):
                         self.log.debug("migration semaphore acquired "
                                        "after %d seconds",
                                        time.time() - startTime)
-                        migrationParams = {
-                            'dst': self._dst,
-                            'mode': self._mode,
-                            'method': METHOD_ONLINE,
-                            'dstparams': self._dstparams,
-                            'dstqemu': self._dstqemu,
-                        }
                         self._startUnderlyingMigration(
-                            time.time(), migrationParams, machineParams
+                            time.time(), machineParams
                         )
                         self._finishSuccessfully(machineParams)
                 except libvirt.libvirtError as e:
@@ -444,8 +442,7 @@ class SourceThread(object):
             self._recover(str(e))
             self.log.exception("Failed to migrate")
 
-    def _startUnderlyingMigration(self, startTime, migrationParams,
-                                  machineParams):
+    def _startUnderlyingMigration(self, startTime, machineParams):
         if self.hibernating:
             self._started = True
             self._vm.hibernate(self._dst)
@@ -474,6 +471,27 @@ class SourceThread(object):
 
             self._started = True
 
+            # REQUIRED_FOR: destination Vdsm < 4.3
+            if not self._vm.min_cluster_version(4, 3):
+                payload_drives = self._vm.payload_drives()
+                if payload_drives:
+                    # Currently, only a single payload device may be present
+                    payload_alias = payload_drives[0].alias
+                    result = self._destServer.fullList(
+                        vmList=(self._vm.id,)
+                    )
+                    vm_list = result.get('items')
+                    remote_devices = vm_list[0].get('devices')
+                    if remote_devices is not None:
+                        payload_path = next(
+                            (d['path'] for d in remote_devices
+                             if d.get('alias') == payload_alias),
+                            None
+                        )
+                        if payload_path is not None:
+                            self._legacy_payload_path = \
+                                (payload_alias, payload_path)
+
             if config.getboolean('vars', 'ssl'):
                 transport = 'tls'
             else:
@@ -481,7 +499,23 @@ class SourceThread(object):
             duri = 'qemu+{}://{}/system'.format(
                 transport, normalize_literal_addr(self.remoteHost))
 
-            dstqemu = migrationParams['dstqemu']
+            if self._encrypted:
+                # TODO: Stop using host names here and set the host
+                # name based certificate verification parameter once
+                # the corresponding functionality is available in
+                # libvirt, see https://bugzilla.redhat.com/1754533
+                #
+                # When an encrypted migration is requested, we must
+                # use the host name (stored in 'dst') rather than the
+                # IP address (stored in 'dstqemu') in order to match
+                # the target certificate.  That means that encrypted
+                # migrations are incompatible with setups that require
+                # an IP address to identify the host properly, such as
+                # when a separate migration network should be used or
+                # when using IPv4/IPv6 dual stack configurations.
+                dstqemu = self.remoteHost
+            else:
+                dstqemu = self._dstqemu
             if dstqemu:
                 muri = 'tcp://{}'.format(
                     normalize_literal_addr(dstqemu))
@@ -523,6 +557,15 @@ class SourceThread(object):
             params[libvirt.VIR_MIGRATE_PARAM_GRAPHICS_URI] = str(
                 '%s://%s' % (graphics, self._consoleAddress)
             )
+        # REQUIRED_FOR: destination Vdsm < 4.3
+        if self._legacy_payload_path is not None:
+            alias, path = self._legacy_payload_path
+            dom = xmlutils.fromstring(self._vm.migratable_domain_xml())
+            source = dom.find(".//alias[@name='%s']/../source" % (alias,))
+            source.set('file', path)
+            xml = xmlutils.tostring(dom)
+            self._vm.log.debug("Migrating domain XML: %s", xml)
+            params[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = xml
         return params
 
     @property
@@ -534,7 +577,7 @@ class SourceThread(object):
         return self._migration_flags
 
     def _calculate_migration_flags(self, tunneled, abort_on_error,
-                                   compressed, auto_converge):
+                                   compressed, auto_converge, encrypted):
         flags = libvirt.VIR_MIGRATE_LIVE | libvirt.VIR_MIGRATE_PEER2PEER
         if tunneled:
             flags |= libvirt.VIR_MIGRATE_TUNNELLED
@@ -544,6 +587,8 @@ class SourceThread(object):
             flags |= libvirt.VIR_MIGRATE_COMPRESSED
         if auto_converge:
             flags |= libvirt.VIR_MIGRATE_AUTO_CONVERGE
+        if encrypted:
+            flags |= libvirt.VIR_MIGRATE_TLS
         if self._vm.min_cluster_version(4, 2):
             flags |= libvirt.VIR_MIGRATE_PERSIST_DEST
         # Migration may fail immediately when VIR_MIGRATE_POSTCOPY flag is
@@ -783,9 +828,9 @@ class MonitorThread(object):
             if not self._vm.switch_migration_to_post_copy():
                 # Do nothing for now; the next action will be invoked after a
                 # while
-                vm.log.warn('Failed to switch to post-copy migration')
+                vm.log.warning('Failed to switch to post-copy migration')
         elif action == CONVERGENCE_SCHEDULE_SET_ABORT:
-            vm.log.warn('Aborting migration')
+            vm.log.warning('Aborting migration')
             vm._dom.abortJob()
             self.stop()
 

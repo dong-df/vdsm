@@ -39,7 +39,6 @@ from vdsm.storage import exception as se
 from vdsm.storage import fileSD
 from vdsm.storage import fileUtils
 from vdsm.storage import iscsi
-from vdsm.storage import misc
 from vdsm.storage import mount
 from vdsm.storage.mount import MountError
 
@@ -637,7 +636,8 @@ class LocalDirectoryConnection(object):
 
     def checkTarget(self):
         if not os.path.isdir(self._path):
-            raise se.StorageServerLocalNotDirError(self._path)
+            raise se.InvalidParameterException(
+                'path', self._path, "not a directory")
         fileSD.validateDirAccess(self._path)
         return True
 
@@ -700,8 +700,8 @@ class ConnectionFactory(object):
     @classmethod
     def createConnection(cls, conInfo):
         conType = conInfo.type
-        params = misc.namedtuple2dict(conInfo.params)
-        for param in params.keys():
+        params = conInfo.params._asdict()
+        for param in list(params):
             if params[param] is None:
                 del params[param]
         try:

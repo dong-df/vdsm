@@ -83,6 +83,7 @@ USER_SHUTDOWN_MESSAGE = 'System going down'
 
 
 throttledlog.throttle('getAllVmStats', 100)
+throttledlog.throttle('getStats', 100)
 
 
 class APIBase(object):
@@ -290,7 +291,7 @@ class VM(APIBase):
         """
         self.log.debug('About to destroy VM %s', self._UUID)
 
-        with self._cif.vmContainerLock:
+        with self._cif.vm_start_stop_lock:
             res = self.vm.destroy(gracefulAttempts)
             status = utils.picklecopy(res)
             if status['status']['code'] == 0:
@@ -402,13 +403,13 @@ class VM(APIBase):
     @api.logged(on="api.virt")
     @api.method
     def hotplugMemory(self, params):
-        validate.require_keys(params, ('vmId', 'memory'))
+        validate.require_keys(params, ('vmId',))
         return self.vm.hotplugMemory(params)
 
     @api.logged(on="api.virt")
     @api.method
     def hotunplugMemory(self, params):
-        validate.require_keys(params, ('vmId', 'memory'))
+        validate.require_keys(params, ('vmId',))
         return self.vm.hotunplugMemory(params)
 
     @api.logged(on="api.virt")
@@ -449,6 +450,7 @@ class VM(APIBase):
             *convergenceSchedule* - actions to perform when stalling
             *outgoingLimit* - max number of outgoing migrations, must be > 0.
             *incomingLimit* - max number of incoming migrations, must be > 0.
+            *encrypted* - whether to use TLS migrations
         """
         params['vmId'] = self._UUID
         self.log.debug(params)
@@ -654,10 +656,8 @@ class VM(APIBase):
 
     @api.logged(on="api.virt")
     @api.method
-    def start_backup(self, backup_id, disks,
-                     from_checkpoint_id=None, to_checkpoint_id=None):
-        return self.vm.start_backup(backup_id, disks,
-                                    from_checkpoint_id, to_checkpoint_id)
+    def start_backup(self, config):
+        return self.vm.start_backup(config)
 
     @api.logged(on="api.virt")
     @api.method
@@ -866,24 +866,12 @@ class Image(APIBase):
     def getVolumes(self):
         return self._irs.getVolumesList(self._sdUUID, self._spUUID, self._UUID)
 
-    def mergeSnapshots(self, ancestor, successor, postZero, discard=False):
-        vmUUID = ''   # Not used
-        # XXX: On success, self._sdUUID needs to be updated
-        return self._irs.mergeSnapshots(self._sdUUID, self._spUUID, vmUUID,
-                                        self._UUID, ancestor, successor,
-                                        postZero, discard)
-
     def move(self, dstSdUUID, operation, postZero, force, discard=False):
         vmUUID = ''   # Not used
         # XXX: On success, self._sdUUID needs to be updated
         return self._irs.moveImage(self._spUUID, self._sdUUID, dstSdUUID,
                                    self._UUID, vmUUID, operation, postZero,
                                    force, discard)
-
-    def sparsify(self, tmpVolUUID, dstSdUUID, dstImgUUID, dstVolUUID):
-        return self._irs.sparsifyImage(self._spUUID, self._sdUUID, self._UUID,
-                                       tmpVolUUID, dstSdUUID, dstImgUUID,
-                                       dstVolUUID)
 
     def cloneStructure(self, dstSdUUID):
         return self._irs.cloneImageStructure(self._spUUID, self._sdUUID,
@@ -1083,11 +1071,6 @@ class StoragePool(APIBase):
     def disconnectStorageServer(self, domainType, connectionParams):
         return self._irs.disconnectStorageServer(domainType, self._UUID,
                                                  connectionParams)
-
-    def fence(self):
-        lastOwner = None   # Unused
-        lastLver = None   # Unused
-        return self._irs.fenceSpmStorage(self._UUID, lastOwner, lastLver)
 
     def getBackedUpVmsInfo(self, storagedomainID, vmList):
         return self._irs.getVmsInfo(self._UUID, storagedomainID, vmList)
@@ -1390,10 +1373,11 @@ class Global(APIBase):
         """
         Report host statistics.
         """
-        return {'status': doneCode,
-                'info': hostapi.get_stats(self._cif,
-                                          sampling.host_samples.stats(),
-                                          multipath=True)}
+        info = hostapi.get_stats(self._cif,
+                                 sampling.host_samples.stats(),
+                                 multipath=True)
+        throttledlog.info('getStats', "Current getStats: %s", info)
+        return {'status': doneCode, 'info': logutils.Suppressed(info)}
 
     @api.logged(on="api.host")
     def setLogLevel(self, level, name=''):
@@ -1431,13 +1415,9 @@ class Global(APIBase):
         """ return a list of known VMs with full (or partial) config each """
         # To improve complexity, convert 'vms' to set(vms)
         vmSet = set(vmList)
-        vmlist = [v.status(fullStatus)
-                  for v in self._cif.vmContainer.values()
+        vmlist = [v.status()
+                  for v in self._cif.getVMs().values()
                   if not vmSet or v.id in vmSet]
-        if not fullStatus and onlyUUID:
-            # BZ 1196735: api backward compatibility issue
-            # REQUIRED_FOR: engine-3.5.0 only
-            vmlist = [v['vmId'] for v in vmlist]
         return {'status': doneCode, 'vmList': vmlist}
 
     @api.logged(on="api.host")
@@ -1521,8 +1501,8 @@ class Global(APIBase):
             supervdsm.getProxy().setupNetworks(networks, bondings, options)
             return {'status': doneCode}
         except ConfigNetworkError as e:
-            self.log.error(e.message, exc_info=True)
-            return {'status': {'code': e.errCode, 'message': e.message}}
+            self.log.error('%s', e.msg, exc_info=True)
+            return {'status': {'code': e.errCode, 'message': e.msg}}
         except exception.HookError as e:
             return response.error('hookError', 'Hook error: ' + str(e))
         finally:
@@ -1556,6 +1536,11 @@ class Global(APIBase):
         Report host network statistics.
         """
         return response.success(info=supervdsm.getProxy().network_stats())
+
+    @api.logged(on="api.host")
+    @api.method
+    def echo(self, message):
+        return {'status': doneCode, 'logged': message}
 
     def getLldp(self, filter):
         return response.success(
@@ -1637,7 +1622,7 @@ class Global(APIBase):
             return errCode['haErr']
 
         try:
-            haClient.HAClient().set_maintenance_mode(mm, enabled)
+            haClient.HAClient().set_maintenance_mode(mm, enabled, timeout=60)
         except Exception:
             self.log.exception("error setting HA maintenance mode")
             return errCode['haErr']

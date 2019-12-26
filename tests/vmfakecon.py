@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2017 Red Hat, Inc.
+# Copyright 2015-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,9 +27,10 @@ import os
 import re
 import xml.etree.ElementTree as etree
 
-from vdsm.common.cache import memoized
-
 import libvirt
+import six
+
+from vdsm.common.cache import memoized
 
 _SCSI = """
 <device>
@@ -145,8 +146,9 @@ class Connection(object):
             dir_name, 'devices', 'data', name + '.xml')
 
         device_xml = None
+        mode = 'rb' if six.PY2 else 'r'
         try:
-            with io.open(xml_path, 'rb') as device_xml_file:
+            with io.open(xml_path, mode) as device_xml_file:
                 device_xml = device_xml_file.read()
         except IOError as e:
             if e.errno == errno.ENOENT:
@@ -161,14 +163,17 @@ class Connection(object):
         def string_to_stub(xml_template, index):
             filled_template = xml_template.format(index)
             final_xml = filled_template.replace('  ', '').replace('\n', '')
-            return VirNodeDeviceStub(final_xml.encode('utf-8'))
+            if six.PY2:
+                final_xml = final_xml.encode('utf-8')
+            return VirNodeDeviceStub(final_xml)
 
         fakelib_path = os.path.realpath(__file__)
         dir_name = os.path.split(fakelib_path)[0]
         xml_path = os.path.join(dir_name, 'devices', 'data', 'devicetree.xml')
 
         ret = []
-        with open(xml_path, 'rb') as device_xml_file:
+        mode = 'rb' if six.PY2 else 'r'
+        with open(xml_path, mode) as device_xml_file:
             for device in device_xml_file:
                 ret.append(VirNodeDeviceStub(device))
 
@@ -212,14 +217,10 @@ class VirNodeDeviceStub(object):
             self._name = None
             self.capability = None
         else:
-            self._name = re.search(
-                b'(?<=<name>).*?(?=</name>)',
-                xml
-            ).group(0)
-            self.capability = re.search(
-                b'(?<=capability type=[\'"]).*?(?=[\'"]>)',
-                xml
-            ).group(0).decode('utf-8')
+            self._name = self._re_search('(?<=<name>).*?(?=</name>)', xml)
+            self.capability = self._re_search(
+                '(?<=capability type=[\'"]).*?(?=[\'"]>)', xml
+            )
 
     def XMLDesc(self, flags=0):
         if self.xml is None:
@@ -229,7 +230,7 @@ class VirNodeDeviceStub(object):
     def name(self):
         if self.xml is None:
             raise Error(libvirt.VIR_ERR_NO_NODE_DEVICE)
-        return self._name.decode('utf-8')
+        return self._name
 
     # unfortunately, in real environment these are the most problematic calls
     # but in order to test them, we would put host in danger of removing
@@ -243,6 +244,14 @@ class VirNodeDeviceStub(object):
     def reAttach(self):
         if self.xml is None:
             raise Error(libvirt.VIR_ERR_NO_NODE_DEVICE)
+
+    def _re_search(self, regexp, data):
+        if six.PY2:
+            regexp = regexp.encode('utf-8')
+        result = re.search(regexp, data).group(0)
+        if six.PY2:
+            result = result.decode('utf-8')
+        return result
 
 
 class FakeRunningVm(object):

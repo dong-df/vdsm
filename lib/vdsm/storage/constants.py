@@ -25,8 +25,9 @@ import os
 import six
 
 from vdsm import constants
-from vdsm.storage import qemuimg
 from vdsm.common.config import config
+from vdsm.common.units import MiB
+from vdsm.storage import qemuimg
 
 
 # ResourceManager Lock Namespaces
@@ -41,20 +42,27 @@ COW_OVERHEAD = 1.1
 
 # The minimal size used to limit internal volume size. This is mainly used
 # when calculating volume optimal size.
-MIN_CHUNK = 8 * VG_EXTENT_SIZE_MB * constants.MEGAB  # 1 GB
+MIN_CHUNK = 8 * VG_EXTENT_SIZE_MB * MiB
 
-# At the moment this is static and it has been introduced to group all the
-# previous implicit references to the block size in FileVolume. In the future
-# it will depend on the storage domain.
-BLOCK_SIZE = 512
-METADATA_SIZE = BLOCK_SIZE
+# TODO: This constant is useful only file base storage, it should be moved to
+# some constant module specific to file based storage once we have such module.
+# Specific stat(2) block size as defined in the man page
+STAT_BYTES_PER_BLOCK = 512
 
 # Supported block sizes in bytes
 BLOCK_SIZE_512 = 512
 BLOCK_SIZE_4K = 4096
+
+METADATA_SIZE = BLOCK_SIZE_512
+
 # Vdsm will detect the underlying storage block size if the storage domain
 # supports this.
 BLOCK_SIZE_AUTO = 0
+
+# This value is not supported as user input, but it may be returned when
+# detecting underlying storage block size, meaning that the underlying
+# storage does not enforce minimal block size for direct I/O.
+BLOCK_SIZE_NONE = 1
 
 # sanlock possible alignment values, that set a lockspace size
 # In combination with a block size (see above)
@@ -64,10 +72,10 @@ BLOCK_SIZE_AUTO = 0
 # - SANLK_RES_ALIGN2M | SANLK_RES_SECTOR4K:  max_hosts 500
 # - SANLK_RES_ALIGN4M | SANLK_RES_SECTOR4K:  max_hosts 1000
 # - SANLK_RES_ALIGN8M | SANLK_RES_SECTOR4K:  max_hosts 2000
-ALIGNMENT_1M = 1024 ** 2
-ALIGNMENT_2M = 2 * ALIGNMENT_1M
-ALIGNMENT_4M = 4 * ALIGNMENT_1M
-ALIGNMENT_8M = 8 * ALIGNMENT_1M
+ALIGNMENT_1M = 1 * MiB
+ALIGNMENT_2M = 2 * MiB
+ALIGNMENT_4M = 4 * MiB
+ALIGNMENT_8M = 8 * MiB
 
 # block size/alignment mapping to the number of hosts
 HOSTS_512_1M = 2000
@@ -78,10 +86,6 @@ HOSTS_4K_8M = 2000
 
 FILE_VOLUME_PERMISSIONS = 0o660
 LEASE_FILEEXT = ".lease"
-
-# Temporary volume indicators
-TEMP_VOL_FILEEXT = ".volatile"         # Added to FileVolume metadata filenames
-TEMP_VOL_LVTAG = "OVIRT_VOL_VOLATILE"  # Tag applied to BlockVolume LVs
 
 # Volume Types
 UNKNOWN_VOL = 0
@@ -111,14 +115,12 @@ HESD_DISKTYPE = "HESD"  # Hosted Engine Sanlock disk
 HEMD_DISKTYPE = "HEMD"  # Hosted Engine metadata disk
 HECI_DISKTYPE = "HECI"  # Hosted Engine configuration image
 
-# TODO: Remove these constants when vdsm doesn't support engine 4.1
-# These constants were used by engine 4.1 and older
-LEGACY_DATA_DISKTYPE = "1"     # Data disk
-LEGACY_SHARED_DISKTYPE = "2"   # Shared disk
-LEGACY_SWAP_DISKTYPE = "3"     # Swap disk
-LEGACY_SYSTEM_DISKTYPE = "4"   # Disk with operating system
-LEGACY_TMP_DISKTYPE = "5"      # Temporary storage disk
-LEGACY_UNKNOWN_DISKTYPE = "6"  # Disk type not specified
+# Engine < 4.2, or engine with compatibility level < 4.2 created data disks
+# with this disk type.
+LEGACY_DATA_DISKTYPE = "2"
+
+# virt-v2v -o rhv/vdsm created data disks with wrong disk type
+LEGACY_V2V_DATA_DISKTYPE = "1"
 
 VOL_DISKTYPE = frozenset([
     DATA_DISKTYPE,
@@ -131,11 +133,7 @@ VOL_DISKTYPE = frozenset([
     HEMD_DISKTYPE,
     HECI_DISKTYPE,
     LEGACY_DATA_DISKTYPE,
-    LEGACY_SHARED_DISKTYPE,
-    LEGACY_SWAP_DISKTYPE,
-    LEGACY_SYSTEM_DISKTYPE,
-    LEGACY_TMP_DISKTYPE,
-    LEGACY_UNKNOWN_DISKTYPE
+    LEGACY_V2V_DATA_DISKTYPE,
 ])
 
 VOLUME_TYPES = {UNKNOWN_VOL: 'UNKNOWN', PREALLOCATED_VOL: 'PREALLOCATED',
@@ -182,7 +180,6 @@ def name2type(name):
 
 # Volume meta data fields
 CAPACITY = "CAP"  # Added in 4.3
-SIZE = "SIZE"  # Deprecated in 4.3
 TYPE = "TYPE"
 FORMAT = "FORMAT"
 DISKTYPE = "DISKTYPE"
@@ -202,7 +199,7 @@ GENERATION = "GEN"  # Added in 4.1
 # Since a disk may be created on file storage, and moved to block
 # storage, the metadata size must be limited on all types of storage.
 #
-# The desription field is limited to 500 characters in the engine side.
+# The description field is limited to 500 characters in the engine side.
 # Since ovirt 3.5, the description field is using JSON format, keeping
 # both alias and description. In OVF_STORE disks, the description field
 # holds additional data such as content size and date.
@@ -277,3 +274,7 @@ P_VDSM_STORAGE = os.path.join(constants.P_VDSM_RUN, 'storage/')
 DOMAIN_MNT_POINT = 'mnt'
 REPO_DATA_CENTER = config.get('irs', 'repository')
 REPO_MOUNT_DIR = os.path.join(REPO_DATA_CENTER, DOMAIN_MNT_POINT)
+
+# TODO: Consider totally removing it in the future.
+# Global process pool name.
+GLOBAL_OOP = 'Global'

@@ -21,6 +21,8 @@
 from __future__ import absolute_import
 from __future__ import division
 
+import inspect
+
 import six
 
 
@@ -79,7 +81,7 @@ except ImportError:
     import json  # NOQA: F401 (unused import)
 
 if six.PY2:
-    import subprocess32 as subprocess
+    import subprocess32 as subprocess  # pylint: disable=import-error
 else:
     import subprocess  # NOQA: F401 (unused import)
 
@@ -91,3 +93,15 @@ except ImportError:
 
 # python2-enum34 or Python's 3 std library version
 from enum import Enum  # NOQA: F401
+
+
+# Wrapper function for inspect arg spec API
+def get_args_spec(func):
+    if six.PY2:
+        spec = inspect.getargspec(func)
+        kwarg = spec.keywords
+    else:
+        spec = inspect.getfullargspec(func)  # pylint: disable=no-member
+        kwarg = spec.varkw
+
+    return spec.args, spec.varargs, kwarg

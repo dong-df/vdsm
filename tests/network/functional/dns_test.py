@@ -32,7 +32,9 @@ from network.nettestlib import restore_resolv_conf
 from . import netfunctestlib as nftestlib
 
 NETWORK_NAME = 'test-network'
-NAMESERVERS = ['1.2.3.4', '2.3.4.5', '6.7.8.9']
+# FIXME: Add third dns when nmstate starts to support it
+# see https://nmstate.atlassian.net/browse/NMSTATE-220
+NAMESERVERS = ['1.2.3.4', '2.3.4.5']
 IPv4_ADDRESS = '192.0.2.1'
 IPv4_GATEWAY = '192.0.2.254'
 IPv4_NETMASK = '255.255.255.0'
@@ -52,21 +54,26 @@ def refresh_cache():
     adapter.refresh_netinfo()
 
 
+@pytest.mark.nmstate
 @nftestlib.parametrize_switch
 class TestNetworkDNS(object):
-
     def test_set_host_nameservers(self, switch):
         original_nameservers = adapter.netinfo.nameservers
-        assert original_nameservers != NAMESERVERS, (
-            'Current nameservers must differ from tested ones')
+        assert (
+            original_nameservers != NAMESERVERS
+        ), 'Current nameservers must differ from tested ones'
         with dummy_device() as nic:
-            NETCREATE = {NETWORK_NAME: {'nic': nic, 'switch': switch,
-                                        'nameservers': NAMESERVERS,
-                                        'defaultRoute': True,
-                                        'ipaddr': IPv4_ADDRESS,
-                                        'netmask': IPv4_NETMASK,
-                                        'gateway': IPv4_GATEWAY,
-                                        }}
+            NETCREATE = {
+                NETWORK_NAME: {
+                    'nic': nic,
+                    'switch': switch,
+                    'nameservers': NAMESERVERS,
+                    'defaultRoute': True,
+                    'ipaddr': IPv4_ADDRESS,
+                    'netmask': IPv4_NETMASK,
+                    'gateway': IPv4_GATEWAY,
+                }
+            }
             with restore_resolv_conf(), preserve_default_route():
                 with adapter.setupNetworks(NETCREATE, {}, nftestlib.NOCHK):
                     adapter.assertNameservers(NAMESERVERS)
@@ -74,25 +81,33 @@ class TestNetworkDNS(object):
     def test_preserve_host_nameservers(self, switch):
         original_nameservers = adapter.netinfo.nameservers
         with dummy_device() as nic:
-            NETCREATE = {NETWORK_NAME: {'nic': nic, 'switch': switch,
-                                        'defaultRoute': True,
-                                        'ipaddr': IPv4_ADDRESS,
-                                        'netmask': IPv4_NETMASK,
-                                        'gateway': IPv4_GATEWAY,
-                                        }}
+            NETCREATE = {
+                NETWORK_NAME: {
+                    'nic': nic,
+                    'switch': switch,
+                    'defaultRoute': True,
+                    'ipaddr': IPv4_ADDRESS,
+                    'netmask': IPv4_NETMASK,
+                    'gateway': IPv4_GATEWAY,
+                }
+            }
             with restore_resolv_conf(), preserve_default_route():
                 with adapter.setupNetworks(NETCREATE, {}, nftestlib.NOCHK):
                     adapter.assertNameservers(original_nameservers)
 
     def test_set_nameservers_on_non_default_network(self, switch):
         with dummy_device() as nic:
-            NETCREATE = {NETWORK_NAME: {'nic': nic, 'switch': switch,
-                                        'nameservers': NAMESERVERS,
-                                        'defaultRoute': False,
-                                        'ipaddr': IPv4_ADDRESS,
-                                        'netmask': IPv4_NETMASK,
-                                        'gateway': IPv4_GATEWAY,
-                                        }}
+            NETCREATE = {
+                NETWORK_NAME: {
+                    'nic': nic,
+                    'switch': switch,
+                    'nameservers': NAMESERVERS,
+                    'defaultRoute': False,
+                    'ipaddr': IPv4_ADDRESS,
+                    'netmask': IPv4_NETMASK,
+                    'gateway': IPv4_GATEWAY,
+                }
+            }
             with pytest.raises(nftestlib.SetupNetworksError) as err:
                 adapter.setupNetworks(NETCREATE, {}, nftestlib.NOCHK)
             assert err.value.status == ERR_BAD_PARAMS

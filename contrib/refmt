@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 #
 # Copyright 2016 Red Hat, Inc.
 #
@@ -59,6 +59,8 @@
 #                                            'lastCheck': '0.0',
 #                                            'valid': True,
 #                                            'version': 3}}
+
+from __future__ import absolute_import
 
 import argparse
 import fileinput

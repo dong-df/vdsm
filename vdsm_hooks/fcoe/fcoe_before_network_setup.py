@@ -1,4 +1,7 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
+
+from __future__ import absolute_import
+
 """
 FCoE hook:
    if fcoe = true custom networks was specified enable FCoE for specified NIC

@@ -1,4 +1,6 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
+
+from __future__ import absolute_import
 
 import os
 import re
@@ -46,7 +48,7 @@ def indexToDiskName(i):
     s = ''
     while True:
         s = chr(ord('a') + i % 26) + s
-        i = i / 26
+        i = i // 26
         if i == 0:
             break
     return 'vd' + (s or 'a')

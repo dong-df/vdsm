@@ -15,14 +15,15 @@ LimitCORE=infinity
 EnvironmentFile=-/etc/sysconfig/vdsm
 ExecStartPre=@LIBEXECDIR@/vdsmd_init_common.sh --pre-start
 ExecStart=@VDSMDIR@/daemonAdapter -0 /dev/null -1 /dev/null -2 /dev/null "@VDSMDIR@/vdsmd"
-ExecStopPost=@LIBEXECDIR@/vdsmd_init_common.sh --post-stop
+# WARNING: Do not use ExecStopPost, breaks killing child processes.
+# https://bugzilla.redhat.com/1761260
 Restart=always
 Nice=-20
 User=@VDSMUSER@
 Group=@VDSMGROUP@
 PermissionsStartOnly=true
 TimeoutStopSec=@SERVICE_STOP_TIMEOUT@
-KillMode=mixed
+KillMode=control-group
 LimitNOFILE=4096
 @SYSTEMD_LIMIT_MEMLOCK@
 

@@ -25,10 +25,6 @@ import os
 
 GLUSTER_MGMT_ENABLED = bool(@GLUSTER_MGMT@)
 
-# SMBIOS manufacturer
-SMBIOS_MANUFACTURER = '@SMBIOS_MANUFACTURER@'
-SMBIOS_OSNAME = '@SMBIOS_OSNAME@'
-
 #
 # file ownership definitions
 #
@@ -80,7 +76,6 @@ SYSCONF_PATH = '@sysconfdir@'
 EXT_CHOWN = '@CHOWN_PATH@'
 
 EXT_DD = '@DD_PATH@'
-EXT_DMIDECODE = '@DMIDECODE_PATH@'
 EXT_DMSETUP = '@DMSETUP_PATH@'
 
 EXT_FENCE_PREFIX = os.path.dirname('@FENCE_AGENT_PATH@') + '/fence_'

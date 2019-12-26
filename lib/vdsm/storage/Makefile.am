@@ -26,6 +26,7 @@ dist_vdsmstorage_PYTHON = \
 	__init__.py \
 	asyncevent.py \
 	asyncutils.py \
+	backends.py \
 	blkdiscard.py \
 	blockSD.py \
 	blockVolume.py \
@@ -114,7 +115,7 @@ EXTRA_DIST = \
 all: vdsm-lvm.rules
 
 vdsm-lvm.rules: vdsm_lvm_rules.template
-	$(VDSM_TARGET_PY_VERSION) $< > $@
+	python3 $< > $@
 
 install-data-local: vdsm-lvm.rules
 	$(MKDIR_P) $(DESTDIR)/usr/lib/udev/rules.d

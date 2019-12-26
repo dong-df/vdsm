@@ -21,21 +21,30 @@
 from __future__ import absolute_import
 
 import errno
+import logging
 import os
 import re
 
 from collections import namedtuple
 from glob import glob
 
-from vdsm.common.supervdsm import getProxy
 from vdsm.common import cmdutils
+from vdsm.common import supervdsm
+from vdsm.common import commands
 from vdsm.constants import EXT_DMSETUP
-from vdsm.storage import misc
+
 
 DMPATH_PREFIX = "/dev/mapper/"
 
 
 PathStatus = namedtuple("PathStatus", "name, status")
+
+
+log = logging.getLogger("storage.devicemapper")
+
+
+class Error(Exception):
+    """ device mapper operation failed """
 
 
 def getDmId(deviceMultipathName):
@@ -122,14 +131,14 @@ def getAllSlaves():
 
 
 def removeMapping(deviceName):
-    return getProxy().removeDeviceMapping(deviceName)
+    if os.geteuid() != 0:
+        return supervdsm.getProxy().devicemapper_removeMapping(deviceName)
 
-
-def _removeMapping(deviceName):
     cmd = [EXT_DMSETUP, "remove", deviceName]
-    rc = misc.execCmd(cmd)[0]
-    if rc != 0:
-        raise Exception("Could not remove mapping `%s`" % deviceName)
+    try:
+        commands.run(cmd)
+    except cmdutils.Error as e:
+        raise Error("Could not remove mapping {!r}: {}".format(deviceName, e))
 
 
 def getAllMappedDevices():
@@ -156,14 +165,20 @@ def removeMappingsHoldingDevice(slaveName):
 PATH_STATUS_RE = re.compile(r"(?P<devnum>\d+:\d+)\s+(?P<status>[AF])")
 
 
-def _getPathsStatus():
+def getPathsStatus():
+    if os.geteuid() != 0:
+        return supervdsm.getProxy().devicemapper_getPathsStatus()
+
     cmd = [EXT_DMSETUP, "status", "--target", "multipath"]
-    rc, out, err = misc.execCmd(cmd)
-    if rc != 0:
-        raise Exception("Could not get device statuses")
+    try:
+        out = commands.run(cmd)
+    except cmdutils.Error as e:
+        raise Error("Could not get device statuses: {}".format(e))
+
+    lines = out.decode("utf-8").splitlines()
 
     res = {}
-    for statusLine in out:
+    for statusLine in lines:
         try:
             devName, statusLine = statusLine.split(":", 1)
         except ValueError:
@@ -181,15 +196,15 @@ def _getPathsStatus():
     return res
 
 
-def getPathsStatus():
-    return getProxy().getPathsStatus()
+def multipath_status():
+    if os.geteuid() != 0:
+        return supervdsm.getProxy().devicemapper_multipath_status()
 
-
-def _multipath_status():
     cmd = [EXT_DMSETUP, "status", "--target", "multipath"]
-    rc, out, err = misc.execCmd(cmd, raw=True)
-    if rc != 0:
-        raise cmdutils.Error(cmd, rc, out, err)
+    try:
+        out = commands.run(cmd)
+    except cmdutils.Error as e:
+        raise Error("Cannot get multipath status: {}".format(e))
 
     res = {}
     lines = out.decode("utf-8").splitlines()
@@ -212,7 +227,3 @@ def _multipath_status():
         res[guid] = statuses
 
     return res
-
-
-def multipath_status():
-    return getProxy().multipath_status()

@@ -23,19 +23,38 @@ from __future__ import absolute_import
 from __future__ import division
 
 import os
+import sys
 
 import six
 import pytest
 
 from vdsm.common import cache
 from vdsm.common import commands
+from vdsm.common import compat
+
+from vdsm.storage.compat import sanlock
+
+from testing import on_travis_ci, on_ovirt_ci
 
 
 requires_root = pytest.mark.skipif(
     os.geteuid() != 0, reason="requires root")
 
+requires_unprivileged_user = pytest.mark.skipif(
+    os.geteuid() == 0, reason="This test can not run as root")
+
+requires_sanlock = pytest.mark.skipif(
+    isinstance(sanlock, compat.MissingModule),
+    reason="sanlock is not available")
+
 xfail_python3 = pytest.mark.xfail(
     six.PY3, reason="needs porting to python 3")
+
+xfail_python37 = pytest.mark.xfail(
+    sys.version_info[:2] == (3, 7), reason="needs porting to python 3.7")
+
+broken_on_ci = pytest.mark.skipif(
+    on_ovirt_ci() or on_travis_ci(), reason="fails on CI")
 
 
 @cache.memoized

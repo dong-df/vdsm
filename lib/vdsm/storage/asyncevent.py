@@ -73,6 +73,7 @@ import six
 from vdsm.common import filecontrol
 from vdsm.common import osutils
 from vdsm.common import time
+from vdsm.common.units import KiB
 
 log = logging.getLogger("storage.asyncevent")
 
@@ -439,7 +440,7 @@ def poll(timeout=0.0, map=None):
     try:
         r = pollster.poll(timeout)
     except select.error as e:
-        if e[0] != errno.EINTR:
+        if e.args[0] != errno.EINTR:
             raise
         return []
 
@@ -568,7 +569,7 @@ class Waker(asyncore.file_dispatcher):
             raise
 
     def handle_read(self):
-        osutils.uninterruptible(self.socket.read, 1024)
+        osutils.uninterruptible(self.socket.read, KiB)
 
     def handle_close(self):
         log.error("Wakeup read end was closed")

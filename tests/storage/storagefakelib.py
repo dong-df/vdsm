@@ -32,6 +32,7 @@ from testlib import make_file, recorded
 from testlib import namedTemporaryDir
 
 from vdsm import utils
+from vdsm.common.units import MiB, GiB
 from vdsm.storage import blockVolume
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -39,6 +40,8 @@ from vdsm.storage import fileVolume
 from vdsm.storage import lvm as real_lvm
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import sd
+from vdsm.storage import sp
+from vdsm.storage import spbackends as spb
 
 
 VG = collections.namedtuple("VG", [
@@ -52,9 +55,9 @@ VG = collections.namedtuple("VG", [
 
 class FakeLVM(object):
     # We pretend all PVs are 10G in size
-    _PV_SIZE = 10 << 30
+    _PV_SIZE = 10 * GiB
     # Found via inspection of real environment
-    _PV_PE_SIZE = sc.VG_EXTENT_SIZE_MB << 20
+    _PV_PE_SIZE = sc.VG_EXTENT_SIZE_MB * MiB
     # The number of PEs used for metadata areas
     _PV_MDA_COUNT = 2
     # 2 PE for metadata + 1 PE to hold a header
@@ -68,14 +71,14 @@ class FakeLVM(object):
         self.lvmd = {}
 
     def createVG(self, vgName, devices, initialTag, metadataSize, force=False):
-        # Convert params from MB to bytes to match other fields
-        metadataSize <<= 20
-        extentsize = sc.VG_EXTENT_SIZE_MB << 20
+        # Convert params from MiB to bytes to match other fields
+        metadataSize *= MiB
+        extentsize = sc.VG_EXTENT_SIZE_MB * MiB
 
         for dev in devices:
             self._create_pv(dev, vgName, self._PV_SIZE)
         pv_name = (tuple(_fqpvname(pdev)
-                         for pdev in real_lvm._normalizeargs(devices)))
+                         for pdev in real_lvm.normalize_args(devices)))
         extent_count = self._calc_vg_pe_count(vgName)
         size = extent_count * self._PV_PE_SIZE
 
@@ -110,10 +113,10 @@ class FakeLVM(object):
         pass
 
     def _size_param_to_bytes(self, size):
-        # Size is received as a string in MB.  We need to convert it to bytes
+        # Size is received as a string in MiB.  We need to convert it to bytes
         # and round it up to a multiple of the VG extent size.
-        extent_size = sc.VG_EXTENT_SIZE_MB << 20
-        size = int(size) << 20
+        extent_size = sc.VG_EXTENT_SIZE_MB * MiB
+        size = int(size) * MiB
         return utils.round(size, extent_size)
 
     def _create_lv_file(self, vgName, lvName, active, size):
@@ -200,25 +203,21 @@ class FakeLVM(object):
         lv_md['active'] = False
         lv_md['attr']['state'] = '-'
 
-    def addtag(self, vg, lv, tag):
-        try:
-            lv_md = self.lvmd[(vg, lv)]
-        except KeyError:
-            raise se.MissingTagOnLogicalVolume("%s/%s" % (vg, lv), tag)
-        lv_md['tags'] += (tag,)
+    def changeLVsTags(self, vg, lvs, delTags=(), addTags=()):
+        lv_mds = []
+        for lv in lvs:
+            try:
+                lv_mds.append(self.lvmd[(vg, lv)])
+            except KeyError:
+                raise se.LogicalVolumeReplaceTagError("LV %s does not exist",
+                                                      "%s/%s" % (vg, lv))
 
-    def changeLVTags(self, vg, lv, delTags=(), addTags=()):
-        try:
-            lv_md = self.lvmd[(vg, lv)]
-        except KeyError:
-            raise se.LogicalVolumeReplaceTagError("LV %s does not exist",
-                                                  "%s/%s" % (vg, lv))
-
-        # Adding an existing tag or removing a nonexistent tag are ignored
-        tags = set(lv_md['tags'])
-        tags |= set(addTags)
-        tags -= set(delTags)
-        lv_md['tags'] = tuple(tags)
+        for lv_md in lv_mds:
+            # Adding an existing tag or removing a nonexistent tag are ignored
+            tags = set(lv_md['tags'])
+            tags |= set(addTags)
+            tags -= set(delTags)
+            lv_md['tags'] = tuple(tags)
 
     def lvsByTag(self, vgName, tag):
         return [lv for lv in self.getLV(vgName) if tag in lv.tags]
@@ -454,3 +453,11 @@ def fake_repo():
 def fake_vg(vg_mda_size=None, vg_mda_free=None, extent_size=None,
             extent_count=None, free=None):
     return VG(vg_mda_size, vg_mda_free, extent_size, extent_count, free)
+
+
+def fake_spm(pool_id, master_version, domains_map):
+    pool = sp.StoragePool(pool_id, None, None)
+    pool.setBackend(spb.StoragePoolMemoryBackend(
+        pool, master_version, domains_map))
+    pool._setSecure()
+    return pool

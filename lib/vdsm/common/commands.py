@@ -165,6 +165,28 @@ def start(args, stdin=None, stdout=None, stderr=None, cwd=None, env=None,
         env=env)
 
 
+def communicate(proc, input=None):
+    """
+    A wrapper for subprocess.communicate() which waits for process to be
+    finished and logs the returned code (and error output if any).
+
+    Arguments:
+        proc: subprocess.Popen instance or commands.PrivilegedPopen if
+            subprocess was created with sudo enabled.
+        input (str): input data to be sent to the child process, or None, if
+            no data should be sent to the process.
+
+    Returns:
+        Tuple of process standard output and error output.
+    """
+    with terminating(proc):
+        out, err = proc.communicate(input)
+
+    log.debug(cmdutils.retcode_log_line(proc.returncode, err=err))
+
+    return out, err
+
+
 @deprecated
 def execCmd(command, sudo=False, cwd=None, data=None, raw=False,
             printable=None, env=None, nice=None, ioclass=None,
@@ -197,7 +219,7 @@ def execCmd(command, sudo=False, cwd=None, data=None, raw=False,
 
     if out is None:
         # Prevent splitlines() from barfing later on
-        out = ""
+        out = b""
 
     execCmdLogger.debug(retcode_log_line(p.returncode, err=err))
 
@@ -225,19 +247,6 @@ class PrivilegedPopen(subprocess.Popen):
         except cmdutils.Error as e:
             log.warning("Error sending signal to child process %d: %s",
                         self.pid, e.err)
-
-
-def grepCmd(pattern, paths):
-    cmd = [constants.EXT_GREP, '-E', '-H', pattern]
-    cmd.extend(paths)
-    rc, out, err = execCmd(cmd)
-    if rc == 0:
-        matches = out  # A list of matching lines
-    elif rc == 1:
-        matches = []  # pattern not found
-    else:
-        raise ValueError("rc: %s, out: %s, err: %s" % (rc, out, err))
-    return matches
 
 
 class TerminatingFailure(Exception):

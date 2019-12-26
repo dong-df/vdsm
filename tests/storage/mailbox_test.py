@@ -24,17 +24,23 @@ from __future__ import division
 import collections
 import contextlib
 import io
+import logging
 import threading
 import struct
+import time
+
+from functools import partial
 
 import pytest
 
-from testlib import mock
+from testlib import make_uuid
 
 import vdsm.storage.mailbox as sm
 
+from vdsm.common.units import MiB, GiB
+
 MAX_HOSTS = 10
-MAILER_TIMEOUT = 6
+MAILER_TIMEOUT = 10
 
 # We used 0.1 seconds for several years, and it proved flaky, failing randomly.
 MONITOR_INTERVAL = 0.2
@@ -43,6 +49,32 @@ SPUUID = '5d928855-b09b-47a7-b920-bd2d2eb5808c'
 
 
 MboxFiles = collections.namedtuple("MboxFiles", "inbox, outbox")
+
+log = logging.getLogger("test")
+
+
+def volume_data(volume_id=None):
+    if volume_id is None:
+        volume_id = 'd772f1c6-3ebb-43c3-a42e-73fcd8255a5f'
+    return dict(poolID=SPUUID,
+                domainID='8adbc85e-e554-4ae0-b318-8a5465fe5fe1',
+                volumeID=volume_id)
+
+
+def extend_message(size=128 * MiB):
+    # Generates a 64 bytes long extend message, with extend size given
+    # as parameter. The message volume data is the default result of
+    # volume_data().
+    message = (
+        b"\x31\x78\x74\x6e\x64\xe1\x5f\xfe"
+        b"\x65\x54\x8a\x18\xb3\xe0\x4a\x54"
+        b"\xe5\x5e\xc8\xdb\x8a\x5f\x5a\x25"
+        b"\x25\xd8\xfc\x73\x2e\xa4\xc3\x43"
+        b"\xbb\x3e\xc6\xf1\x72\xd7\x30\x30"
+        b"\x30\x30\x30\x30\x30\x30%08x\x30"
+        b"\x30\x30\x30\x30\x30\x30\x30\x30"
+        b"\x30\x30") % size
+    return message
 
 
 @pytest.fixture()
@@ -94,6 +126,39 @@ def make_spm_mailbox(mboxfiles):
             raise RuntimeError('Timemout waiting for spm mailbox')
 
 
+class FakeSPMMailer(object):
+    """
+    Fake SPM mailer class for sending reply message when
+    pool extend volume request handling is done.
+    """
+    def __init__(self):
+        self.msg_id = None
+        self.msg = None
+
+    def sendReply(self, msg_id, msg):
+        self.msg_id = msg_id
+        self.msg = msg
+
+
+class FakePool(object):
+    """
+    Fake storage pool class implementing the extend volume interface used by
+    storage mailbox code.
+    """
+    spUUID = SPUUID
+
+    def __init__(self, mailer):
+        self.spmMailer = mailer
+        self.volume_data = None
+
+    def extendVolume(self, sdUUID, volUUID, newSize):
+        self.volume_data = {
+            'domainID': sdUUID,
+            'volumeID': volUUID,
+            'size': newSize
+        }
+
+
 class TestSPMMailMonitor:
 
     def test_thread_leak(self, mboxfiles):
@@ -118,6 +183,10 @@ class TestSPMMailMonitor:
             with io.open(mboxfiles.outbox, "rb") as f:
                 data = f.read()
             assert data == sm.EMPTYMAILBOX * MAX_HOSTS
+
+    def test_skip_empty_request(self, mboxfiles, monkeypatch):
+        with make_spm_mailbox(mboxfiles) as spm_mm:
+            assert not spm_mm._handleRequests(sm.EMPTYMAILBOX * MAX_HOSTS)
 
 
 class TestHSMMailbox:
@@ -151,6 +220,11 @@ class TestHSMMailbox:
                 data = f.read()
             assert data == dirty_outbox
 
+    def test_skip_empty_response(self, mboxfiles):
+        with make_hsm_mailbox(mboxfiles, 1) as hsm_mb:
+            hsm_mb._mailman._used_slots_array = [1] * sm.MESSAGES_PER_MAILBOX
+            assert not hsm_mb._mailman._handleResponses(sm.EMPTYMAILBOX)
+
 
 class TestCommunicate:
 
@@ -165,93 +239,155 @@ class TestCommunicate:
 
         with make_hsm_mailbox(mboxfiles, 7) as hsm_mb:
             with make_spm_mailbox(mboxfiles) as spm_mm:
-                spm_mm.registerMessageType(b"xtnd", spm_callback)
-                VOL_DATA = dict(
-                    poolID=SPUUID,
-                    domainID='8adbc85e-e554-4ae0-b318-8a5465fe5fe1',
-                    volumeID='d772f1c6-3ebb-43c3-a42e-73fcd8255a5f')
-                REQUESTED_SIZE = 100
+                spm_mm.registerMessageType(sm.EXTEND_CODE, spm_callback)
+                REQUESTED_SIZE = 128 * MiB
+                hsm_mb.sendExtendMsg(volume_data(), REQUESTED_SIZE)
 
-                hsm_mb.sendExtendMsg(VOL_DATA, REQUESTED_SIZE)
-
-                if not msg_processed.wait(10 * MONITOR_INTERVAL):
+                if not msg_processed.wait(MAILER_TIMEOUT):
                     expired = True
 
         assert not expired, 'message was not processed on time'
-        assert received_messages == [(449, (
-            b"1xtnd\xe1_\xfeeT\x8a\x18\xb3\xe0JT\xe5^\xc8\xdb\x8a_Z%"
-            b"\xd8\xfcs.\xa4\xc3C\xbb>\xc6\xf1r\xd700000000000000640"
-            b"0000000000"))]
+        assert received_messages == [(448, extend_message(REQUESTED_SIZE))]
 
     def test_send_reply(self, mboxfiles):
         HOST_ID = 3
         MSG_ID = HOST_ID * sm.SLOTS_PER_MAILBOX + 12
-
+        SIZE = 2 * GiB
         with make_hsm_mailbox(mboxfiles, HOST_ID):
             with make_spm_mailbox(mboxfiles) as spm_mm:
-                VOL_DATA = dict(
-                    poolID=SPUUID,
-                    domainID='8adbc85e-e554-4ae0-b318-8a5465fe5fe1',
-                    volumeID='d772f1c6-3ebb-43c3-a42e-73fcd8255a5f')
-                msg = sm.SPM_Extend_Message(VOL_DATA, 0)
+                msg = sm.SPM_Extend_Message(volume_data(), SIZE)
                 spm_mm.sendReply(MSG_ID, msg)
 
         inbox, outbox = read_mbox(mboxfiles)
-        assert inbox == b'\0' * 0x1000 * MAX_HOSTS
+        assert inbox == b'\0' * sm.MAILBOX_SIZE * MAX_HOSTS
 
         # proper MSG_ID is written, anything else is intact
-        msg_offset = 0x40 * MSG_ID
+        msg_offset = sm.MESSAGE_SIZE * MSG_ID
         assert outbox[:msg_offset] == b'\0' * msg_offset
-        assert outbox[msg_offset:msg_offset + 0x40] == (
-            b'1xtnd\xe1_\xfeeT\x8a\x18\xb3\xe0JT\xe5^\xc8\xdb\x8a_Z%'
-            b'\xd8\xfcs.\xa4\xc3C\xbb>\xc6\xf1r\xd700000000000000000'
-            b'0000000000')
-        assert outbox[msg_offset + 0x40:] == b'\0' * (
-            0x1000 * MAX_HOSTS - 0x40 - msg_offset)
+        msg_end = msg_offset + sm.MESSAGE_SIZE
+        assert outbox[msg_offset:msg_end] == extend_message(SIZE)
+        assert outbox[msg_end:] == b'\0' * (
+            sm.MAILBOX_SIZE * MAX_HOSTS - sm.MESSAGE_SIZE - msg_offset)
+
+    def test_fill_slots(self, mboxfiles, monkeypatch):
+
+        filled = threading.Event()
+        orig_cmd = sm._mboxExecCmd
+
+        def mbox_cmd_hook(*args, **kwargs):
+            data = kwargs.get('data')
+            if data and all(
+                data[i:i + 1] != b"\0"
+                for i in range(0, sm.MESSAGES_PER_MAILBOX, sm.MESSAGE_SIZE)
+            ):
+                filled.set()
+            return orig_cmd(*args, **kwargs)
+
+        monkeypatch.setattr(sm, "_mboxExecCmd", mbox_cmd_hook)
+
+        with make_hsm_mailbox(mboxfiles, 1) as hsm_mb:
+            for _ in range(sm.MESSAGES_PER_MAILBOX):
+                hsm_mb.sendExtendMsg(volume_data(make_uuid()), 100)
+
+            assert filled.wait(MAILER_TIMEOUT * 2)
+
+    @pytest.mark.parametrize("delay", [0, 0.05])
+    @pytest.mark.parametrize("messages", [
+        1,
+        2,
+        4,
+        8,
+        # From 9 failures and on the code sleeps for a minute
+        16,
+        32,
+        sm.MESSAGES_PER_MAILBOX,
+    ])
+    def test_roundtrip(self, mboxfiles, delay, messages):
+        timeout = MAILER_TIMEOUT + messages * (1.0 + delay)
+        with make_hsm_mailbox(mboxfiles, 7) as hsm_mb:
+            with make_spm_mailbox(mboxfiles) as spm_mm:
+                pool = FakePool(spm_mm)
+                spm_callback = partial(
+                    sm.SPM_Extend_Message.processRequest, pool)
+                spm_mm.registerMessageType(sm.EXTEND_CODE, spm_callback)
+
+                done = threading.Event()
+                start = {}
+                end = {}
+
+                def reply_msg_callback(vol_data):
+                    vol_id = vol_data['volumeID']
+                    assert vol_id in start, "Missing request"
+                    assert vol_id not in end, "Duplicate request"
+
+                    end[vol_id] = time.time()
+                    log.info("got extension reply for volume %s, elapsed %s",
+                             vol_id, end[vol_id] - start[vol_id])
+                    if len(end) == messages:
+                        log.info("done gathering all replies")
+                        done.set()
+
+                for _ in range(messages):
+                    vol_id = make_uuid()
+                    start[vol_id] = time.time()
+                    log.info("requesting to extend volume %s (delay=%.3f)",
+                             vol_id, delay)
+                    hsm_mb.sendExtendMsg(
+                        volume_data(vol_id),
+                        2 * GiB,
+                        callbackFunction=reply_msg_callback)
+                    time.sleep(delay)
+
+                log.info("waiting for replies clearing")
+                assert done.wait(timeout), "Roundtrip did not finish"
+
+                log.info("waiting for messages clearing in SPM inbox")
+                deadline = time.time() + MAILER_TIMEOUT
+                while True:
+                    with io.open(mboxfiles.inbox, "rb") as f:
+                        # check that SPM inbox was cleared
+                        if f.read(sm.MAILBOX_SIZE) == sm.EMPTYMAILBOX:
+                            break
+                    assert time.time() < deadline, "Timeout clearing SPM inbox"
+                    time.sleep(0.1)
+
+        times = [end[k] - start[k] for k in start]
+        times.sort()
+        log.info("stats: messages=%d delay=%.3f best=%.3f worst=%.3f avg=%.3f",
+                 messages, delay, times[0], times[-1], sum(times) / len(times))
 
 
 class TestExtendMessage:
 
-    VOL_DATA = dict(
-        poolID=SPUUID,
-        domainID='8adbc85e-e554-4ae0-b318-8a5465fe5fe1',
-        volumeID='d772f1c6-3ebb-43c3-a42e-73fcd8255a5f')
-
     def test_no_domain(self):
-        vol_data = dict(self.VOL_DATA)
+        vol_data = volume_data()
         del vol_data['domainID']
         with pytest.raises(sm.InvalidParameterException):
             sm.SPM_Extend_Message(vol_data, 0)
 
     def test_bad_size(self):
         with pytest.raises(sm.InvalidParameterException):
-            sm.SPM_Extend_Message(self.VOL_DATA, -1)
+            sm.SPM_Extend_Message(volume_data(), -1)
 
     def test_process_request(self):
-        PAYLOAD = (
-            b'1xtnd\xe1_\xfeeT\x8a\x18\xb3\xe0JT\xe5^\xc8\xdb\x8a_Z%'
-            b'\xd8\xfcs.\xa4\xc3C\xbb>\xc6\xf1r\xd7'
-            b'000000000000109200000000000')
         MSG_ID = 7
-        pool = mock.MagicMock()
-        pool.spUUID = SPUUID
+        SIZE = GiB
+        spm_mailer = FakeSPMMailer()
+        pool = FakePool(spm_mailer)
 
         ret = sm.SPM_Extend_Message.processRequest(
-            pool=pool, msgID=MSG_ID, payload=PAYLOAD)
+            pool=pool, msgID=MSG_ID, payload=extend_message(SIZE))
 
         assert ret == {'status': {'code': 0, 'message': 'Done'}}
-        pool.extendVolume.assert_called_with(
-            self.VOL_DATA['domainID'], self.VOL_DATA['volumeID'], 4242)
-
-        called_name, called_args, called_kwargs = pool.mock_calls[1]
-        assert called_name == 'spmMailer.sendReply'
-        called_msgid, called_msg = called_args
-        assert called_msgid == MSG_ID
-        assert called_msg.payload == (
-            b'1xtnd\xe1_\xfeeT\x8a\x18\xb3\xe0JT\xe5^\xc8\xdb\x8a_Z%'
-            b'\xd8\xfcs.\xa4\xc3C\xbb>\xc6\xf1r\xd700000000000010920'
-            b'0000000000')
-        assert called_msg.callback is None
+        vol_data = volume_data()
+        assert pool.volume_data == {
+            'volumeID': vol_data['volumeID'],
+            'domainID': vol_data['domainID'],
+            'size': SIZE
+        }
+        assert spm_mailer.msg_id == MSG_ID
+        assert spm_mailer.msg.payload == extend_message(SIZE)
+        assert spm_mailer.msg.callback is None
 
 
 class TestValidation:
@@ -264,7 +400,7 @@ class TestValidation:
         msg = b"x" * sm.MESSAGE_SIZE
         padding = sm.MAILBOX_SIZE - sm.MESSAGE_SIZE - sm.CHECKSUM_BYTES
         data = msg + padding * b"\0"
-        n = sm.checksum(data, sm.CHECKSUM_BYTES)
+        n = sm.checksum(data)
         checksum = struct.pack('<l', n)
         mailbox = data + checksum
         assert sm.SPM_MailMonitor.validateMailbox(mailbox, 7)
@@ -279,20 +415,51 @@ class TestValidation:
 
 class TestChecksum:
 
-    def test_consistency(self):
-        """
-        Test if when given the same input in different times the user will get
-        the same checksum.
-        """
-        with open("/dev/urandom", "rb") as f:
-            data = f.read(50)
-        assert sm.checksum(data, 16) == sm.checksum(data, 16)
+    @pytest.mark.parametrize("data,result,packed_result", [
+        pytest.param(
+            sm.EMPTYMAILBOX,
+            0,
+            b"\x00\x00\x00\x00",
+            id="empty"),
+        pytest.param(
+            sm.CLEAN_MESSAGE * sm.MESSAGES_PER_MAILBOX + b"\0" * 62,
+            4032,
+            b"\xc0\x0f\x00\x00",
+            id="clean notifications"),
+        pytest.param(
+            b"\xff" * 4092,
+            1043460,
+            b"\x04\xec\x0f\x00",
+            id="maximum value"),
+        pytest.param(
+            bytes(bytearray(i % 256 for i in range(4092))),
+            521226,
+            b"\x0a\xf4\x07\x00",
+            id="range pattern"),
+        pytest.param(
+            extend_message() + b"\0" * 4028,
+            6455,
+            b"\x37\x19\x00\x00",
+            id="extend message pad tail"),
+        pytest.param(
+            b"\0" * 4028 + extend_message(),
+            6455,
+            b"\x37\x19\x00\x00",
+            id="extend message pad head")
+    ])
+    def test_sanity(self, data, result, packed_result):
+        assert sm.checksum(data) == result
+        assert sm.packed_checksum(data) == packed_result
 
 
 class TestWaitTimeout:
 
-    def test_production_config(self):
-        assert pytest.approx(3.0) == sm.wait_timeout(2)
-
-    def test_testing_config(self):
-        assert pytest.approx(0.15) == sm.wait_timeout(0.1)
+    @pytest.mark.parametrize("monitor_interval, expected_timeout", [
+        (2, 3.0),     # production config
+        (3, 4.5),     # production config
+        (0.1, 0.15),  # testing config
+        (0.2, 0.3),   # testing config
+    ])
+    def test_config(self, monitor_interval, expected_timeout):
+        actual_timeout = sm.wait_timeout(monitor_interval)
+        assert actual_timeout == pytest.approx(expected_timeout)

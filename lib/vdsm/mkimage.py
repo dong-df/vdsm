@@ -1,5 +1,5 @@
 #
-# Copyright 2012-2017 Red Hat, Inc.
+# Copyright 2012-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -27,7 +27,6 @@ import shutil
 import stat
 import base64
 import errno
-import hashlib
 
 import six
 
@@ -70,7 +69,7 @@ def _decodeFilesIntoDir(files, parentdir):
             try:
                 os.makedirs(dirname)
             except OSError as e:
-                if e.errno != os.errno.EEXIST:
+                if e.errno != errno.EEXIST:
                     raise
         with _openFile(filename, 'wb', 0o640) as f:
             f.write(base64.b64decode(content))
@@ -85,7 +84,7 @@ def _commonCleanFs(dirname, media):
         shutil.rmtree(dirname)
 
 
-def getFileName(vmId, files):
+def getFileName(vmId):
     if not os.path.exists(_P_PAYLOAD_IMAGES):
         try:
             os.mkdir(_P_PAYLOAD_IMAGES)
@@ -93,11 +92,9 @@ def getFileName(vmId, files):
                      resolveUid(DISKIMAGE_USER),
                      resolveGid(DISKIMAGE_GROUP))
         except OSError as e:
-            if e.errno != os.errno.EEXIST:
+            if e.errno != errno.EEXIST:
                 raise
-    content = ''.join(files.keys()).encode() + b''.join(files.values())
-    md5 = hashlib.md5(content).hexdigest()
-    path = os.path.join(_P_PAYLOAD_IMAGES, "%s.%s.img" % (vmId, md5))
+    path = os.path.join(_P_PAYLOAD_IMAGES, "%s.img" % (vmId,))
     return path
 
 
@@ -119,10 +116,10 @@ def injectFilesToFs(floppy, files, fstype='auto'):
         _commonCleanFs(dirname, floppy)
 
 
-def mkFloppyFs(vmId, files, volumeName=None):
+def mkFloppyFs(vmId, files, volumeName=None, path=None):
     floppy = None
     try:
-        floppy = getFileName(vmId, files)
+        floppy = path or getFileName(vmId)
         if os.path.exists(floppy):
             # mkfs.msdos refuses to overwrite existing images
             logging.warning('Removing stale floppy image: %s', floppy)
@@ -141,12 +138,12 @@ def mkFloppyFs(vmId, files, volumeName=None):
     return floppy
 
 
-def mkIsoFs(vmId, files, volumeName=None):
+def mkIsoFs(vmId, files, volumeName=None, path=None):
     dirname = isopath = None
     try:
         dirname = tempfile.mkdtemp()
         _decodeFilesIntoDir(files, dirname)
-        isopath = getFileName(vmId, files)
+        isopath = path or getFileName(vmId)
 
         command = [EXT_MKISOFS, '-R', '-J', '-o', isopath]
         if volumeName is not None:

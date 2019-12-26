@@ -1,6 +1,6 @@
 # encoding: utf-8
 #
-# Copyright 2018 Red Hat, Inc.
+# Copyright 2018-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -65,8 +65,8 @@ class TestLookup(VdsmTestCase):
             ),
         ]
         self.devices_conf = [
-            {'alias': 'dimm0', 'type': hwclass.MEMORY, 'size': 1024},
-            {'alias': 'ac97', 'type': hwclass.SOUND}
+            {'alias': 'dimm0', 'type': 'memory', 'size': 1024},
+            {'alias': 'ac97', 'type': 'sound'}
         ]
         self.devices = common.empty_dev_map()
 
@@ -142,8 +142,8 @@ class TestLookup(VdsmTestCase):
             self.assertEqual(drive.name, dev_name)
 
     @permutations([
-        [hwclass.MEMORY, 'dimm0', 0],
-        [hwclass.SOUND, 'ac97', 1],
+        ['memory', 'dimm0', 0],
+        ['sound', 'ac97', 1],
     ])
     def test_lookup_conf(self, dev_type, alias, index):
         conf = lookup.conf_by_alias(
@@ -151,8 +151,8 @@ class TestLookup(VdsmTestCase):
         self.assertEqual(conf, self.devices_conf[index])
 
     @permutations([
-        [hwclass.MEMORY, 'dimm1'],
-        [hwclass.SOUND, 'dimm0'],
+        ['memory', 'dimm1'],
+        ['sound', 'dimm0'],
     ])
     def test_lookup_conf_error(self, dev_type, alias):
         self.assertRaises(LookupError,
@@ -167,13 +167,13 @@ class TestLookup(VdsmTestCase):
     def test_lookup_conf_missing(self, devices_conf):
         self.assertRaises(LookupError,
                           lookup.conf_by_alias,
-                          devices_conf, hwclass.MEMORY, 'dimm0')
+                          devices_conf, 'memory', 'dimm0')
 
     @permutations([
         # devices_conf
         [[]],
         [[{}]],
-        [[{'alias': 'ac97', 'type': hwclass.SOUND}]],
+        [[{'alias': 'ac97', 'type': 'sound'}]],
     ])
     def test_lookup_conf_by_path_missing(self, devices_conf):
         self.assertRaises(LookupError,

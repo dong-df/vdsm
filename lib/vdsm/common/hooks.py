@@ -1,5 +1,5 @@
 #
-# Copyright 2010-2017 Red Hat, Inc.
+# Copyright 2010-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,11 +26,11 @@ import glob
 import hashlib
 import itertools
 import json
-import libvirt
 import logging
 import os
 import os.path
 import pkgutil
+import subprocess
 import sys
 import tempfile
 
@@ -48,15 +48,17 @@ _LAUNCH_FLAGS_PATH = os.path.join(
 )
 
 
-# dir path is relative to '/' for test purposes
-# otherwise path is relative to P_VDSM_HOOKS
-def _scriptsPerDir(dir):
-    if (dir[0] == '/'):
-        path = dir
-    else:
-        path = P_VDSM_HOOKS + dir
-    return [s for s in glob.glob(path + '/*')
-            if os.access(s, os.X_OK)]
+def _scriptsPerDir(dir_name):
+    if os.path.isabs(dir_name):
+        raise ValueError("Cannot use absolute path as hook directory")
+    head = dir_name
+    while head:
+        head, tail = os.path.split(head)
+        if tail == "..":
+            raise ValueError("Hook directory paths cannot contain '..'")
+    path = os.path.join(P_VDSM_HOOKS, dir_name, '*')
+    return [s for s in glob.glob(path)
+            if os.path.isfile(s) and os.access(s, os.X_OK)]
 
 _DOMXML_HOOK = 1
 _JSON_HOOK = 2
@@ -76,9 +78,9 @@ def _runHooksDir(data, dir, vmconf={}, raiseError=True, errors=None, params={},
     data_fd, data_filename = tempfile.mkstemp()
     try:
         if hookType == _DOMXML_HOOK:
-            os.write(data_fd, data or '')
+            os.write(data_fd, data.encode('utf-8') if data else b'')
         elif hookType == _JSON_HOOK:
-            os.write(data_fd, json.dumps(data))
+            os.write(data_fd, json.dumps(data).encode('utf-8'))
         os.close(data_fd)
 
         scriptenv = os.environ.copy()
@@ -87,21 +89,22 @@ def _runHooksDir(data, dir, vmconf={}, raiseError=True, errors=None, params={},
         env_update = [six.iteritems(params),
                       six.iteritems(vmconf.get('custom', {}))]
 
-        # Encode custom properties to UTF-8 and save them to scriptenv
-        # Pass str objects (byte-strings) without any conversion
+        # On py2 encode custom properties with default system encoding
+        # and save them to scriptenv. Pass str objects (byte-strings)
+        # without any conversion
         for k, v in itertools.chain(*env_update):
             try:
-                if isinstance(v, six.text_type):
-                    scriptenv[k] = v.encode('utf-8')
+                if six.PY2 and isinstance(v, six.text_type):
+                    scriptenv[k] = v.encode(sys.getfilesystemencoding())
                 else:
                     scriptenv[k] = v
-            except UnicodeDecodeError:
+            except UnicodeEncodeError:
                 pass
 
         if vmconf.get('vmId'):
             scriptenv['vmId'] = vmconf.get('vmId')
         ppath = scriptenv.get('PYTHONPATH', '')
-        hook = pkgutil.get_loader('vdsm.hook').filename
+        hook = os.path.dirname(pkgutil.get_loader('vdsm.hook').get_filename())
         scriptenv['PYTHONPATH'] = ':'.join(ppath.split(':') + [hook])
         if hookType == _DOMXML_HOOK:
             scriptenv['_hook_domxml'] = data_filename
@@ -109,8 +112,13 @@ def _runHooksDir(data, dir, vmconf={}, raiseError=True, errors=None, params={},
             scriptenv['_hook_json'] = data_filename
 
         for s in scripts:
-            rc, out, err = commands.execCmd([s], raw=True,
-                                            env=scriptenv)
+            p = commands.start([s], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=scriptenv)
+
+            with commands.terminating(p):
+                (out, err) = p.communicate()
+
+            rc = p.returncode
             logging.info('%s: rc=%s err=%s', s, rc, err)
             if rc != 0:
                 errors.append(err)
@@ -118,7 +126,7 @@ def _runHooksDir(data, dir, vmconf={}, raiseError=True, errors=None, params={},
             if rc == 2:
                 break
             elif rc > 2:
-                logging.warn('hook returned unexpected return code %s', rc)
+                logging.warning('hook returned unexpected return code %s', rc)
 
         if errors and raiseError:
             raise exception.HookError(err)
@@ -438,11 +446,11 @@ def after_hostdev_list_by_caps(devices):
 
 def _getScriptInfo(path):
     try:
-        with open(path) as f:
-            md5 = hashlib.md5(f.read()).hexdigest()
+        with open(path, 'rb') as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
     except EnvironmentError:
-        md5 = ''
-    return {'md5': md5}
+        digest = ''
+    return {'checksum': digest}
 
 
 def load_vm_launch_flags_from_file(vm_id):
@@ -450,7 +458,8 @@ def load_vm_launch_flags_from_file(vm_id):
     if os.path.isfile(flags_file):
         with open(flags_file) as f:
             return int(f.readline())
-    return libvirt.VIR_DOMAIN_NONE
+    # The following return value must match libvirt.VIR_DOMAIN_NONE
+    return 0
 
 
 def dump_vm_launch_flags_to_file(vm_id, flags):

@@ -21,24 +21,62 @@
 from __future__ import absolute_import
 from __future__ import division
 
+import six
+
+from collections import defaultdict
+
+from vdsm.common.compat import get_args_spec
 from vdsm.common.exception import GeneralException
+from vdsm.common.exception import VdsmException
 from vdsm.storage import exception as storage_exception
 
-from testlib import VdsmTestCase
+
+def find_module_exceptions(module, base_class=None):
+    for name in dir(module):
+        obj = getattr(module, name)
+
+        if not isinstance(obj, type):
+            continue
+
+        if base_class and not issubclass(obj, base_class):
+            continue
+
+        yield obj
 
 
-class TestStorageExceptions(VdsmTestCase):
-    def test_collisions(self):
-        codes = {}
+def test_collisions():
+    codes = defaultdict(list)
 
-        for name in dir(storage_exception):
-            obj = getattr(storage_exception, name)
+    for obj in find_module_exceptions(storage_exception, GeneralException):
+        codes[obj.code].append(obj.__name__)
 
-            if not isinstance(obj, type):
-                continue
+    problems = [(k, v) for k, v in six.iteritems(codes)
+                if len(v) != 1 or k >= 5000]
 
-            if not issubclass(obj, GeneralException):
-                continue
+    assert not problems, "Duplicated or invalid exception code"
 
-            self.assertFalse(obj.code in codes)
-            self.assertTrue(obj.code < 5000)
+
+def test_info():
+    for obj in find_module_exceptions(storage_exception, VdsmException):
+        # Inspect exception object initialization parameters.
+        args, varargs, kwargs = get_args_spec(obj.__init__)
+
+        # Prepare fake parameters for object initialization.
+        # We ignore the 'self' argument from counting.
+        args = [FakeArg(i) for i in range(len(args) - 1)]
+        if varargs:
+            args.append(FakeArg(len(args)))
+            args.append(FakeArg(len(args)))
+        kwargs = {kwargs: FakeArg(len(args))} if kwargs else {}
+
+        # Instantiate the traversed exception object.
+        e = obj(*args, **kwargs)
+        assert e.info() == {
+            "code": e.code,
+            "message": str(e)
+        }
+
+
+class FakeArg(int):
+    def __getitem__(self, name):
+        return self

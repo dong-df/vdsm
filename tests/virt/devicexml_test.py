@@ -24,7 +24,6 @@ from __future__ import division
 from __future__ import print_function
 
 import logging
-import os.path
 import xml.etree.ElementTree as ET
 
 from vdsm.virt.domain_descriptor import DomainDescriptor
@@ -33,12 +32,10 @@ from vdsm.virt.vmdevices import lookup
 from vdsm.virt import metadata
 from vdsm.virt import vmdevices
 from vdsm.virt import vmxml
-from vdsm import constants
 from vdsm.common import hostdev
 from vdsm.common import xmlutils
 
 from monkeypatch import MonkeyPatchScope, MonkeyPatch
-from testlib import make_config
 from testlib import permutations, expandPermutations
 from testlib import read_data
 from testlib import XMLTestCase
@@ -67,247 +64,6 @@ class DeviceToXMLTests(XMLTestCase):
             'memGuaranteedSize': '512',
         }
 
-    def test_console_virtio(self):
-        consoleXML = """
-            <console type="pty">
-                <target port="0" type="virtio"/>
-            </console>"""
-        dev = {
-            'device': 'console',
-            'specParams': {'consoleType': 'virtio'},
-            'vmid': self.conf['vmId'],
-        }
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getXML()), consoleXML)
-
-    def test_console_serial(self):
-        consoleXML = """
-            <console type="pty">
-                <target port="0" type="serial"/>
-            </console>"""
-        dev = {
-            'device': 'console',
-            'specParams': {'consoleType': 'serial'},
-            'vmid': self.conf['vmId'],
-        }
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getXML()), consoleXML)
-
-    def test_console_default(self):
-        consoleXML = """
-            <console type="pty">
-                <target port="0" type="virtio"/>
-            </console>"""
-        dev = {
-            'device': 'console',
-            'vmid': self.conf['vmId'],
-        }
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getXML()), consoleXML)
-
-    def test_serial_device(self):
-        serialXML = """
-            <serial type="pty">
-                <target port="0"/>
-            </serial>"""
-        dev = {
-            'device': 'console',
-            'vmid': self.conf['vmId'],
-        }
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getSerialDeviceXML()),
-                            serialXML)
-
-    def test_unix_socket_serial_device(self):
-        path = "/var/run/ovirt-vmconsole-console/%s.sock" % self.conf['vmId']
-        serialXML = """
-            <serial type="unix">
-                <source mode="bind" path="%s" />
-                <target port="0" />
-            </serial>""" % path
-        dev = {
-            'vmid': self.conf['vmId'],
-            'device': 'console',
-            'specParams': {
-                'enableSocket': True
-            }
-        }
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getSerialDeviceXML()),
-                            serialXML)
-
-    def test_smartcard(self):
-        smartcardXML = '<smartcard mode="passthrough" type="spicevmc"/>'
-        dev = {'device': 'smartcard',
-               'specParams': {'mode': 'passthrough', 'type': 'spicevmc'}}
-        smartcard = vmdevices.core.Smartcard(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(smartcard.getXML()),
-                            smartcardXML)
-
-    def test_tpm(self):
-        tpmXML = """
-            <tpm model="tpm-tis">
-                <backend type="passthrough">
-                    <device path="/dev/tpm0"/>
-                </backend>
-            </tpm>
-            """
-        dev = {'device': 'tpm',
-               'specParams': {'mode': 'passthrough',
-                              'path': '/dev/tpm0', 'model': 'tpm-tis'}}
-        tpm = vmdevices.core.Tpm(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(tpm.getXML()), tpmXML)
-
-    @permutations([[None], [{}], [{'enableSocket': False}]])
-    def test_console_pty(self, specParams):
-        consoleXML = """
-            <console type="pty">
-                <target port="0" type="virtio"/>
-            </console>"""
-        dev = {'device': 'console'}
-        if specParams is not None:
-            dev['specParams'] = specParams
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getXML()), consoleXML)
-
-    def test_console_socket(self):
-        consoleXML = """
-            <console type="unix">
-                <source mode="bind" path="%s%s.sock" />
-                <target port="0" type="virtio"/>
-            </console>""" % (constants.P_OVIRT_VMCONSOLES,
-                             self.conf['vmId'])
-        dev = {'device': 'console', 'specParams': {'enableSocket': True}}
-        dev['vmid'] = self.conf['vmId']
-        console = vmdevices.core.Console(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(console.getXML()), consoleXML)
-
-    def test_balloon(self):
-        balloonXML = '<memballoon model="virtio"/>'
-        dev = {'device': 'memballoon', 'type': 'balloon',
-               'specParams': {'model': 'virtio'}}
-        balloon = vmdevices.core.Balloon(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(balloon.getXML()), balloonXML)
-
-    def test_rng(self):
-        rngXML = """
-            <rng model="virtio">
-                <rate bytes="1234" period="2000"/>
-                <backend model="random">/dev/random</backend>
-            </rng>"""
-
-        dev = {'type': 'rng', 'model': 'virtio', 'specParams':
-               {'period': '2000', 'bytes': '1234', 'source': 'random'}}
-
-        rng = vmdevices.core.Rng(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(rng.getXML()), rngXML)
-
-    def test_watchdog(self):
-        watchdogXML = '<watchdog action="none" model="i6300esb"/>'
-        dev = {'device': 'watchdog', 'type': 'watchdog',
-               'specParams': {'model': 'i6300esb', 'action': 'none'}}
-        watchdog = vmdevices.core.Watchdog(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(watchdog.getXML()), watchdogXML)
-
-    def test_sound(self):
-        soundXML = '<sound model="ac97"/>'
-        dev = {'device': 'ac97'}
-        sound = vmdevices.core.Sound(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(sound.getXML()), soundXML)
-
-    @permutations([
-        [{'device': 'vga',
-          'specParams': {'vram': '32768', 'heads': '2'}},
-         """<video>
-         <model heads="2" type="vga" vram="32768"/>
-         </video>"""],
-        [{'device': 'qxl',
-          'specParams': {'vram': '65536', 'heads': '2', 'ram': '131072'}},
-         """<video>
-         <model heads="2" ram="131072" type="qxl" vram="65536"/>
-         </video>"""],
-        [{'device': 'qxl',
-          'specParams': {'vram': '32768', 'heads': '2',
-                         'ram': '65536', 'vgamem': '8192'}},
-         """<video>
-         <model heads="2" ram="65536" type="qxl" vgamem="8192" vram="32768"/>
-         </video>"""]
-    ])
-    def test_video(self, dev_spec, video_xml):
-        video = vmdevices.core.Video(self.log, **dev_spec)
-        self.assertXMLEqual(xmlutils.tostring(video.getXML()), video_xml)
-
-    def test_controller(self):
-        devConfs = [
-            {'device': 'ide', 'index': '0', 'address': self.PCI_ADDR_DICT},
-            {'device': 'scsi', 'index': '0', 'model': 'virtio-scsi',
-             'address': self.PCI_ADDR_DICT},
-            {'device': 'scsi', 'index': '0', 'model': 'virtio-scsi',
-             'address': self.PCI_ADDR_DICT, 'specParams': {}},
-            {'device': 'scsi', 'model': 'virtio-scsi', 'index': '0',
-             'specParams': {'ioThreadId': '0'},
-             'address': self.PCI_ADDR_DICT},
-            {'device': 'scsi', 'model': 'virtio-scsi', 'index': '0',
-             'specParams': {'ioThreadId': 0},
-             'address': self.PCI_ADDR_DICT},
-            {'device': 'virtio-serial', 'address': self.PCI_ADDR_DICT},
-            {'device': 'usb', 'model': 'ich9-ehci1', 'index': '0',
-             'master': {'startport': '0'}, 'address': self.PCI_ADDR_DICT}]
-        expectedXMLs = [
-            """
-            <controller index="0" type="ide">
-                <address %s/>
-            </controller>""",
-
-            """
-            <controller index="0" model="virtio-scsi" type="scsi">
-                <address %s/>
-            </controller>""",
-
-            """
-            <controller index="0" model="virtio-scsi" type="scsi">
-                <address %s/>
-            </controller>""",
-
-            """
-            <controller index="0" model="virtio-scsi" type="scsi">
-                <address %s/>
-                <driver iothread="0"/>
-            </controller>""",
-
-            """
-            <controller index="0" model="virtio-scsi" type="scsi">
-                <address %s/>
-                <driver iothread="0"/>
-            </controller>""",
-
-            """
-            <controller index="0" ports="16" type="virtio-serial">
-                <address %s/>
-            </controller>""",
-
-            """
-            <controller index="0" model="ich9-ehci1" type="usb">
-                <master startport="0"/>
-                <address %s/>
-            </controller>"""]
-
-        for devConf, xml in zip(devConfs, expectedXMLs):
-            device = vmdevices.core.Controller(self.log, **devConf)
-            self.assertXMLEqual(xmlutils.tostring(device.getXML()),
-                                xml % self.PCI_ADDR)
-
-    def test_redir(self):
-        redirXML = """
-            <redirdev type="spicevmc">
-                <address %s/>
-            </redirdev>""" % self.PCI_ADDR
-
-        dev = {'device': 'spicevmc', 'address': self.PCI_ADDR_DICT}
-
-        redir = vmdevices.core.Redir(self.log, **dev)
-        self.assertXMLEqual(xmlutils.tostring(redir.getXML()), redirXML)
-
     def test_memory_device(self):
         memoryXML = """<memory model='dimm'>
             <target>
@@ -318,8 +74,7 @@ class DeviceToXMLTests(XMLTestCase):
         """
         params = {'device': 'memory', 'type': 'memory',
                   'size': 1024, 'node': 0}
-        memory = vmdevices.core.Memory(self.log, **params)
-        self.assertXMLEqual(xmlutils.tostring(memory.getXML()), memoryXML)
+        self.assertXMLEqual(vmdevices.core.memory_xml(params), memoryXML)
 
     @MonkeyPatch(vmdevices.network.supervdsm,
                  'getProxy', lambda: FakeProxy())
@@ -657,51 +412,6 @@ _CONTROLLERS_XML = [
      u"</controller>"],
 ]
 
-_GRAPHICS_DATA = [
-    # graphics_xml, display_ip, meta, src_ports, expected_ports
-    # both port requested, some features disabled
-    [
-        u'''<graphics type='spice' port='{port}' tlsPort='{tls_port}'
-                  autoport='yes' keymap='en-us'
-                  defaultMode='secure' passwd='*****'
-                  passwdValidTo='1970-01-01T00:00:01'>
-          <clipboard copypaste='no'/>
-          <filetransfer enable='no'/>
-          <listen type='network' network='vdsm-ovirtmgmt'/>
-        </graphics>''',
-        '127.0.0.1',
-        {},
-        {'port': '5900', 'tls_port': '5901'},
-        {'port': '-1', 'tls_port': '-1'},
-    ],
-    # only insecure port requested
-    [
-        u'''<graphics type='vnc' port='{port}' autoport='yes'
-                   keymap='en-us'
-                   defaultMode="secure" passwd="*****"
-                   passwdValidTo='1970-01-01T00:00:01'>
-           <listen type='network' network='vdsm-ovirtmgmt'/>
-        </graphics>''',
-        '192.168.1.1',
-        {},
-        {'port': '5900', 'tls_port': '5901'},
-        {'port': '-1', 'tls_port': '-1'},
-    ],
-    # listening on network, preserving autoselect
-    [
-        u'''<graphics type='vnc' port='{port}' autoport='yes'
-                   keymap='en-us'
-                   defaultMode="secure" passwd="*****"
-                   passwdValidTo='1970-01-01T00:00:01'>
-           <listen type='network' network='vdsm-ovirtmgmt'/>
-        </graphics>''',
-        '192.168.1.1',
-        {},
-        {'port': '-1', 'tls_port': '-1'},
-        {'port': '-1', 'tls_port': '-1'},
-    ],
-
-]
 _TRANSIENT_STORAGE_TEST_DATA = [
     [u'''<disk device="disk" snapshot="no" type="block">
         <source dev="/var/lib/vdsm/transient">
@@ -930,164 +640,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
         else:
             raise AssertionError('from_xml_tree implemented')
 
-    def test_generic(self):
-        # simplified version of channel XML, only for test purposes.
-        # this should never be seen in the wild
-        generic_xml = '<channel type="spicevmc" />'
-        self._check_roundtrip(vmdevices.core.Generic, generic_xml)
-
-    @permutations([
-        # sound_xml
-        [u'''<sound model="ac97"/>'''],
-        [u'''<sound model='es1370'/>'''],
-    ])
-    def test_sound(self, sound_xml):
-        self._check_roundtrip(vmdevices.core.Sound, sound_xml)
-
-    def test_balloon(self):
-        balloon_xml = u'''<memballoon model='virtio'>
-          <address type='pci' domain='0x0000' bus='0x00' slot='0x04'
-           function='0x0'/>
-        </memballoon>'''
-        self._check_roundtrip(vmdevices.core.Balloon, balloon_xml)
-
-    @permutations([
-        # console_type, is_serial
-        ['virtio', False],
-        ['serial', True],
-    ])
-    def test_console_pty(self, console_type, is_serial):
-        console_xml = u'''<console type="pty">
-            <target port="0" type="%s" />
-        </console>''' % console_type
-        self._check_roundtrip(
-            vmdevices.core.Console, console_xml, meta={'vmid': 'VMID'}
-        )
-
-    @permutations([
-        # console_type, is_serial
-        ['virtio', False],
-        ['serial', True],
-    ])
-    def test_console_pty_properties(self, console_type, is_serial):
-        console_xml = u'''<console type="pty">
-            <target port="0" type="%s" />
-        </console>''' % console_type
-        dev = vmdevices.core.Console.from_xml_tree(
-            self.log,
-            xmlutils.fromstring(console_xml),
-            meta={'vmid': 'VMID'}
-        )
-        self.assertEqual(dev.isSerial, is_serial)
-
-    @permutations([
-        # console_type, is_serial
-        ['virtio', False],
-        ['serial', True],
-    ])
-    def test_console_unix_socket(self, console_type, is_serial):
-        vmid = 'VMID'
-        console_xml = u'''<console type='unix'>
-          <source mode='bind' path='{sockpath}.sock' />
-          <target type='{console_type}' port='0' />
-        </console>'''.format(
-            sockpath=os.path.join(constants.P_OVIRT_VMCONSOLES, vmid),
-            console_type=console_type
-        )
-        self._check_roundtrip(
-            vmdevices.core.Console, console_xml, meta={'vmid': vmid}
-        )
-
-    @permutations([
-        # console_type, is_serial
-        ['virtio', False],
-        ['serial', True],
-    ])
-    def test_console_unix_socket_properties(self, console_type, is_serial):
-        vmid = 'VMID'
-        console_xml = u'''<console type='unix'>
-          <source mode='bind' path='{sockpath}.sock' />
-          <target type='{console_type}' port='0' />
-        </console>'''.format(
-            sockpath=os.path.join(constants.P_OVIRT_VMCONSOLES, vmid),
-            console_type=console_type
-        )
-        dev = vmdevices.core.Console.from_xml_tree(
-            self.log,
-            xmlutils.fromstring(console_xml),
-            meta={'vmid': vmid}
-        )
-        self.assertEqual(dev.isSerial, is_serial)
-        self.assertEqual(dev.vmid, vmid)
-        self.assertTrue(dev.specParams['enableSocket'])
-
-    @permutations(_CONTROLLERS_XML)
-    def test_controller(self, controller_xml):
-        self._check_roundtrip(vmdevices.core.Controller, controller_xml)
-
-    def test_smartcard(self):
-        smartcard_xml = u'''<smartcard mode='passthrough' type='spicevmc'>
-            <address type='ccid' controller='0' slot='0'/>
-        </smartcard>'''
-        self._check_roundtrip(vmdevices.core.Smartcard, smartcard_xml)
-
-    def test_redir(self):
-        redir_xml = u'''<redirdev bus='usb' type='spicevmc'>
-          <address type='usb' bus='0' port='1'/>
-        </redirdev>'''
-        self._check_roundtrip(vmdevices.core.Redir, redir_xml)
-
-    def test_video(self):
-        video_xml = u'''<video>
-          <address type='pci' domain='0x0000'
-           bus='0x00' slot='0x02' function='0x0'/>
-          <model type='qxl' ram='65536' vram='32768' vgamem='16384' heads='1'/>
-        </video>'''
-        self._check_roundtrip(vmdevices.core.Video, video_xml)
-
-    @permutations([
-        # rate_present
-        [True],
-        [False]
-    ])
-    @MonkeyPatch(vmdevices.core.supervdsm,
-                 'getProxy', lambda: FakeProxy())
-    def test_rng(self, rate_present):
-        rate = '<rate period="2000" bytes="1234"/>' if rate_present else ''
-        rng_xml = u'''<rng model='virtio'>
-            %s
-            <backend model='random'>/dev/random</backend>
-        </rng>''' % (rate)
-        self._check_roundtrip(
-            vmdevices.core.Rng, rng_xml, meta={'vmid': 'VMID'}
-        )
-
-    def test_tpm(self):
-        tpm_xml = u'''<tpm model='tpm-tis'>
-            <backend type='passthrough'>
-                <device path='/dev/tpm0' />
-            </backend>
-        </tpm>'''
-        self._check_roundtrip(vmdevices.core.Tpm, tpm_xml)
-
-    def test_watchdog(self):
-        watchdog_xml = u'''<watchdog model='i6300esb' action='reset'>
-          <address type='pci' domain='0x0000' bus='0x00' slot='0x05'
-           function='0x0'/>
-        </watchdog>'''
-        self._check_roundtrip(vmdevices.core.Watchdog, watchdog_xml)
-
-    def test_memory(self):
-        memory_xml = u'''<memory model='dimm'>
-            <target>
-                <size unit='KiB'>524288</size>
-                <node>1</node>
-            </target>
-            <alias name='dimm0'/>
-            <address type='dimm' slot='0' base='0x100000000'/>
-        </memory>'''
-        self._check_roundtrip(vmdevices.core.Memory, memory_xml)
-
     def test_lease(self):
         lease_xml = u'''<lease>
             <key>12523e3d-ad22-410c-8977-d2a7bf458a65</key>
@@ -1096,26 +648,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
                     path="/dev/c2a6d7c8-8d81-4e01-9ed4-7eb670713448/leases"/>
         </lease>'''
         self._check_roundtrip(vmdevices.lease.Device, lease_xml)
-
-    @permutations(_GRAPHICS_DATA)
-    def test_graphics(self, graphics_xml, display_ip, meta,
-                      src_ports, expected_ports):
-        meta['vmid'] = 'VMID'
-        with MonkeyPatchScope([
-            (vmdevices.graphics, '_getNetworkIp', lambda net: display_ip),
-            (vmdevices.graphics.displaynetwork,
-                'create_network', lambda net, vmid: None),
-            (vmdevices.graphics.displaynetwork,
-                'delete_network', lambda net, vmid: None),
-            (vmdevices.graphics, 'config',
-                make_config([('vars', 'ssl', 'true')])),
-        ]):
-            self._check_roundtrip(
-                vmdevices.graphics.Graphics,
-                graphics_xml.format(**src_ports),
-                meta=meta,
-                expected_xml=graphics_xml.format(**expected_ports)
-            )
 
     @MonkeyPatch(vmdevices.network.supervdsm,
                  'getProxy', lambda: FakeProxy())
@@ -1597,7 +1129,7 @@ _DRIVE_PAYLOAD_XML = u"""<domain type='kvm' id='2'>
 _INVALID_DEVICE_XML = u"""<domain type='kvm' id='2'>
   <uuid>1234</uuid>
   <devices>
-    <tpm/>
+    <graphics/>
   </devices>
 </domain>
 """
@@ -1657,17 +1189,10 @@ class DeviceFromXMLTests(XMLTestCase):
 
     def test_erroneous_device_init(self):
         dom_desc = DomainDescriptor(_INVALID_DEVICE_XML)
-        md_desc = metadata.Descriptor.from_xml(_INVALID_DEVICE_XML)
-        with self.assertRaises(vmxml.NotFound):
-            vmdevices.common.dev_map_from_domain_xml(
-                '1234', dom_desc, md_desc, self.log
-            )
-
-    def test_erroneous_device_init_ignored(self):
-        dom_desc = DomainDescriptor(_INVALID_DEVICE_XML)
-        md_desc = metadata.Descriptor.from_xml(_INVALID_DEVICE_XML)
-        self.assertNotRaises(vmdevices.common.dev_map_from_domain_xml,
-                             '1234', dom_desc, md_desc, self.log, noerror=True)
+        for dom in dom_desc.get_device_elements('graphics'):
+            dev = vmdevices.graphics.Graphics(dom, '1234')
+            with self.assertRaises(vmxml.NotFound):
+                dev._display_network()
 
 
 # invalid domain with only the relevant sections added
@@ -1934,32 +1459,6 @@ class MdevTests(XMLTestCase):
             self.assertNotRaises(vm._buildDomainXML)
             self._check_mdev_device(vm, 'c1f343ae-99a5-4d82-9d5c-203cd4b7dac0',
                                     placement)
-
-    def test_legacy_mdev_creation_4_2_parameter(self):
-        params = {'xml': _VM_NO_MDEV_XML,
-                  'custom': _MDEV_CUSTOM}
-        with vmfakelib.VM(params=params, create_device_objects=True) as vm:
-            self._legacy_mdev_checks(vm)
-
-    def test_legacy_mdev_creation_4_2_metadata(self):
-        params = {'xml': _VM_METADATA_MDEV_XML}
-        with vmfakelib.VM(params=params, create_device_objects=True) as vm:
-            self._legacy_mdev_checks(vm)
-
-    def _legacy_mdev_checks(self, vm):
-        xml = vm._buildDomainXML()
-        dom = ET.fromstring(xml)
-        expected = """
-        <hostdev mode="subsystem" model="vfio-pci" type="mdev">
-          <source>
-            <address uuid="67d496a0-d7d9-30f7-9c2d-4844b2d3c76e" />
-          </source>
-        </hostdev>"""
-        hostdevs = dom.findall('*//hostdev')
-        self.assertEqual(len(hostdevs), 1)
-        self.assertXMLEqual(ET.tostring(hostdevs[0]), expected)
-        self._check_mdev_device(vm, '67d496a0-d7d9-30f7-9c2d-4844b2d3c76e',
-                                hostdev.MdevPlacement.COMPACT)
 
     def test_update_from_xml(self):
         params = {'xml': _VM_MDEV_XML % {'placement': ''}}

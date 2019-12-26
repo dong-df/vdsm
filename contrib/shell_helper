@@ -5,6 +5,12 @@
 VDSM_SOURCE_DIR="${VDSM_SOURCE_DIR:-~/code/vdsm}"
 RPMDIR=`rpm --eval %_rpmdir`
 
+if grep -q 'CentOS Linux release 7' /etc/redhat-release; then
+    PYTHON='python2'
+else
+    PYTHON='python3'
+fi
+
 _latest_version() {
     ls "$RPMDIR"/*/vdsm-python* -t -w 1 | head -1 | sed 's/.*vdsm-[a-z]*-//;s/.noarch.rpm//'
 }
@@ -41,12 +47,6 @@ vdsm_caps() {
     else
         sudo vdsm-client Host getCapabilities
     fi
-}
-
-vdsm_functional() {
-    pushd /usr/share/vdsm/tests && \
-    clear && sudo NOSE_TESTMATCH=$1 ./run_tests.sh -s functional/networkTests.py
-    popd
 }
 
 vdsm_check() {
@@ -112,6 +112,7 @@ del_dummies() {
         sudo ip link del dev $dummy
     done
     sudo rm /etc/sysconfig/network-scripts/ifcfg-dummy*
+    sudo nmcli conn del $(nmcli -f name conn show | grep dummy)
 }
 
 del_veths() {
@@ -121,6 +122,7 @@ del_veths() {
         sudo ip link del dev $veth
     done
     sudo rm /etc/sysconfig/network-scripts/ifcfg-veth*
+    sudo nmcli conn del $(nmcli -f name conn show | grep veth)
 }
 
 del_bonds() {
@@ -146,7 +148,7 @@ del_ovs_bridges() {
 }
 
 del_test_nets() {
-    cat << EOF | sudo python -
+    cat << EOF | sudo $PYTHON -
 from __future__ import print_function
 from vdsm.common import libvirtconnection
 c = libvirtconnection.get()
@@ -161,7 +163,7 @@ EOF
 }
 
 del_net_persistency() {
-cat << EOF | sudo python -
+cat << EOF | sudo $PYTHON -
 import os
 
 dirs = ('/var/lib/vdsm/staging/netconf/nets/',
@@ -207,7 +209,7 @@ vdsm_flake8() {
 
 vdsm_unit () {
     cd $VDSM_SOURCE_DIR && \
-    ./autogen.sh --system && make && \
+    ./autogen.sh --system && make && make -C tests run_tests_local.sh && \
     cd tests && sudo ./run_tests_local.sh $1
 }
 

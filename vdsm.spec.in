@@ -2,26 +2,29 @@
 %global vdsm_name vdsm
 
 # Required users and groups
-%global vdsm_user @VDSMUSER@
-%global vdsm_group @VDSMGROUP@
-%global qemu_user @QEMUUSER@
-%global qemu_group @QEMUGROUP@
-%global snlk_group @SNLKGROUP@
-%global snlk_user @SNLKUSER@
-%global cdrom_group @CDROMGROUP@
+%global vdsm_user vdsm
+%global vdsm_group kvm
+%{!?qemu_user: %global qemu_user qemu}
+%{!?qemu_group: %global qemu_group qemu}
+%global snlk_group sanlock
+%global snlk_user sanlock
+%global cdrom_group cdrom
 
 # Features
-%global with_ovirt_imageio @OVIRT_IMAGEIO@
-%global with_ovirt_vmconsole @OVIRT_VMCONSOLE@
-%global with_gluster_mgmt @GLUSTER_MGMT@
-%global with_hooks @HOOKS@
-%global with_vhostmd @VHOSTMD@
+%{!?with_ovirt_imageio: %global with_ovirt_imageio 1}
+%{!?with_ovirt_vmconsole: %global with_ovirt_vmconsole 1}
+%{!?with_gluster_mgmt: %global with_gluster_mgmt 1}
+%{!?with_hooks: %global with_hooks 1}
+%{!?with_vhostmd: %global with_vhostmd 1}
 
 %ifarch ppc64le
-%global with_openvswitch 0
+%global with_openvswitch_default 0
 %else
-%global with_openvswitch @OPENVSWITCH@
+%global with_openvswitch_default 1
 %endif
+%{!?with_openvswitch: %global with_openvswitch %{with_openvswitch_default}}
+
+%{!?vdsm_repo: %global vdsm_repo /rhev/data-center}
 
 %if 0%{?centos} || 0%{?fedora}
 %global gluster_version 3.12
@@ -45,14 +48,16 @@
 # Disable debuginfo package, since vdsm is a meta-package
 %global debug_package %{nil}
 
-%global target_py @VDSM_TARGET_PY_MAJOR_SHORT_VERSION@
+%{!?target_py: %global target_py py3}
 
 %if %{target_py} == py2
 %global python2_or_python3 python2
 %global python_or_python3 python
+%global python_pyyaml PyYAML
 %else
 %global python2_or_python3 python3
 %global python_or_python3 python3
+%global python_pyyaml python3-pyyaml
 %endif
 
 %if %{target_py} == py3
@@ -67,9 +72,23 @@
 %global python_sitelib %{python3_sitelib}
 %endif
 
+%if %{target_py} == py2
+%global python_libvirt libvirt-python
+%else
+%global python_libvirt python3-libvirt
+%endif
+
+# Release must be generated dynamically and that can't be done here.
+# It must be either:
+# - filled in by configure
+# - generated using ./build-aux/make-dist script
+# - passed to rpmbuild as
+#   --define="vdsm_release $(./build-aux/pkg-version --release)"
+%{!?vdsm_release: %global vdsm_release @PACKAGE_RELEASE@}
+
 Name:           %{vdsm_name}
-Version:        @PACKAGE_VERSION@
-Release:        @PACKAGE_RELEASE@%{?dist}%{?extra_release}
+Version:        4.40.0
+Release:        %{vdsm_release}%{?dist}%{?extra_release}
 Summary:        Virtual Desktop Server Manager
 
 Group:          Applications/System
@@ -81,8 +100,8 @@ Source0:        %{vdsm_name}-%{version}.tar.gz
 
 BuildRequires: openssl
 BuildRequires: %{python_or_python3}
-BuildRequires: python-six >= 1.9.0
-BuildRequires: python-dateutil
+BuildRequires: %{python_or_python3}-six >= 1.9.0
+BuildRequires: %{python_or_python3}-dateutil
 %if %{target_py} == py2
 BuildRequires: python-subprocess32
 %endif
@@ -94,17 +113,20 @@ BuildRequires: systemd-units
 %if 0%{?enable_autotools}
 BuildRequires: autoconf
 BuildRequires: automake
-BuildRequires: gettext-devel
-BuildRequires: libtool
 BuildRequires: util-linux
 %endif
 
+%if %{target_py} == py2
 %if 0%{?rhel}
-BuildRequires: %{python_or_python3}-enum34
+BuildRequires: python-enum34
+%else  # fedora
+BuildRequires: python2-enum34
+%endif
 %endif
 
-%if 0%{?fedora}
-BuildRequires: %{python2_or_python3}-enum34
+%if 0%{?rhel} >= 8
+# we don't want BRP to change all our shebangs to platform-python
+%undefine __brp_mangle_shebangs
 %endif
 
 # Numactl is not available on s390[x] and ARM
@@ -124,30 +146,35 @@ Requires: sudo >= 1.7.3
 Requires: logrotate
 Requires: lshw
 Requires: xz
-Requires: python-netaddr
+Requires: %{python_or_python3}-netaddr
 %if %{target_py} == py2
-# TODO: port ioprocess to python3
-# Requires lstat() support, see https://bugzilla.redhat.com/1560460
-Requires: python2-ioprocess >= 1.1.1
-%endif
 Requires: python-pthreading >= 0.1.3-3
-Requires: python-six >= 1.9.0
-Requires: python-requests
 Requires: rpm-python
+%else
+Requires: python3-rpm
+%endif
+Requires: %{python_or_python3}-six >= 1.9.0
+Requires: %{python_or_python3}-requests
 Requires: abrt-cli
 Requires: abrt-addon-vmcore
 Requires: abrt-addon-ccpp
-%if %{target_py} == py2
+%if %{target_py} == py3
+Requires: python3-abrt-addon
+%else
+# python2 abrt-addon-python doesn't exist in Fedora anymore
+%if ! 0%{?fedora}
 Requires: abrt-addon-python
+%endif
 %endif
 Requires: curl
 Requires: %{name}-http = %{version}-%{release}
 Requires: %{name}-jsonrpc = %{version}-%{release}
+%if 0%{?rhel} >= 8
+Requires: safelease >= 1.0.1-1.el8ev
+%else
 Requires: safelease >= 1.0-7
-%if %{target_py} == py2
-# TODO: port mom to python3
-Requires: mom >= 0.5.12
 %endif
+Requires: mom >= 0.5.14
 Requires: util-linux
 Requires(pre): shadow-utils
 
@@ -161,13 +188,13 @@ Requires: nfs-utils >= 1.3.0-0.48.el7_4.2
 Requires: nfs-utils
 %endif
 
-%if 0%{?with_ovirt_imageio}
+%if %{with_ovirt_imageio}
 Requires: ovirt-imageio-common
 # For GET /tickets/*
 Requires: ovirt-imageio-daemon >= 1.2.0
 %endif
 
-%if 0%{?with_ovirt_vmconsole}
+%if %{with_ovirt_vmconsole}
 Requires: ovirt-vmconsole >= 1.0.0-0
 %endif
 
@@ -188,28 +215,39 @@ Requires: libvirt-daemon-config-nwfilter
 Requires: libvirt-lock-sanlock
 
 %if 0%{?rhel}
+%if 0%{?rhel} < 8
 # 7.6 baseline
-Requires: libvirt-python >= 4.5.0-1.el7
+Requires: %{python_libvirt} >= 4.5.0-1.el7
 # CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
 Requires: libvirt-daemon-kvm >= 4.5.0-10.el7_6.9
+%else # RHEL 8
+Requires: libvirt-daemon-kvm
+Requires: %{python_libvirt}
+%endif
 %else # fedora
-# Required for preventing an HotPlug disk failure due to cgroups.
-# See https://bugzilla.redhat.com/1540872 for details.
-Requires: libvirt-python >= 3.7.0
-# Required to fix order of VM life cycle events.
-# See https://bugzilla.redhat.com/1612943 for details.
 %ifnarch s390 s390x
 # virt-preview is not available for s390
+# Required to fix order of VM life cycle events.
+# See https://bugzilla.redhat.com/1612943 for details.
 Requires: libvirt-daemon-kvm >= 4.9.0-1
+Requires: %{python_libvirt} >= 4.9
 %else
 Requires: libvirt-daemon-kvm
+# Required for preventing an HotPlug disk failure due to cgroups.
+# See https://bugzilla.redhat.com/1540872 for details.
+Requires: %{python_libvirt} >= 3.7.0
 %endif
 %endif
 
 # iscsi-intiator versions
 Requires: iscsi-initiator-utils >= 6.2.0.873-21
 
-Requires: sanlock >= 3.5.0-1, sanlock-python
+%if %{target_py} == py2
+# Adding 4k support.
+Requires: sanlock-python >= 3.7.3
+%else
+Requires: python3-sanlock
+%endif
 
 # device-mapper-multipath
 
@@ -226,14 +264,18 @@ Requires: device-mapper-multipath >= 0.7.4-3
 # augeas
 
 %if 0%{?rhel}
-Requires: python-augeas
+Requires: %{python_or_python3}-augeas
 %endif
 
 %if 0%{?fedora}
-Requires: python2-augeas
+Requires: %{python2_or_python3}-augeas
 %endif
 
+%if %{target_py} == py2
 Requires: policycoreutils-python
+%else
+Requires: python3-policycoreutils
+%endif
 Requires: fence-agents-all
 Requires: systemd >= 219-11
 Requires: initscripts >= 9.49.31
@@ -246,15 +288,21 @@ Requires: lvm2 >= 2.02.145
 %endif
 
 %if 0%{?rhel}
+# TODO - use baseline el8.1 kernel version once available
+%if 0%{?centos}
 # CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
 Requires: kernel >= 3.10.0-957.12.2.el7
+%else # rhel
+# CVE-2019-14835
+Requires: kernel >= 4.18.0-145.el8
+%endif
 Requires: e2fsprogs
 Requires: selinux-policy-targeted >= 3.13.1-166.el7_4.3
 %else # fedora
 # CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
 Requires: kernel >=  5.0.16-100
 Requires: e2fsprogs >= 1.41.14
-Requires: policycoreutils-python-utils
+Requires: %{python_or_python3}-policycoreutils
 Requires: sed >= 4.2.1-10
 Requires: ed
 Requires: selinux-policy-targeted >= 3.13-1
@@ -263,18 +311,36 @@ Requires: selinux-policy-targeted >= 3.13-1
 Requires: policycoreutils >= 2.1.13-55
 %endif
 
-%if 0%{?rhel}
+# qemu-kvm
+
+%if 0%{?rhel} >= 8
+%if 0%{?centos}
+# Advanced virt stream not available yet on CentOS.
+Requires: qemu-kvm
+%else
+# 4.4. Baseline.
+Requires: qemu-kvm >= 15:4.1.0-14.module+el8.1.0+4548+ed1300f4
+%endif #centos
+%endif #rhel
+
+%if 0%{?rhel} == 7
+# 4k not supported yet on rhel 7.
+# https://bugzilla.redhat.com/1745443
 # CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
 Requires: qemu-kvm-rhev >= 10:2.12.0-18.el7_6.5
-%else # fedora
-# qemu-kvm 2.12 is Fedora 28 virt-preview baseline
-# but virt-preview is not available on s390 arch
-%ifnarch s390 s390x
-Requires: qemu-kvm >= 2:2.12
-%else
+%endif
+
+%if 0%{?fedora}
+%ifarch s390 s390x
+# virt-preview is not available on s390 arch.
 Requires: qemu-kvm >= 2:2.11.2
-%endif
-%endif
+%else
+# For 4k support:
+# - https://bugzilla.redhat.com/1737256
+# - https://bugzilla.redhat.com/1738657
+Requires: qemu-kvm >= 2:4.1.0-2
+%endif # s390
+%endif # fedora
 
 # GlusterFS client-side RPMs needed for Gluster SD
 %ifnarch ppc64le
@@ -283,20 +349,40 @@ Requires: glusterfs-fuse >= %{gluster_version}
 %endif
 
 Requires: psmisc >= 22.6-15
+
+# Make sure we require sos version which includes VDSM plugin
+%if 0%{?centos} || 0%{?fedora}
+# Currently we are without sos VDSM plugin on CentOS/Fedora:
+#  - CentOS: When 7.7 is released, we also need to require 3.7-3+
+#  - Fedora: When sos 3.7.1/3.8 is relased, we need to require it
 Requires: sos
+%else
+# RHEL
+%if 0%{?rhel} >= 8
+Requires: sos >= 3.7-1
+%else
+Requires: sos >= 3.7-3
+%endif
+%endif
+
 Requires: tree
 Requires: dosfstools
 Requires: genisoimage
+%if %{target_py} == py2
 Requires: libselinux-python >= 2.5-2
+%else
+Requires: python3-libselinux
+%endif
 Requires: %{name}-python = %{version}-%{release}
 Requires: %{name}-hook-vmfex-dev = %{version}-%{release}
 Requires: libguestfs-tools-c
 
 Requires(post): /usr/sbin/saslpasswd2
 
-%if 0%{?fedora}
+%if 0%{?fedora} || 0%{?rhel} >= 8
 Requires(post): hostname
 %else
+# RHEL/CentOS 7
 Requires(post): /bin/hostname
 %endif
 
@@ -310,11 +396,18 @@ Requires: edk2-ovmf
 %endif
 %endif
 
-Requires: python-pyudev
+Requires: %{python_or_python3}-pyudev
+
+Conflicts: ovirt-hosted-engine-ha < 2.3.6
 
 Conflicts: vdsm-hook-sriov
 Obsoletes: vdsm-hook-vfio-mdev
 Provides: vdsm-hook-vfio-mdev
+Obsoletes: %{name}-hook-floppy
+Obsoletes: %{name}-hook-numa
+Obsoletes: %{name}-hook-pincpu
+Obsoletes: %{name}-hook-vmdisk
+Obsoletes: %{name}-hook-hostdev-scsi
 
 %description
 The VDSM service is required by a Virtualization Manager to manage the
@@ -349,11 +442,7 @@ Access vdsm API from the command line.
 %package api
 Summary:        VDSM API
 BuildArch:      noarch
-%if %{target_py} == py2
-BuildRequires:  PyYAML
-%else
-BuildRequires:  python3-PyYAML
-%endif
+BuildRequires:  %{python_pyyaml}
 
 %description api
 Contains api schema files
@@ -372,7 +461,11 @@ A Json-based RPC interface that serves as the protocol for libvdsm.
 %package yajsonrpc
 Summary:        JSON RPC server and client implementation
 BuildArch:      noarch
+%if %{target_py} == py2
 Requires:       python >= 2.6
+%else
+Requires:       python3 >= 3.6
+%endif
 
 %description yajsonrpc
 A JSON RPC server and client implementation.
@@ -386,16 +479,19 @@ Requires:       %{python_or_python3}-dateutil
 Requires:       %{python_or_python3}-six >= 1.9.0
 %if %{target_py} == py2
 Requires:       python-subprocess32
+%if 0%{?rhel}
+Requires:       python-enum34
+%else  # fedora
+Requires:       python2-enum34
+%endif
 %endif
 %if 0%{?rhel}
 Requires:       %{python_or_python3}-decorator
-Requires:       libvirt-python >= 3.2.0-3.el7_4.1
-Requires:       %{python_or_python3}-enum34
+Requires:       %{python_libvirt} >= 3.2.0-3.el7_4.1
 %endif
 %if 0%{?fedora}
 Requires:       %{python2_or_python3}-decorator
-Requires:       %{python2_or_python3}-enum34
-Requires:       libvirt-python >= 3.7.0
+Requires:       %{python_libvirt} >= 3.7.0
 %endif
 
 %description common
@@ -404,7 +500,11 @@ VDSM libraries that are imported by all subsystems
 %package network
 Summary:        VDSM network python libraries
 Requires:       NetworkManager-config-server
+%if %{target_py} == py2
 Requires:       dbus-python
+%else
+Requires:       python3-dbus
+%endif
 Requires:       dhclient
 Requires:       ethtool
 Requires:       initscripts
@@ -412,16 +512,27 @@ Requires:       iproute
 %if 0%{?fedora} >= 25
 Requires:       iproute-tc
 %endif
+%if 0%{?fedora} >= 29 || 0%{?rhel} >= 8
+# remove when nmstate is finished
+Requires: network-scripts
+Requires: nmstate
+%endif
 Requires:       libnl3
+%if %{target_py} == py2
 Requires:       libselinux-python
+%else
+Requires:       python3-libselinux
+%endif
 Requires:       lldpad
-%if 0%{?with_openvswitch}
+%if %{with_openvswitch}
 Requires:       openvswitch >= 2.7.0
 %endif
 Requires:       %{python_or_python3}-inotify
+%if %{target_py} == py2
 Requires:       python-ipaddress
-Requires:       python-netaddr
-Requires:       python-six
+%endif
+Requires:       %{python_or_python3}-netaddr
+Requires:       %{python_or_python3}-six
 Requires:       systemd
 Requires:       %{name}-common = %{version}-%{release}
 
@@ -432,25 +543,13 @@ VDSM network python libraries
 Summary:        VDSM python libraries
 Requires:       %{name}-api = %{version}-%{release}
 BuildArch:      noarch
-Requires:       python-ioprocess >= 0.16.1-1
+# Provides probe_block_size(), see https://bugzilla.redhat.com/1753898
+Requires:       %{python2_or_python3}-ioprocess >= 1.3.0
 Requires:       %{name}-common = %{version}-%{release}
 Requires:       %{name}-network = %{version}-%{release}
 
 %description python
 Shared libraries between the various VDSM packages.
-
-%package tests
-Summary:        VDSM Test Suite
-BuildArch:      noarch
-Requires:       %{name} = %{version}-%{release}
-Requires:       %{name}-common = %{version}-%{release}
-Requires:       %{name}-network = %{version}-%{release}
-Requires:       dracut
-Requires:       python-nose python-ipaddress
-Requires:       PyYAML
-
-%description tests
-A test suite for verifying the functionality of a running vdsm instance
 
 %package hook-allocate_net
 Summary:        random_network allocation hook for VDSM
@@ -514,7 +613,7 @@ Summary:        Set extra ipv4 addresses for vdsm networks.
 This hook allows the user to set extra ipv4
 addresses for vdsm networks.
 
-%if 0%{?with_vhostmd}
+%if %{with_vhostmd}
 %package hook-vhostmd
 Summary:        VDSM hook set for interaction with vhostmd
 BuildArch:      noarch
@@ -578,25 +677,15 @@ To enable this hook on your host, set vars.fake_vmstats_enable=true in your
 %package hook-fileinject
 Summary:        Allow uploading file to VMs disk
 BuildArch:      noarch
-Requires:       python-libguestfs
+Requires:       %{python_or_python3}-libguestfs
 
 %description hook-fileinject
 Hook is getting target file name and its content and
 create that file in target machine.
 
-%package hook-floppy
-Summary:        Allow adding floppy to VM
-BuildArch:      noarch
-
-%description hook-floppy
-Allow adding floppy to VM
-
 %package hook-httpsisoboot
 Summary:        Allow directly booting from an https available ISO
 BuildArch:      noarch
-%if 0%{?rhel}
-Requires:       qemu-kvm-rhev >= 10:2.1.2-3
-%endif
 
 %description hook-httpsisoboot
 Let the VM boot from an ISO image made available via an https URL without
@@ -611,36 +700,12 @@ BuildArch:      noarch
 If the nested virtualization is enabled in your kvm module
 this hook will expose it to the guests.
 
-%package hook-numa
-Summary:        NUMA support for VDSM
-BuildArch:      noarch
-
-%description hook-numa
-Hooks is getting number/rage of NUMA nodes and NUMA mode,
-and update the VM xml.
-
 %package hook-openstacknet
 Summary:        OpenStack Network vNICs support for VDSM
 BuildArch:      noarch
 
 %description hook-openstacknet
 Hook for OpenStack Network vNICs.
-
-%package hook-pincpu
-Summary:        Hook pin VM so specific CPUs
-BuildArch:      noarch
-
-%description hook-pincpu
-pincpu is hook for VDSM.
-pincpu enable to pin virtual machine to a specific CPUs.
-
-%package hook-promisc
-Summary:        Network interface promiscuous mode support for VDSM
-BuildArch:      noarch
-
-%description hook-promisc
-VDSM promiscuous mode let user define a VM interface that will capture
-all network traffic.
 
 %package hook-qemucmdline
 Summary:        QEMU cmdline hook for VDSM
@@ -688,13 +753,6 @@ Conflicts:      hook-vmfex
 Allows to use custom device properties to connect a guest vNIC to a host
 VM-FEX Virtual Function (SR-IOV with macvtap mode).
 
-%package hook-vmdisk
-Summary:        External disk support for VDSM
-BuildArch:      noarch
-
-%description hook-vmdisk
-Hook adds additional disk image for a VM (raw or qcow2)
-
 %package hook-fcoe
 Summary:        Hook to enable FCoE support
 BuildArch:      noarch
@@ -716,7 +774,15 @@ BuildArch:      noarch
 %description hook-cpuflags
 Hook that modifies guest's CPU flags using custom properties.
 
-%if 0%{?with_gluster_mgmt}
+%package hook-hostdev-scsi
+Summary:        Hook to optimize hostdev SCSI devices translating their config.
+BuildArch:      noarch
+
+%description hook-hostdev-scsi
+Hook to optimizet hostdev SCSI generic devices translating their configuration
+into more specific one.
+
+%if %{with_gluster_mgmt}
 %package gluster
 Summary:        Gluster Plugin for VDSM
 Requires: %{name} = %{version}-%{release}
@@ -724,12 +790,12 @@ Requires: glusterfs-server >= %{gluster_version}
 Requires: glusterfs-api >= %{gluster_version}
 Requires: glusterfs-geo-replication >= %{gluster_version}
 Requires: glusterfs-events >= %{gluster_version}
-Requires: python-magic
-Requires: PyYAML
-%if 0%{?fedora}
-Requires: python-blivet1 >= 1.20.4-1
+Requires: %{python_or_python3}-magic
+Requires: %{python_pyyaml}
+%if 0%{?fedora} && %{target_py} == py2
+Requires: python2-blivet1 >= 1.20.4-1
 %else
-Requires: python-blivet
+Requires: %{python_or_python3}-blivet
 %endif
 Requires: xfsprogs
 %ifarch x86_64
@@ -750,7 +816,32 @@ Gluster plugin enables VDSM to serve Gluster functionalities.
 autoreconf -if
 %endif
 
-%configure @CONFIGURE_FLAGS@
+%if %{with_ovirt_imageio}
+%define enable_ovirt_imageio yes
+%else
+%define enable_ovirt_imageio no
+%endif
+%if %{with_ovirt_vmconsole}
+%define enable_ovirt_vmconsole yes
+%else
+%define enable_ovirt_vmconsole no
+%endif
+%if %{with_gluster_mgmt}
+%define enable_gluster_mgmt yes
+%else
+%define enable_gluster_mgmt no
+%endif
+%if %{with_hooks}
+%define enable_hooks yes
+%else
+%define enable_hooks no
+%endif
+%if %{with_vhostmd}
+%define enable_vhostmd yes
+%else
+%define enable_vhostmd no
+%endif
+%configure --with-qemu-user=%{qemu_user} --with-qemu-group=%{qemu_group} --enable-ovirt-imageio=%{enable_ovirt_imageio} --enable-ovirt-vmconsole=%{enable_ovirt_vmconsole} --enable-gluster-mgmt=%{enable_gluster_mgmt} --enable-hooks=%{enable_hooks} --enable-vhostmd=%{enable_vhostmd} --with-data-center=%{vdsm_repo}
 make
 
 %install
@@ -758,8 +849,6 @@ make DESTDIR=%{buildroot} install
 
 %if %{target_py} == py3
 %py_byte_compile python3 %{buildroot}/%{_datadir}/%{vdsm_name}/sitecustomize.py
-%py_byte_compile python3 %{buildroot}/%{_datadir}/%{vdsm_name}/tests
-%py_byte_compile python3 %{buildroot}/%{_datadir}/yum-plugins/vdsmupgrade.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/after_device_create/openstacknet_utils.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/openstacknet_utils.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/openstacknet_utils.py
@@ -801,7 +890,7 @@ fi
 # the ghost macro (in files session) the files are not included
 touch %{_vdsm_log_dir}/{mom.log,supervdsm.log,vdsm.log}
 chmod 0644 %{_vdsm_log_dir}/{mom.log,supervdsm.log,vdsm.log}
-chown @VDSMUSER@:@VDSMGROUP@ %{_vdsm_log_dir}/{mom.log,vdsm.log}
+chown %{vdsm_user}:%{vdsm_group} %{_vdsm_log_dir}/{mom.log,vdsm.log}
 chown root:root %{_vdsm_log_dir}/supervdsm.log
 
 systemd-tmpfiles --create %{vdsm_name}.conf
@@ -880,6 +969,7 @@ exit 0
 %doc README.md
 %doc lib/vdsm/vdsm.conf.sample
 %doc README.logging
+%doc ChangeLog
 %license COPYING
 %{_presetdir}/85-vdsmd.preset
 %{_unitdir}/dev-hugepages1G.mount
@@ -890,12 +980,12 @@ exit 0
 %{_unitdir}/mom-vdsm.service
 %{_sysconfdir}/systemd/system/libvirtd.service.d/unlimited-core.conf
 
-%dir %attr(-, %{vdsm_user}, %{vdsm_group}) @VDSMREPO@
+%dir %attr(-, %{vdsm_user}, %{vdsm_group}) %{vdsm_repo}
 %ghost %config %attr(0644, %{vdsm_user}, %{vdsm_group}) %{_vdsm_log_dir}/mom.log
 %ghost %config %attr(0644, root, root) %{_vdsm_log_dir}/supervdsm.log
 %ghost %config %attr(0644, %{vdsm_user}, %{vdsm_group}) %{_vdsm_log_dir}/vdsm.log
-%ghost %dir %attr(-, %{vdsm_user}, %{vdsm_group}) @VDSMREPO@/hsm-tasks
-%ghost %dir %attr(-, %{vdsm_user}, %{vdsm_group}) @VDSMREPO@/mnt
+%ghost %dir %attr(-, %{vdsm_user}, %{vdsm_group}) %{vdsm_repo}/hsm-tasks
+%ghost %dir %attr(-, %{vdsm_user}, %{vdsm_group}) %{vdsm_repo}/mnt
 %dir %{_libexecdir}/%{vdsm_name}
 %dir %{_sysconfdir}/%{vdsm_name}/vdsm.conf.d
 %dir %{_sysconfdir}/modprobe.d/
@@ -927,6 +1017,7 @@ exit 0
 %{_sysconfdir}/sudoers.d/50_vdsm
 %{_sysconfdir}/cron.hourly/vdsm-logrotate
 %{_sysconfdir}/libvirt/hooks/qemu
+%{_exec_prefix}/lib/dracut/dracut.conf.d/99-vdsm_protect_ifcfg.conf
 %{_libexecdir}/%{vdsm_name}/curl-img-wrap
 %{_libexecdir}/%{vdsm_name}/fc-scan
 %{_libexecdir}/%{vdsm_name}/managedvolume-helper
@@ -943,12 +1034,14 @@ exit 0
 %endif
 %dir %{_libexecdir}/%{vdsm_name}/hooks
 %dir %{_libexecdir}/%{vdsm_name}/hooks/*
+%if %{target_py} == py3 && ( ! 0%{?rhel} || 0%{?rhel} >= 8 )
+%{python3_sitelib}/dnf-plugins/*.py
+%{python3_sitelib}/dnf-plugins/__pycache__/*
+%else
+%exclude %{python_sitelib}/dnf-plugins
+%endif
 
 %{_libexecdir}/%{vdsm_name}/get-conf-item
-%{python_sitelib}/sos/plugins/vdsm.py*
-%if %{target_py} == py3
-%{python3_sitelib}/sos/plugins/__pycache__/*
-%endif
 %{_udevrulesdir}/12-vdsm-lvm.rules
 /etc/security/limits.d/99-vdsm.conf
 %{_mandir}/man8/vdsmd.8*
@@ -961,6 +1054,7 @@ exit 0
 %dir %{_sysconfdir}/pki/%{vdsm_name}
 %dir %{_sysconfdir}/pki/%{vdsm_name}/keys
 %dir %{_sysconfdir}/pki/%{vdsm_name}/certs
+%{_sysconfdir}/pki/%{vdsm_name}/libvirt-migrate
 %dir %{_sysconfdir}/pki/%{vdsm_name}/libvirt-spice
 %config(noreplace) %{_sysconfdir}/pki/%{vdsm_name}/keys/libvirt_password
 %dir %{_localstatedir}/lib/%{vdsm_name}
@@ -976,11 +1070,6 @@ exit 0
 %{_datadir}/%{vdsm_name}/lvmlocal.conf
 %{_datadir}/%{vdsm_name}/autounattend/
 
-%{_sysconfdir}/yum/pluginconf.d/vdsmupgrade.conf
-%{_datadir}/yum-plugins/*.py*
-%if %{target_py} == py3
-%{_datadir}/yum-plugins/__pycache__/*
-%endif
 
 %files common
 %{python_sitelib}/%{vdsm_name}/__init__.py*
@@ -1080,10 +1169,6 @@ exit 0
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/exception.*.pyc
 %endif
 
-%files tests
-%doc %{_datadir}/%{vdsm_name}/tests/README
-%{_datadir}/%{vdsm_name}/tests
-
 %files hook-openstacknet
 %{_sysconfdir}/sudoers.d/50_vdsm_hook_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/after_device_create/50_openstacknet
@@ -1110,7 +1195,7 @@ exit 0
 %{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/__pycache__/*
 %endif
 
-%if 0%{?with_vhostmd}
+%if %{with_vhostmd}
 %files hook-vhostmd
 %license COPYING
 %{_sysconfdir}/sudoers.d/50_vdsm_hook_vhostmd
@@ -1152,7 +1237,7 @@ exit 0
 %files hook-cpuflags
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_cpuflags
 
-%if 0%{?with_hooks}
+%if %{with_hooks}
 %files hook-allocate_net
 %{_libexecdir}/%{vdsm_name}/hooks/before_device_create/10_allocate_net
 
@@ -1183,10 +1268,6 @@ exit 0
 %files hook-fileinject
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_fileinject
 
-%files hook-floppy
-%{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_floppy
-%{_libexecdir}/%{vdsm_name}/hooks/before_vm_migrate_source/50_floppy
-
 %files hook-httpsisoboot
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_httpsisoboot
 
@@ -1201,17 +1282,6 @@ exit 0
 %{_sysconfdir}/modprobe.d/vdsm-nestedvt.conf
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_nestedvt
 
-%files hook-numa
-%{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_numa
-
-%files hook-pincpu
-%{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_pincpu
-
-%files hook-promisc
-%{_sysconfdir}/sudoers.d/50_vdsm_hook_promisc
-%{_libexecdir}/%{vdsm_name}/hooks/after_vm_start/50_promisc
-%{_libexecdir}/%{vdsm_name}/hooks/before_vm_destroy/50_promisc
-
 %files hook-scratchpad
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_scratchpad
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_migrate_source/50_scratchpad
@@ -1222,9 +1292,6 @@ exit 0
 
 %files hook-spiceoptions
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_spiceoptions
-
-%files hook-vmdisk
-%{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_vmdisk
 %endif
 
 %files http
@@ -1270,7 +1337,7 @@ exit 0
 %if %{target_py} == py3
 %{python3_sitelib}/%{vdsm_name}/api/__pycache__/*
 %endif
-%if ! 0%{?with_gluster_mgmt}
+%if ! %{with_gluster_mgmt}
 %exclude %{python_sitelib}/%{vdsm_name}/rpc/vdsm-api-gluster.pickle
 %endif
 
@@ -1293,7 +1360,7 @@ exit 0
 %{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/10_faqemu
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/10_faqemu
 
-%if 0%{?with_gluster_mgmt}
+%if %{with_gluster_mgmt}
 %files gluster
 %license COPYING
 %{python_sitelib}/%{vdsm_name}/gluster/api.py*
@@ -1323,20 +1390,6 @@ exit 0
 %endif
 %endif
 
-
 %changelog
-* Wed Aug 03 2016 Yaniv Bronhaim <ybronhei@redhat.com> - 4.18.999
-- Re-review of vdsm.spec to return it to fedora Bug #1361659
-
-* Sun Oct 13 2013 Yaniv Bronhaim <ybronhei@redhat.com> - 4.13.0
-- Removing vdsm-python-cpopen from the spec
-- Adding dependency on formal cpopen package
-
-* Sun Apr 07 2013 Yaniv Bronhaim <ybronhei@redhat.com> - 4.9.0-1
-- Adding cpopen package
-
-* Wed Oct 12 2011 Federico Simoncelli <fsimonce@redhat.com> - 4.9.0-0
-- Initial upstream release
-
-* Thu Nov 02 2006 Simon Grinberg <simong@qumranet.com> -  0.0-1
-- Initial build
+* Tue Feb 26 2019 Milan Zamazal <mzamazal@redhat.com> - 4.40
+- See %{_docdir}/%{vdsm_name}/ChangeLog for the complete list of Vdsm changes.

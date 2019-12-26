@@ -38,7 +38,8 @@ def process_request(command):
                 if err_line.startswith(_TC_ERR_PREFIX):
                     err = err_line
                     retcode = _errno_trans.get(
-                        err[len(_TC_ERR_PREFIX):].strip())
+                        err[len(_TC_ERR_PREFIX) :].strip()
+                    )
                     break
         raise TrafficControlException(retcode, err, command)
     return out
@@ -47,6 +48,6 @@ def process_request(command):
 class TrafficControlException(Exception):
     def __init__(self, errCode, message, command):
         self.errCode = errCode
-        self.message = message
+        self.msg = message
         self.command = command
-        Exception.__init__(self, self.errCode, self.message, self.command)
+        Exception.__init__(self, self.errCode, self.msg, self.command)

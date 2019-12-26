@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 #
 # Copyright 2011 Red Hat, Inc.
 #
@@ -19,10 +19,12 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
+from __future__ import absolute_import
+from __future__ import print_function
+
 '''
 To Enable this set fake_kvm_support=true in /etc/vdsm/vdsm.conf.
 '''
-from __future__ import print_function
 from functools import wraps
 import getopt
 import sys

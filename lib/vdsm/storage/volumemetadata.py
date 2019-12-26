@@ -29,6 +29,12 @@ from vdsm.storage import constants as sc
 from vdsm.storage import exception
 
 
+# SIZE property was deprecated in metadata v5, but we still need this key to
+# read and write legacy metadata. To make sure no other code use it and it's
+# used only by metadata code, move it here and make it private.
+_SIZE = "SIZE"
+
+
 class VolumeMetadata(object):
 
     log = logging.getLogger('storage.VolumeMetadata')
@@ -63,8 +69,16 @@ class VolumeMetadata(object):
 
     @classmethod
     def from_lines(cls, lines):
+        '''
+        Instantiates a VolumeMetadata object from storage read bytes.
+
+        Args:
+            lines: list of key=value entries given as bytes read from storage
+            metadata section. "EOF" entry terminates parsing.
+        '''
         md = {}
         for line in lines:
+            line = line.decode("utf-8")
             if line.startswith("EOF"):
                 break
             if '=' not in line:
@@ -79,7 +93,7 @@ class VolumeMetadata(object):
             if sc.CAPACITY in md:
                 capacity = int(md[sc.CAPACITY])
             else:
-                capacity = int(md[sc.SIZE]) * sc.BLOCK_SIZE_512
+                capacity = int(md[_SIZE]) * sc.BLOCK_SIZE_512
 
             return cls(domain=md[sc.DOMAIN],
                        image=md[sc.IMAGE],
@@ -134,15 +148,6 @@ class VolumeMetadata(object):
         self._ctime = self._validate_integer("ctime", value)
 
     @property
-    def size(self):
-        return self.capacity // sc.BLOCK_SIZE_512
-
-    @size.setter
-    def size(self, value):
-        self.capacity = (self._validate_integer("size", value) *
-                         sc.BLOCK_SIZE_512)
-
-    @property
     def generation(self):
         return self._generation
 
@@ -172,18 +177,15 @@ class VolumeMetadata(object):
 
     def storage_format(self, domain_version, **overrides):
         """
-        Format metadata string in storage format.
+        Format metadata parameters into storage format bytes.
 
-        VolumeMetadata is quite restrictive and doesn't allows
+        VolumeMetadata is quite restrictive and does not allow
         you to make an invalid metadata, but sometimes, for example
         for a format conversion, you need some additional fields to
         be written to the storage. Those fields can be added using
         overrides dict.
 
         Raises MetadataOverflowError if formatted metadata is too long.
-
-        NOTE: Not used yet! We need to drop legacy_info() and pass
-        VolumeMetadata instance instead of a dict to use this code.
         """
 
         info = {
@@ -208,7 +210,7 @@ class VolumeMetadata(object):
 
             # Pre v5 domains should have SIZE in blocks
             # instead of CAPACITY in bytes
-            info[sc.SIZE] = self.size
+            info[_SIZE] = self.capacity // sc.BLOCK_SIZE_512
         else:
             info[sc.CAPACITY] = self.capacity
 
@@ -217,7 +219,7 @@ class VolumeMetadata(object):
         keys = sorted(info.keys())
         lines = ["%s=%s\n" % (key, info[key]) for key in keys]
         lines.append("EOF\n")
-        data = "".join(lines)
+        data = "".join(lines).encode("utf-8")
         if len(data) > sc.METADATA_SIZE:
             raise exception.MetadataOverflowError(data)
         return data
@@ -244,7 +246,6 @@ class VolumeMetadata(object):
         sc.PUUID: 'puuid',
         sc.LEGALITY: 'legality',
         sc.GENERATION: 'generation',
-        sc.SIZE: 'size'
     }
 
     def __getitem__(self, item):
@@ -254,7 +255,7 @@ class VolumeMetadata(object):
             raise KeyError(item)
 
         # Some fields needs to be converted to string
-        if item in (sc.CAPACITY, sc.SIZE, sc.CTIME):
+        if item in (sc.CAPACITY, sc.CTIME):
             value = str(value)
         return value
 

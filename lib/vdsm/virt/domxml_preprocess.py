@@ -87,7 +87,6 @@ Please check the documentation of the functions in this module to learn
 about the supported placeholders and their meaning.
 """
 
-from vdsm import constants
 from vdsm import host
 from vdsm import osinfo
 
@@ -264,13 +263,7 @@ def replace_placeholders(dom, arch, serial=None):
         os_version = osd.get('version', '') + '-' + osd.get('release', '')
         serial_number = host.uuid() if serial is None else serial
         libvirtxml.update_sysinfo(
-            dom, constants.SMBIOS_OSNAME, os_version, serial_number)
-
-
-def add_mediated_device(dom, mdev_uuid):
-    devs = vmxml.find_first(dom, 'devices')
-    hostdev = libvirtxml.make_mdev_element(mdev_uuid)
-    devs.append(hostdev)
+            dom, osd['name'], os_version, serial_number)
 
 
 def _make_disk_devices(engine_xml, log):

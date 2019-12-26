@@ -24,7 +24,6 @@ from __future__ import division
 # stdlib imports
 from collections import defaultdict, namedtuple
 from contextlib import contextmanager
-import itertools
 import json
 import logging
 import os
@@ -42,7 +41,6 @@ import six
 from vdsm.common import api
 from vdsm.common import cpuarch
 from vdsm.common import exception
-from vdsm.common import hostdev
 from vdsm.common import libvirtconnection
 from vdsm.common import logutils
 from vdsm.common import response
@@ -63,12 +61,12 @@ from vdsm.common.logutils import SimpleLogAdapter, volume_chain_to_str
 from vdsm.network import api as net_api
 
 # TODO: remove these imports, code using this should use storage apis.
-from vdsm.storage import fileUtils
 from vdsm.storage import outOfProcess as oop
 from vdsm.storage import qemuimg
 from vdsm.storage import sd
 from vdsm.storage import sdc
 
+from vdsm.virt import backup
 from vdsm.virt import domxml_preprocess
 from vdsm.virt import drivemonitor
 from vdsm.virt import guestagent
@@ -362,9 +360,9 @@ class Vm(object):
         self._cluster_version = None
         self._pause_time = None
         self._guest_agent_api_version = None
+        self._balloon_minimum = None
+        self._balloon_target = None
         self._blockJobs = {}
-        # REQUIRED_FOR: Engine < 4.2.6
-        self._mdev_type = params.get('custom', {}).get('mdev_type')
         self._md_desc = metadata.Descriptor.from_xml(self.conf['xml'])
         self._init_from_metadata()
         self._destroy_requested = threading.Event()
@@ -508,19 +506,13 @@ class Vm(object):
     @property
     def _agent_channel_name(self):
         name = vmchannels.LEGACY_DEVICE_NAME
-        if 'agentChannelName' in self.conf:
-            name = self.conf['agentChannelName']
-        else:
-            for channel_name, _path in self._domain.all_channels():
-                if channel_name == 'ovirt-guest-agent.0':
-                    name = channel_name
+        for channel_name, _path in self._domain.all_channels():
+            if channel_name == 'ovirt-guest-agent.0':
+                name = channel_name
         return name
 
     def _init_from_metadata(self):
         self._custom['custom'] = self._md_desc.custom
-        if self._mdev_type is None:
-            # REQUIRED_FOR: Engine < 4.2.6
-            self._mdev_type = self._custom['custom'].get('mdev_type')
         with self._md_desc.values() as md:
             self._destroy_on_reboot = (
                 md.get('destroy_on_reboot', False) or
@@ -549,6 +541,7 @@ class Vm(object):
             self._resume_behavior = md.get('resumeBehavior',
                                            ResumeBehavior.AUTO_RESUME)
             self._pause_time = md.get('pauseTime')
+            self._balloon_target = md.get('balloonTarget')
 
     def min_cluster_version(self, major, minor):
         """
@@ -656,9 +649,6 @@ class Vm(object):
 
     def _dev_spec_update_with_vm_conf(self, dev):
         dev['vmid'] = self.id
-        if dev['type'] == hwclass.GRAPHICS:
-            if 'specParams' not in dev:
-                dev['specParams'] = {}
         if dev['type'] in (hwclass.DISK, hwclass.NIC):
             vm_custom = self._custom['custom']
             self.log.debug('device %s: adding VM custom properties %s',
@@ -688,9 +678,10 @@ class Vm(object):
         elif len(balloon_devs) > 1:
             self.log.warning("Multiple balloon devices present")
             return
-        dev = balloon_devs[0]
-        dev.target = self.mem_size_mb(current=self.recovering) * 1024
-        dev.minimum = self._mem_guaranteed_size_mb * 1024
+        if self._balloon_target is None:
+            self._balloon_target = \
+                self.mem_size_mb(current=self.recovering) * 1024
+        self._balloon_minimum = self._mem_guaranteed_size_mb * 1024
 
     def updateDriveIndex(self, drv):
         drv['index'] = self.__getNextIndex(self._usedIndices[
@@ -931,7 +922,18 @@ class Vm(object):
                 if self._destroy_requested.is_set():
                     # A destroy request has been issued, exit early
                     break
-                drive['path'] = self.cif.prepareVolumePath(drive, self.id)
+                if self._altered_state.origin is not None:
+                    # We must use the original payload path in
+                    # incoming migrations, otherwise the generated
+                    # payload path may not match the one from the
+                    # domain XML (when migrating from Vdsm versions
+                    # using different payload paths).
+                    path = drive.get('path')
+                else:
+                    path = None
+                drive['path'] = self.cif.prepareVolumePath(
+                    drive, self.id, path=path
+                )
                 if isVdsmImage(drive):
                     # This is the only place we support manipulation of a
                     # prepared image, required for the localdisk hook. The hook
@@ -945,6 +947,10 @@ class Vm(object):
     def _prepareTransientDisks(self, drives):
         for drive in drives:
             self._createTransientDisk(drive)
+
+    def payload_drives(self):
+        return [drive for drive in self._devices[hwclass.DISK]
+                if vmdevices.storage.is_payload_drive(drive)]
 
     def _getShutdownReason(self, stopped_shutdown):
         exit_code = NORMAL
@@ -1824,23 +1830,21 @@ class Vm(object):
             ),
         }
 
+    def migratable_domain_xml(self):
+        """
+        Return domain XML suitable for migration destinations.
+
+        Unlike a normal domain XML, this domain XML may be slightly
+        modified by libvirt and will not be rejected by the migration
+        end.
+        """
+        return self._dom.XMLDesc(libvirt.VIR_DOMAIN_XML_MIGRATABLE)
+
     def _get_vm_migration_progress(self):
         return self.migrateStatus()['progress']
 
     def _getGraphicsStats(self):
-        def getInfo(dev):
-            return {
-                'type': dev.device,
-                'port': dev.port,
-                'tlsPort': dev.tlsPort,
-                'ipAddress': dev.specParams.get('displayIp', '0'),
-            }
-
-        display_info = [
-            getInfo(dev) for dev in self._devices[hwclass.GRAPHICS]
-        ]
-
-        return {'displayInfo': display_info}
+        return {'displayInfo': vmdevices.graphics.display_info(self.domain)}
 
     def _getGuestStats(self):
         stats = self.guestAgent.getGuestInfo()
@@ -2091,10 +2095,6 @@ class Vm(object):
 
         domxml_preprocess.update_leases_xml_from_disk_objs(
             self, dom, self._devices[hwclass.DISK])
-        if self._mdev_type is not None:
-            # REQUIRED_FOR: Engine < 4.2.6
-            mdev_uuid = hostdev.get_mdev_uuid(self.id)
-            domxml_preprocess.add_mediated_device(dom, mdev_uuid)
         domxml_preprocess.replace_device_xml_with_hooks_xml(
             dom, self.id, self._custom)
 
@@ -2109,8 +2109,8 @@ class Vm(object):
         self._teardown_devices()
         cleanup_guest_socket(self._qemuguestSocketFile)
         self._cleanupStatsCache()
-        for con in self._devices[hwclass.CONSOLE]:
-            con.cleanup()
+        for con in self._domain.get_device_elements('console'):
+            vmdevices.core.cleanup_console(con, self.id)
         if self.hugepages:
             self._cleanup_hugepages()
 
@@ -2143,7 +2143,7 @@ class Vm(object):
         Runs after the underlying libvirt domain was destroyed.
         """
         if devices is None:
-            devices = list(itertools.chain(*self._devices.values()))
+            devices = list(self._tracked_devices())
 
         for device in devices:
             try:
@@ -2151,6 +2151,14 @@ class Vm(object):
             except Exception:
                 self.log.exception('Failed to tear down device %s, device in '
                                    'inconsistent state', device.device)
+
+        for device in self._domain.get_device_elements('graphics'):
+            try:
+                vmdevices.graphics.Graphics(device, self.id).teardown()
+            except Exception:
+                self.log.exception('Failed to tear down device %s, device in '
+                                   'inconsistent state',
+                                   xmlutils.tostring(device, pretty=True))
 
     def _undefine_domain(self):
         if self._external:
@@ -2260,8 +2268,8 @@ class Vm(object):
         # Drop enableGuestEvents from conf - Not required from here anymore
         self.conf.pop('enableGuestEvents', None)
 
-        for con in self._devices[hwclass.CONSOLE]:
-            con.prepare()
+        for con in self._domain.get_device_elements('console'):
+            vmdevices.core.prepare_console(con, self.id)
 
         self._guestCpuRunning = self._isDomainRunning()
         self._logGuestCpuStatus('domain initialization')
@@ -2327,6 +2335,13 @@ class Vm(object):
         self._updateVcpuTuneInfo()
         self._updateVcpuLimit()
 
+    def _tracked_devices(self):
+        for dom in self._domain.get_device_elements('graphics'):
+            yield vmdevices.graphics.Graphics(dom, self.id)
+        for dev_objects in self._devices.values():
+            for dev_object in dev_objects[:]:
+                yield dev_object
+
     def _setup_devices(self):
         """
         Runs before the underlying libvirt domain is created.
@@ -2337,30 +2352,20 @@ class Vm(object):
         raised as we cannot continue the VM creation due to device failures.
         """
         done = []
-
-        for dev_objects in self._devices.values():
-            for dev_object in dev_objects[:]:
-                try:
-                    dev_object.setup()
-                except Exception:
-                    self.log.exception("Failed to setup device %s",
-                                       dev_object.device)
-                    self._teardown_devices(done)
-                    raise
-                else:
-                    done.append(dev_object)
+        for dev_object in self._tracked_devices():
+            try:
+                dev_object.setup()
+            except Exception:
+                self.log.exception("Failed to setup device %s",
+                                   dev_object.device)
+                self._teardown_devices(done)
+                raise
+            else:
+                done.append(dev_object)
 
     def _make_devices(self):
         disk_objs = self._perform_host_local_adjustment()
-        devices = self._make_devices_from_xml(disk_objs)
-        if self._mdev_type is not None:
-            # REQUIRED_FOR: Engine < 4.2.6
-            # Mediated devices used to be handled by a hook, so they are not
-            # handled by older Engines in the usual way.
-            vmdevices.hostdevice.append_mediated_device(
-                devices, self.log, self._mdev_type, self.id
-            )
-        return devices
+        return self._make_devices_from_xml(disk_objs)
 
     def _perform_host_local_adjustment(self):
         """
@@ -2481,7 +2486,9 @@ class Vm(object):
 
         self._devices = self._make_devices()
         # We (re)initialize the balloon values in all the flows.
-        self._initialize_balloon(self._devices[hwclass.BALLOON])
+        self._initialize_balloon(
+            list(self._domain.get_device_elements('memballoon'))
+        )
 
         initDomain = self._altered_state.origin != _MIGRATION_ORIGIN
         # we need to complete the initialization, including
@@ -2649,16 +2656,8 @@ class Vm(object):
 
         domObj = ET.fromstring(domXML)
         for devXml in domObj.findall('.//devices/graphics'):
-            try:
-                devObj = self._lookupDeviceByIdentification(
-                    hwclass.GRAPHICS, devXml.get('type'))
-            except LookupError:
-                self.log.warning('configuration mismatch: graphics device '
-                                 'type %s found in domain XML, but not among '
-                                 'VM devices' % devXml.get('type'))
-            else:
-                devObj.setupPassword(devXml)
-        return ET.tostring(domObj)
+            vmdevices.graphics.reset_password(devXml)
+        return xmlutils.tostring(domObj)
 
     @api.guard(_not_migrating)
     def hotplugNic(self, params):
@@ -2721,18 +2720,10 @@ class Vm(object):
 
         device_info = {'devices': [{'macAddr': nic.macAddr,
                                     'alias': nic.alias,
-                                    }]}
+                                    }],
+                       'xml': self._domain.xml,
+                       }
         return {'status': doneCode, 'vmList': device_info}
-
-    def _lookupDeviceByIdentification(self, devType, devIdent):
-        for dev in self._devices[devType][:]:
-            try:
-                if dev.device == devIdent:
-                    return dev
-            except AttributeError:
-                continue
-        raise LookupError('Device object for device identified as %s '
-                          'of type %s not found' % (devIdent, devType))
 
     def _hotunplug_device(self, device_xml, device, device_hwclass,
                           update_metadata=False):
@@ -2752,6 +2743,9 @@ class Vm(object):
             self._updateDomainDescriptor()
 
     @api.guard(_not_migrating)
+    # This hot plug must be able to take multiple devices so that
+    # IOMMU placeholders and/or different devices in shared groups can
+    # be added.
     def hostdevHotplug(self, dev_specs):
         dev_objects = []
         for dev_spec in dev_specs:
@@ -2761,6 +2755,7 @@ class Vm(object):
                 dev_object.setup()
             except libvirt.libvirtError:
                 # We couldn't detach one of the devices. Halt.
+                # No cleanup needed, detaching a detached device is noop.
                 self.log.exception('Could not detach a device from a host.')
                 return response.error('hostdevDetachErr')
 
@@ -3035,8 +3030,7 @@ class Vm(object):
     def _update_mem_guaranteed_size(self, params):
         if 'memGuaranteedSize' in params:
             self._mem_guaranteed_size_mb = params["memGuaranteedSize"]
-            self._devices[hwclass.BALLOON][0].minimum = \
-                self._mem_guaranteed_size_mb * 1024
+            self._balloon_minimum = self._mem_guaranteed_size_mb * 1024
             self._update_metadata()
 
     def update_guest_agent_api_version(self):
@@ -3046,47 +3040,33 @@ class Vm(object):
 
     @api.guard(_not_migrating)
     def hotplugMemory(self, params):
-        memParams = params.get('memory', {})
-        device = vmdevices.core.Memory(self.log, **memParams)
-
-        deviceXml = xmlutils.tostring(device.getXML())
-        deviceXml = hooks.before_memory_hotplug(deviceXml, self._custom)
-        device._deviceXML = deviceXml
-        self.log.debug("Hotplug memory xml: %s", deviceXml)
+        device_xml = params.get('xml')
+        if device_xml is None:
+            mem_params = params.get('memory', {})
+            device_xml = vmdevices.core.memory_xml(mem_params)
+        device_xml = hooks.before_memory_hotplug(device_xml, self._custom)
+        self.log.debug("Hotplug memory xml: %s", device_xml)
 
         try:
-            self._dom.attachDevice(deviceXml)
+            self._dom.attachDevice(device_xml)
         except libvirt.libvirtError as e:
             self.log.exception("hotplugMemory failed")
             if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
                 raise exception.NoSuchVM()
             return response.error('hotplugMem', str(e))
 
-        self._devices[hwclass.MEMORY].append(device)
         self._updateDomainDescriptor()
-        device.update_device_info(self, self._devices[hwclass.MEMORY])
         self._update_mem_guaranteed_size(params)
-
-        hooks.after_memory_hotplug(deviceXml, self._custom)
+        hooks.after_memory_hotplug(device_xml, self._custom)
 
         return {'status': doneCode, 'vmList': {}}
 
     @api.guard(_not_migrating)
     def hotunplugMemory(self, params):
-        xml = params.get('xml')
-        try:
-            if xml is not None:
-                device = lookup.device_from_xml_alias(
-                    self._devices[hwclass.MEMORY][:],
-                    xml)
-            else:
-                device = lookup.device_by_alias(
-                    self._devices[hwclass.MEMORY][:],
-                    params['memory']['alias'])
-        except LookupError as e:
-            raise exception.HotunplugMemFailed(str(e), vmId=self.id)
-
-        device_xml = xmlutils.tostring(device.getXML())
+        device_xml = params.get('xml')
+        if device_xml is None:
+            mem_params = params['memory']
+            device_xml = vmdevices.core.memory_xml(mem_params)
         self.log.info("Hotunplug memory xml: %s", device_xml)
 
         try:
@@ -3955,26 +3935,37 @@ class Vm(object):
         self.log.info("%d guest filesystems thawed", thawed)
         return response.success()
 
+    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
-    def start_backup(self, backup_id, disks,
-                     from_checkpoint_id=None, to_checkpoint_id=None):
-        raise exception.MethodNotImplemented()
+    def start_backup(self, config):
+        dom = backup.DomainAdapter(self)
+        return backup.start_backup(self, dom, config)
 
+    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def stop_backup(self, backup_id):
-        raise exception.MethodNotImplemented()
+        dom = backup.DomainAdapter(self)
+        return backup.stop_backup(self, dom, backup_id=backup_id)
 
+    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def backup_info(self, backup_id):
-        raise exception.MethodNotImplemented()
+        dom = backup.DomainAdapter(self)
+        return backup.backup_info(self, dom, backup_id=backup_id)
 
+    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def delete_checkpoints(self, checkpoint_ids):
-        raise exception.MethodNotImplemented()
+        dom = backup.DomainAdapter(self)
+        return backup.delete_checkpoints(
+            self, dom, checkpoint_ids=checkpoint_ids)
 
+    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def redefine_checkpoints(self, checkpoints):
-        raise exception.MethodNotImplemented()
+        dom = backup.DomainAdapter(self)
+        return backup.redefine_checkpoints(
+            self, dom, checkpoints=checkpoints)
 
     @api.guard(_not_migrating)
     def snapshot(self, snapDrives, memoryParams, frozen=False):
@@ -4025,19 +4016,15 @@ class Vm(object):
             """Returns the needed vm configuration with the memory snapshot"""
 
             return {'restoreFromSnapshot': True,
-                    '_srcDomXML': self._dom.XMLDesc(
-                        libvirt.VIR_DOMAIN_XML_MIGRATABLE),
+                    '_srcDomXML': self.migratable_domain_xml(),
                     'elapsedTimeOffset': time.time() - self._startTime}
 
         def _padMemoryVolume(memoryVolPath, sdUUID):
             sdType = sd.name2type(
                 self.cif.irs.getStorageDomainInfo(sdUUID)['info']['type'])
             if sdType in sd.FILE_DOMAIN_TYPES:
-                if sdType == sd.NFS_DOMAIN:
-                    oop.getProcessPool(sdUUID).fileUtils. \
-                        padToBlockSize(memoryVolPath)
-                else:
-                    fileUtils.padToBlockSize(memoryVolPath)
+                iop = oop.getProcessPool(sdUUID)
+                iop.fileUtils.padToBlockSize(memoryVolPath)
 
         snap = vmxml.Element('domainsnapshot')
         disks = vmxml.Element('disks')
@@ -4121,7 +4108,9 @@ class Vm(object):
             try:
                 with open(vmConfVolPath, "rb+") as f:
                     vmConf = _vmConfForMemorySnapshot()
-                    data = pickle.dumps(vmConf)
+                    # protocol=2 is needed for clusters < 4.4
+                    # (for Python 2 host compatibility)
+                    data = pickle.dumps(vmConf, protocol=2)
 
                     # Ensure that the volume is aligned; qemu-img may segfault
                     # when converting unligned images.
@@ -4771,6 +4760,7 @@ class Vm(object):
                 vm['guestAgentAPIVersion'] = self._guest_agent_api_version
             vm['destroy_on_reboot'] = self._destroy_on_reboot
             vm['memGuaranteedSize'] = self._mem_guaranteed_size_mb
+            vm['balloonTarget'] = self._balloon_target
             if self._pause_time is None:
                 try:
                     del vm['pauseTime']
@@ -4800,10 +4790,11 @@ class Vm(object):
         """
 
         # delete the payload devices
-        for drive in self._devices[hwclass.DISK]:
-            if (hasattr(drive, 'specParams') and
-                    'vmPayload' in drive.specParams):
+        for drive in self.payload_drives():
+            try:
                 supervdsm.getProxy().removeFs(drive.path)
+            except:
+                self.log.exception("Failed to remove a payload file")
 
         with self._releaseLock:
             if self._released.is_set():
@@ -4902,7 +4893,8 @@ class Vm(object):
         Clean VM from the system
         """
         try:
-            del self.cif.vmContainer[self.id]
+            with self.cif.vm_container_lock:
+                del self.cif.vmContainer[self.id]
         except KeyError:
             self.log.exception("Failed to delete VM %s", self.id)
         else:
@@ -4995,9 +4987,8 @@ class Vm(object):
             return response.success()
 
     def setBalloonTarget(self, target):
-
-        dev = self._devices[hwclass.BALLOON][0]
-        if dev.specParams['model'] == 'none':
+        dev = next(self._domain.get_device_elements('memballoon'))
+        if dev.attrib.get('model') == 'none':
             return
 
         if not self._dom.connected:
@@ -5012,23 +5003,18 @@ class Vm(object):
                 raise exception.NoSuchVM()
             raise exception.BalloonError(str(e))
         else:
-            # TODO: update metadata once we build devices with engine XML
-            self._devices[hwclass.BALLOON][0].target = target
+            self._balloon_target = target
+            self._update_metadata()
 
     def get_balloon_info(self):
-        try:
-            # we will always have exactly one memballoon device
-            dev = self._devices[hwclass.BALLOON][0]
-        except IndexError:
-            # except if getStats() is called concurrently when the
-            # VM is being created, in this case no balloon device is
-            # available
+        if self._balloon_minimum is None or self._balloon_target is None:
+            # getStats() is called concurrently when the VM is being
+            # created, in this case no balloon device is available
             return {}
-        else:
-            return {
-                'target': dev.target,
-                'minimum': dev.minimum,
-            }
+        return {
+            'target': self._balloon_target,
+            'minimum': self._balloon_minimum,
+        }
 
     def setCpuTuneQuota(self, quota):
         try:
@@ -5218,12 +5204,6 @@ class Vm(object):
             alias = vmdevices.core.find_device_alias(deviceXML)
             if alias in aliasToDevice:
                 aliasToDevice[alias]._deviceXML = xmlutils.tostring(deviceXML)
-            elif vmxml.tag(deviceXML) == hwclass.GRAPHICS:
-                # graphics device do not have aliases, must match by type
-                graphicsType = vmxml.attr(deviceXML, 'type')
-                for devObj in self._devices[hwclass.GRAPHICS]:
-                    if devObj.device == graphicsType:
-                        devObj._deviceXML = xmlutils.tostring(deviceXML)
 
     def waitForMigrationDestinationPrepare(self):
         """Wait until paths are prepared for migration destination"""
@@ -5371,7 +5351,7 @@ class Vm(object):
         # another call to merge() where the job has been recorded but not yet
         # started.
         with self._jobsLock:
-            for storedJob in self._blockJobs.values():
+            for storedJob in list(self._blockJobs.values()):
                 jobID = storedJob['jobID']
                 self.log.debug("Checking job %s", jobID)
                 cleanThread = self._liveMergeCleanupThreads.get(jobID)

@@ -365,9 +365,9 @@ class StoragePool(object):
                     self.spmMailer = mailbox.SPM_MailMonitor(
                         self, maxHostID, inbox, outbox)
                     self.spmMailer.start()
-                    self.spmMailer.registerMessageType('xtnd', partial(
-                        mailbox.SPM_Extend_Message.processRequest,
-                        self))
+                    self.spmMailer.registerMessageType(
+                        mailbox.EXTEND_CODE, partial(
+                            mailbox.SPM_Extend_Message.processRequest, self))
                     self.log.debug("SPM mailbox ready for pool %s on master "
                                    "domain %s", self.spUUID,
                                    self.masterDomain.sdUUID)
@@ -464,7 +464,7 @@ class StoragePool(object):
         try:
             with rm.acquireResource(sc.STORAGE, "upgrade_" + self.spUUID,
                                     rm.EXCLUSIVE, timeout=lockTimeout):
-                sd.validateDomainVersion(targetDomVersion)
+                sd.StorageDomain.validate_version(targetDomVersion)
                 # _upgradePool is executed during startSpm. Other operations
                 # (like storage jobs such as copy_data/amend_image) that use
                 # the same lock may be running. In case we'll try to upgrade
@@ -487,7 +487,7 @@ class StoragePool(object):
                 self.log.debug("Marking active domains for upgrade")
                 domains = self.getDomains(activeOnly=True)
                 domains.pop(self.masterDomain.sdUUID, None)
-                self._domainsToUpgrade = domains.keys()
+                self._domainsToUpgrade = list(domains)
 
                 self.log.debug("Registering with state change event")
                 self.domainMonitor.onDomainStateChange.register(
@@ -1282,7 +1282,7 @@ class StoragePool(object):
 
         # We should not rebuild non-active domains, because
         # they are probably disconnected from the host
-        domUUIDs = self.getDomains(activeOnly=True).keys()
+        domUUIDs = list(self.getDomains(activeOnly=True))
 
         # msdUUID should be present and active in getDomains result.
         try:
@@ -1424,11 +1424,11 @@ class StoragePool(object):
         dom = sdCache.produce(sdUUID)
         dom.reduceVolume(imgUUID, volUUID, allowActive=allowActive)
 
-    def extendVolumeSize(self, sdUUID, imgUUID, volUUID, newSize):
+    def extendVolumeSize(self, sdUUID, imgUUID, volUUID, new_capacity):
         img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, sdUUID)
         with rm.acquireResource(img_ns, imgUUID, rm.EXCLUSIVE):
             vol = sdCache.produce(sdUUID).produceVolume(imgUUID, volUUID)
-            return vol.extendSize(int(newSize))
+            return vol.extendSize(int(new_capacity))
 
     @unsecured
     def getVersion(self):
@@ -1530,7 +1530,7 @@ class StoragePool(object):
     @unsecured
     def getDomains(self, activeOnly=False):
         return dict((sdUUID, status) for sdUUID, status
-                    in self._backend.getDomainsMap().iteritems()
+                    in six.iteritems(self._backend.getDomainsMap())
                     if not activeOnly or status == sd.DOM_ACTIVE_STATUS)
 
     def checkBackupDomain(self):
@@ -1666,45 +1666,6 @@ class StoragePool(object):
             img.move(srcDomUUID, dstDomUUID, imgUUID, vmUUID, op, postZero,
                      force, discard)
 
-    def sparsifyImage(self, tmpSdUUID, tmpImgUUID, tmpVolUUID, dstSdUUID,
-                      dstImgUUID, dstVolUUID):
-        """
-        Reduce sparse image size by converting free space on image to free
-        space on host using virt-sparsify.
-
-        :param tmpSdUUID: The UUID of the storage domain where the temporary
-                            snapshot of source volume exists.
-        :type tmpSdUUID: UUUID
-        :param tmpImgUUID: The UUID of the temporary snapshot image.
-        :type tmpImgUUID: UUID
-        :param tmpVolUUID: The UUID of the temporary snapshot volume that needs
-                            to be sparsified.
-        :type tmpVolUUID: UUID
-        :param dstSdUUID: The UUID of the storage domain where the destination
-                            image exists.
-        :type dstSdUUID: UUUID
-        :param dstImgUUID: The UUID of the destination image to which the
-                            destination volume belongs.
-        :type dstImgUUID: UUID
-        :param dstVolUUID: The UUID of the destination volume for the
-                            sparsified volume.
-        :type dstVolUUID: UUID
-        """
-        srcNamespace = rm.getNamespace(sc.IMAGE_NAMESPACE, tmpSdUUID)
-        dstNamespace = rm.getNamespace(sc.IMAGE_NAMESPACE, dstSdUUID)
-
-        # virt-sparsify writes to temporary volume when using --tmp:prebuilt,
-        # so we acquire exclusive lock for the temporary image.
-        # Destination image is where the sparsified volume gets written to, so
-        # we acquire exclusive lock for the destination image too.
-        # Since source volume is only a parent of temporary volume, we don't
-        # need to acquire any lock for it.
-        with rm.acquireResource(srcNamespace, tmpImgUUID, rm.EXCLUSIVE), \
-                rm.acquireResource(dstNamespace, dstImgUUID, rm.EXCLUSIVE):
-            img = image.Image(self.poolPath)
-            img.sparsify(tmpSdUUID, tmpImgUUID, tmpVolUUID, dstSdUUID,
-                         dstImgUUID, dstVolUUID)
-
     def cloneImageStructure(self, sdUUID, imgUUID, dstSdUUID):
         """
         Clone an image structure from a source domain to a destination domain
@@ -1829,34 +1790,6 @@ class StoragePool(object):
             chain = img.reconcileVolumeChain(sdUUID, imgUUID, leafVolUUID)
         return dict(volumes=chain)
 
-    def mergeSnapshots(self, sdUUID, vmUUID, imgUUID, ancestor, successor,
-                       postZero, discard):
-        """
-        Merges the source volume to the destination volume.
-
-        :param sdUUID: The UUID of the storage domain that contains the images.
-        :type sdUUID: UUID
-        :param spUUID: The UUID of the storage pool that contains the images.
-        :type spUUID: UUID
-        :param imgUUID: The UUID of the new image you will be created after
-                        the merge.?
-        :type imgUUID: UUID
-        :param ancestor: The UUID of the source volume.?
-        :type ancestor: UUID
-        :param successor: The UUID of the destination volume.?
-        :type successor: UUID
-        :param postZero: ?
-        :type postZero: bool?
-        :param discard: discard the successor before removal
-        :type discard: bool
-        """
-        img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, sdUUID)
-
-        with rm.acquireResource(img_ns, imgUUID, rm.EXCLUSIVE):
-            img = image.Image(self.poolPath)
-            img.merge(sdUUID, vmUUID, imgUUID, ancestor, successor, postZero,
-                      discard)
-
     def prepareMerge(self, subchainInfo):
         """
         This operation is required before performing (cold) merge.
@@ -1935,10 +1868,10 @@ class StoragePool(object):
 
         with rm.acquireResource(img_ns, imgUUID, rm.EXCLUSIVE):
             newVolUUID = sdCache.produce(sdUUID).createVolume(
-                imgUUID=imgUUID, size=size, volFormat=volFormat,
+                imgUUID=imgUUID, capacity=size, volFormat=volFormat,
                 preallocate=preallocate, diskType=diskType, volUUID=volUUID,
                 desc=desc, srcImgUUID=srcImgUUID, srcVolUUID=srcVolUUID,
-                initialSize=initialSize)
+                initial_size=initialSize)
         return dict(uuid=newVolUUID)
 
     def deleteVolume(self, sdUUID, imgUUID, volumes, postZero, force, discard):

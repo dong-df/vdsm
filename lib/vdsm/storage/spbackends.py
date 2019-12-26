@@ -23,8 +23,9 @@ from __future__ import absolute_import
 import logging
 import weakref
 
+import six
+
 from vdsm.common import exception
-from vdsm.storage import blockSD
 from vdsm.storage import clusterlock
 from vdsm.storage import exception as se
 from vdsm.storage import misc
@@ -36,7 +37,6 @@ from vdsm.storage.securable import secured
 from vdsm.storage.securable import unsecured
 from vdsm.storage.sp import LVER_INVALID
 from vdsm.storage.sp import SPM_ACQUIRED
-from vdsm.storage.sp import SPM_FREE
 from vdsm.storage.sp import SPM_ID_FREE
 from vdsm.config import config
 
@@ -50,15 +50,8 @@ PMDK_SPM_ID = "POOL_SPM_ID"
 PMDK_MASTER_VER = "MASTER_VERSION"
 
 
-# Calculate how many domains can be in the pool before overflowing the Metadata
-MAX_DOMAINS = blockSD.SD_METADATA_SIZE - blockSD.METADATA_BASE_SIZE
-MAX_DOMAINS -= MAX_POOL_DESCRIPTION_SIZE + sd.MAX_DOMAIN_DESCRIPTION_SIZE
-MAX_DOMAINS -= blockSD.PVS_METADATA_SIZE
-MAX_DOMAINS //= 48
-
-
 def _domainListEncoder(domDict):
-    domains = ','.join(['%s:%s' % (k, v) for k, v in domDict.iteritems()])
+    domains = ','.join(['%s:%s' % (k, v) for k, v in six.iteritems(domDict)])
     return domains
 
 
@@ -268,14 +261,7 @@ class StoragePoolDiskBackend(StoragePoolBackendInterface):
 
     @unsecured
     def getMaximumSupportedDomains(self):
-        msdInfo = self.masterDomain.getInfo()
-        msdType = sd.name2type(msdInfo["type"])
-        msdVersion = int(msdInfo["version"])
-        if msdType in sd.BLOCK_DOMAIN_TYPES and \
-                msdVersion in blockSD.VERS_METADATA_LV:
-            return MAX_DOMAINS
-        else:
-            return config.getint("irs", "maximum_domains_in_pool")
+        return config.getint("irs", "maximum_domains_in_pool")
 
     @unsecured
     def getMasterVersion(self):
@@ -340,13 +326,6 @@ class StoragePoolDiskBackend(StoragePoolBackendInterface):
         }
 
     # Backend Specific Methods
-
-    @unsecured
-    def forceFreeSpm(self):
-        # DO NOT USE, STUPID, HERE ONLY FOR BC
-        # TODO: SCSI Fence the 'lastOwner'
-        self.setSpmStatus(LVER_INVALID, SPM_ID_FREE, __securityOverride=True)
-        self.pool.spmRole = SPM_FREE
 
     @classmethod
     def _getPoolMD(cls, domain):
@@ -449,7 +428,7 @@ class StoragePoolMemoryBackend(StoragePoolBackendInterface):
 
     def setDomainsMap(self, domainsMap):
         self.domainsMap = dict(
-            ((k, v.capitalize()) for k, v in domainsMap.iteritems()))
+            ((k, v.capitalize()) for k, v in six.iteritems(domainsMap)))
         self.log.info(
             'new storage pool master version %s and domains map %s',
             self.masterVersion, self.domainsMap)
@@ -506,4 +485,5 @@ class StoragePoolMemoryBackend(StoragePoolBackendInterface):
         self.log.debug('updating domain version to %s and domains map '
                        'to %s', masterVersion, domainsMap)
         self.masterVersion = masterVersion
+        # pylint: disable=unexpected-keyword-arg
         self.setDomainsMap(domainsMap, __securityOverride=True)

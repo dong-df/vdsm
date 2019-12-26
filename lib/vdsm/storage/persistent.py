@@ -28,6 +28,8 @@ import hashlib
 import logging
 from contextlib import contextmanager
 
+import six
+
 from vdsm.storage import exception as se
 
 import threading
@@ -36,12 +38,35 @@ from six.moves import filter as ifilter
 
 SHA_CKSUM_TAG = "_SHA_CKSUM"
 
+log = logging.getLogger("storage.persistent")
 
-def _preprocessLine(line):
-    if not isinstance(line, unicode):
-        line = unicode(str(line), 'utf-8')
 
-    return unicode.encode(line, 'ascii', 'xmlcharrefreplace')
+def _format_line(key, value):
+    return "%s=%s" % (key, value)
+
+
+def _dump_lines(md):
+    return [_format_line(key, value)
+            for key, value in sorted(six.iteritems(md))]
+
+
+def _calc_checksum(lines):
+    h = hashlib.sha1()
+    for line in lines:
+        h.update(line.encode('ascii', 'xmlcharrefreplace'))
+    return h.hexdigest()
+
+
+def _parse_lines(lines):
+    md = {}
+    for line in lines:
+        try:
+            key, value = line.split("=", 1)
+        except ValueError:
+            log.warning("Could not parse line: %r", line)
+        else:
+            md[key.strip()] = value
+    return md
 
 
 def unicodeEncoder(s):
@@ -114,7 +139,7 @@ class DictValidator(object):
 
     def update(self, metadata):
         metadata = metadata.copy()
-        for key, value in metadata.iteritems():
+        for key, value in six.iteritems(metadata):
             enc = self._encoder(key)
             metadata[key] = enc(value)
 
@@ -127,7 +152,7 @@ class DictValidator(object):
 
     def copy(self):
         md = self._dict.copy()
-        for key, value in md.iteritems():
+        for key, value in six.iteritems(md):
             try:
                 dec = self._decoder(key)
                 md[key] = dec(value)
@@ -143,7 +168,6 @@ class PersistentDict(object):
     This class provides interface for a generic set of key=value pairs
     that can be accessed by any consumer
     """
-    log = logging.getLogger("storage.PersistentDict")
 
     @contextmanager
     def _accessWrapper(self):
@@ -157,24 +181,24 @@ class PersistentDict(object):
     def transaction(self):
         with self._syncRoot:
             if self._inTransaction:
-                self.log.debug("Reusing active transaction")
+                log.debug("Reusing active transaction")
                 yield
                 return
 
             self._inTransaction = True
             try:
                 with self._accessWrapper():
-                    self.log.debug("Starting transaction")
+                    log.debug("Starting transaction")
                     backup = deepcopy(self._metadata)
                     try:
                         yield
                         # TODO : check appropriateness
                         if backup != self._metadata:
-                            self.log.debug("Flushing changes")
+                            log.debug("Flushing changes")
                             self._flush(self._metadata)
-                        self.log.debug("Finished transaction")
+                        log.debug("Finished transaction")
                     except:
-                        self.log.warn(
+                        log.warning(
                             "Error in transaction, rolling back changes",
                             exc_info=True)
                         # TBD: Maybe check that the old MD is what I remember?
@@ -189,8 +213,8 @@ class PersistentDict(object):
         self._metaRW = metaReaderWriter
         self._isValid = False
         self._inTransaction = False
-        self.log.debug("Created a persistent dict with %s backend",
-                       self._metaRW.__class__.__name__)
+        log.debug("Created a persistent dict with %s backend",
+                  self._metaRW.__class__.__name__)
 
     def get(self, key, default=None):
         with self._accessWrapper():
@@ -212,14 +236,6 @@ class PersistentDict(object):
         with self.transaction():
             self._metadata.update(metadata)
 
-    def keys(self):
-        with self._accessWrapper():
-            return self._metadata.keys()
-
-    def iterkeys(self):
-        with self._accessWrapper():
-            return self._metadata.iterkeys()
-
     def __iter__(self):
         with self._accessWrapper():
             return iter(self._metadata)
@@ -228,27 +244,14 @@ class PersistentDict(object):
         with self._syncRoot:
             lines = self._metaRW.readlines()
 
-            self.log.debug("read lines (%s)=%s",
-                           self._metaRW.__class__.__name__,
-                           lines)
-            newMD = {}
-            declaredChecksum = None
-            for line in lines:
-                try:
-                    key, value = line.split("=", 1)
-                    value = value.strip()
-                except ValueError:
-                    self.log.warn("Could not parse line `%s`.", line)
-                    continue
+            log.debug("read lines (%s)=%s",
+                      self._metaRW.__class__.__name__,
+                      lines)
 
-                if key == SHA_CKSUM_TAG:
-                    declaredChecksum = value
-                    continue
-
-                newMD[key] = value
-
+            newMD = _parse_lines(lines)
+            declaredChecksum = newMD.pop(SHA_CKSUM_TAG, None)
             if not newMD:
-                self.log.debug("Empty metadata")
+                log.debug("Empty metadata")
                 self._isValid = True
                 self._metadata = newMD
                 return
@@ -258,25 +261,18 @@ class PersistentDict(object):
                 # FIXME : This is ugly but necessary, What we need is a class
                 # method that creates the initial metadata. Then we can assume
                 # that empty metadata is always invalid.
-                self.log.warn("data has no embedded checksum - "
-                              "trust it as it is")
+                log.warning("data has no embedded checksum - "
+                            "trust it as it is")
                 self._isValid = True
                 self._metadata = newMD
                 return
 
-            checksumCalculator = hashlib.sha1()
-            keys = newMD.keys()
-            keys.sort()
-            for key in keys:
-                value = newMD[key]
-                line = "%s=%s" % (key, value)
-                checksumCalculator.update(_preprocessLine(line))
-            computedChecksum = checksumCalculator.hexdigest()
+            computedChecksum = _calc_checksum(_dump_lines(newMD))
 
             if declaredChecksum != computedChecksum:
-                self.log.warning("data seal is broken metadata declares `%s` "
-                                 "should be `%s` (lines=%s)",
-                                 declaredChecksum, computedChecksum, newMD)
+                log.warning("data seal is broken metadata declares `%s` "
+                            "should be `%s` (lines=%s)",
+                            declaredChecksum, computedChecksum, newMD)
                 raise se.MetaDataSealIsBroken(declaredChecksum,
                                               computedChecksum)
 
@@ -286,22 +282,11 @@ class PersistentDict(object):
     def _flush(self, overrideMD):
         with self._syncRoot:
             md = overrideMD
-
-            checksumCalculator = hashlib.sha1()
-            lines = []
-            keys = md.keys()
-            keys.sort()
-            for key in keys:
-                value = md[key]
-                line = "=".join([key, value.strip()])
-                checksumCalculator.update(_preprocessLine(line))
-                lines.append(line)
-
-            computedChecksum = checksumCalculator.hexdigest()
-            lines.append("=".join([SHA_CKSUM_TAG, computedChecksum]))
-
-            self.log.debug("about to write lines (%s)=%s",
-                           self._metaRW.__class__.__name__, lines)
+            lines = _dump_lines(md)
+            computedChecksum = _calc_checksum(lines)
+            lines.append(_format_line(SHA_CKSUM_TAG, str(computedChecksum)))
+            log.debug("about to write lines (%s)=%s",
+                      self._metaRW.__class__.__name__, lines)
             self._metaRW.writelines(lines)
 
             self._metadata = md

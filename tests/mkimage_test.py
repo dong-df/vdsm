@@ -35,11 +35,13 @@ import stat
 from shutil import rmtree
 from tempfile import mkdtemp
 
+import six
+
 from monkeypatch import Patch
 from testlib import VdsmTestCase, permutations, expandPermutations
 from testValidation import checkSudo, ValidateRunningAsRoot
 
-from vdsm.common.commands import execCmd
+from vdsm.common.commands import run
 from vdsm.common.fileutils import rm_file
 from vdsm.constants import EXT_MKFS_MSDOS
 from vdsm.storage import mount
@@ -71,12 +73,19 @@ class MkimageTestCase(VdsmTestCase):
         self.subdir = os.path.join('a', 'subdirectory', 'for', 'testing')
         for i in range(5):
             content = os.urandom(1024)
+            encoded_content = b64encode(content)
+
+            # the base64-encoded file contents are actually read from the
+            # domain XML, so they're unicode strings in py3
+            if six.PY3:
+                encoded_content = encoded_content.decode("utf-8")
+
             filename = "test_%d" % i
             longpath = os.path.join(self.subdir, filename)
             self.expected_results[filename] = content
-            self.files[filename] = b64encode(content)
+            self.files[filename] = encoded_content
             self.expected_results[longpath] = content
-            self.files[longpath] = b64encode(content)
+            self.files[longpath] = encoded_content
 
         self.patch = Patch([
             (mkimage, "DISKIMAGE_USER", -1),
@@ -146,9 +155,8 @@ class MkimageTestCase(VdsmTestCase):
         if label is None:
             return
         cmd = ['blkid', '-s', 'LABEL', imgPath]
-        (ret, out, err) = execCmd(cmd, raw=True)
+        out = run(cmd)
 
-        self.assertEqual(ret, 0)
         partitions = out.rpartition(b'LABEL=')
         self.assertEqual(len(partitions), 3)
         self.assertEqual(partitions[2].strip(), b'"' + label.encode() + b'"')
@@ -168,10 +176,10 @@ class MkimageTestCase(VdsmTestCase):
         Tests mkimage.injectFilesToFs creating an image and checking its
         content. Requires root permissions for writing into the floppy image.
         """
-        floppy = mkimage.getFileName("vmId_inject", self.files)
+        floppy = mkimage.getFileName("vmId_inject")
         command = [EXT_MKFS_MSDOS, '-C', floppy, '1440']
         try:
-            rc, out, err = execCmd(command, raw=True)
+            run(command)
 
             mkimage.injectFilesToFs(floppy, self.files, fstype)
 
@@ -191,10 +199,10 @@ class MkimageTestCase(VdsmTestCase):
         Tests for failure mkimage.injectFilesToFs when wrong fstype is
         specified. Requires root permissions for mounting the image.
         """
-        floppy = mkimage.getFileName("vmId_inject", self.files)
+        floppy = mkimage.getFileName("vmId_inject")
         command = [EXT_MKFS_MSDOS, '-C', floppy, '1440']
         try:
-            rc, out, err = execCmd(command, raw=True)
+            run(command)
 
             with self.assertRaises(MountError):
                 mkimage.injectFilesToFs(floppy, self.files, 'ext3')

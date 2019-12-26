@@ -24,6 +24,7 @@ import uuid
 
 import pytest
 
+from vdsm.common.units import MiB, GiB
 from vdsm.storage import blockSD
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -34,13 +35,9 @@ from vdsm.storage import sd
 from vdsm.storage.formatconverter import _v3_reset_meta_volsize
 from vdsm.storage.sdc import sdCache
 
-from .storagetestlib import (
-    fake_volume,
-    MB
-)
-
+from . storagetestlib import fake_volume
 from . constants import CLEARED_VOLUME_METADATA
-from . marks import requires_root, xfail_python3
+from . marks import requires_root
 
 # This metadata is missing required keys (DOMAIN, VOLTYPE, LEGALITY).
 INVALID_VOLUME_METADATA = b"""\
@@ -58,21 +55,21 @@ EOF
 
 @pytest.fixture(params=[sc.RAW_FORMAT, sc.COW_FORMAT])
 def vol(request):
-    with fake_volume(format=request.param, size=MB) as vol:
+    with fake_volume(format=request.param, size=MiB) as vol:
         yield vol
 
 
 def test_v3_reset_meta_vol_size_metadata_no_change_needed(vol):
-    original_size_blk = vol.getSize()
+    original_capacity = vol.getCapacity()
     _v3_reset_meta_volsize(vol)
-    assert vol.getSize() == original_size_blk
+    assert vol.getCapacity() == original_capacity
 
 
 def test_v3_reset_meta_vol_size_metadata_wrong(vol):
-    original_size_blk = vol.getSize()
-    vol.setSize(1024)
+    original_capacity = vol.getCapacity()
+    vol.setCapacity(original_capacity // 2)
     _v3_reset_meta_volsize(vol)
-    assert vol.getSize() == original_size_blk
+    assert vol.getCapacity() == original_capacity
 
 
 def test_convert_from_v3_to_v4_localfs(tmpdir, tmp_repo, fake_access):
@@ -94,10 +91,7 @@ def test_convert_from_v3_to_v4_localfs(tmpdir, tmp_repo, fake_access):
     assert dom.getVersion() == 4
 
 
-@pytest.mark.parametrize("src_version", [
-    3,
-    4,
-])
+@pytest.mark.parametrize("src_version", [3, 4])
 def test_convert_to_v5_localfs(tmpdir, tmp_repo, tmp_db, fake_access,
                                fake_rescan, fake_task, src_version):
     dom = tmp_repo.create_localfs_domain(name="domain", version=src_version)
@@ -109,7 +103,7 @@ def test_convert_to_v5_localfs(tmpdir, tmp_repo, tmp_db, fake_access,
             diskType="DATA",
             imgUUID=str(uuid.uuid4()),
             preallocate=sc.SPARSE_VOL,
-            size=10 * 1024**3,
+            capacity=10 * GiB,
             srcImgUUID=sc.BLANK_UUID,
             srcVolUUID=sc.BLANK_UUID,
             volFormat=sc.COW_FORMAT,
@@ -130,7 +124,7 @@ def test_convert_to_v5_localfs(tmpdir, tmp_repo, tmp_db, fake_access,
         diskType="DATA",
         imgUUID=img_id,
         preallocate=sc.SPARSE_VOL,
-        size=10 * 1024**3,
+        capacity=10 * GiB,
         srcImgUUID=sc.BLANK_UUID,
         srcVolUUID=sc.BLANK_UUID,
         volFormat=sc.COW_FORMAT,
@@ -152,7 +146,7 @@ def test_convert_to_v5_localfs(tmpdir, tmp_repo, tmp_db, fake_access,
         diskType="DATA",
         imgUUID=img_id,
         preallocate=sc.SPARSE_VOL,
-        size=10 * 1024**3,
+        capacity=10 * GiB,
         srcImgUUID=sc.BLANK_UUID,
         srcVolUUID=sc.BLANK_UUID,
         volFormat=sc.COW_FORMAT,
@@ -199,7 +193,7 @@ def test_convert_to_v5_localfs(tmpdir, tmp_repo, tmp_db, fake_access,
             continue
         vol_md = volumes_md[vol.volUUID]
         meta_path = vol.getMetaVolumePath()
-        with open(meta_path) as f:
+        with open(meta_path, "rb") as f:
             data = f.read()
         assert data == vol_md.storage_format(5)
 
@@ -215,18 +209,14 @@ def test_convert_to_v5_localfs(tmpdir, tmp_repo, tmp_db, fake_access,
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
-@pytest.mark.parametrize("src_version", [
-    3,
-    4,
-])
+@pytest.mark.parametrize("src_version", [3, 4])
 def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
                              fake_rescan, fake_task, fake_sanlock,
                              src_version):
     sd_uuid = str(uuid.uuid4())
 
-    dev = tmp_storage.create_device(20 * 1024 ** 3)
+    dev = tmp_storage.create_device(20 * GiB)
     lvm.createVG(sd_uuid, [dev], blockSD.STORAGE_UNREADY_DOMAIN_TAG, 128)
     vg = lvm.getVG(sd_uuid)
 
@@ -236,9 +226,7 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
         domClass=sd.DATA_DOMAIN,
         vgUUID=vg.uuid,
         version=src_version,
-        storageType=sd.ISCSI_DOMAIN,
-        block_size=sc.BLOCK_SIZE_512,
-        alignment=sc.ALIGNMENT_1M)
+        storageType=sd.ISCSI_DOMAIN)
 
     sdCache.knownSDs[sd_uuid] = blockSD.findDomain
     sdCache.manuallyAddDomain(dom)
@@ -256,7 +244,7 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
             diskType="DATA",
             imgUUID=str(uuid.uuid4()),
             preallocate=sc.SPARSE_VOL,
-            size=10 * 1024**3,
+            capacity=10 * GiB,
             srcImgUUID=sc.BLANK_UUID,
             srcVolUUID=sc.BLANK_UUID,
             volFormat=sc.COW_FORMAT,
@@ -277,7 +265,7 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
         diskType="DATA",
         imgUUID=img_id,
         preallocate=sc.SPARSE_VOL,
-        size=10 * 1024**3,
+        capacity=10 * GiB,
         srcImgUUID=sc.BLANK_UUID,
         srcVolUUID=sc.BLANK_UUID,
         volFormat=sc.COW_FORMAT,
@@ -298,7 +286,7 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
         diskType="DATA",
         imgUUID=img_id,
         preallocate=sc.SPARSE_VOL,
-        size=10 * 1024**3,
+        capacity=10 * GiB,
         srcImgUUID=sc.BLANK_UUID,
         srcVolUUID=sc.BLANK_UUID,
         volFormat=sc.COW_FORMAT,
@@ -342,8 +330,8 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
     assert old_dom_md == new_dom_md
 
     # Verify that xleases volume is created when upgrading from version < 4.
-    xleases_vol = lvm.getLV(sd_uuid, "xleases")
-    assert int(xleases_vol.size) == 1024**3
+    xleases_vol = lvm.getLV(sd_uuid, sd.XLEASES)
+    assert int(xleases_vol.size) == sd.XLEASES_SLOTS * dom.alignment
 
     with pytest.raises(se.NoSuchLease):
         dom.manifest.lease_info("no-such-lease")
@@ -356,7 +344,7 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
         vol_md = volumes_md[vol.volUUID]
         _, slot = vol.getMetadataId()
         data = dom.manifest.read_metadata_block(slot)
-        data = data.rstrip("\0")
+        data = data.rstrip(b"\0")
         assert data == vol_md.storage_format(5)
 
     # Verify that invalid metadata was copied to v5 area.
@@ -373,4 +361,4 @@ def test_convert_to_v5_block(tmpdir, tmp_repo, tmp_storage, tmp_db,
     offset = blockSD.METADATA_BASE_V4
     size = blockSD.METADATA_BASE_V5 - blockSD.METADATA_BASE_V4
     data = misc.readblock(meta_path, offset, size)
-    assert data == "\0" * size
+    assert data == b"\0" * size

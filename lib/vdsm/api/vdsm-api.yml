@@ -510,12 +510,6 @@ types:
         name: DiskType
         type: enum
         values:
-            1: The disk is for data (<4.2)
-            2: The disk is shared among multiple VMs (<4.2)
-            3: The disk is used for swap space (<4.2)
-            4: The disk contains the operating system (<4.2)
-            5: The disk is used for temporary storage space (<4.2)
-            6: The type is not specified (<4.2)
             DATA: This volume is for data (>=4.2)
             OVFS: This volume is OVF store (>=4.2)
             MEMD: This is a memory dump volume (>=4.2)
@@ -655,6 +649,16 @@ types:
         type: map
         value-type:
         -   string
+
+    SupportedBlockSizeMap: &SupportedBlockSizeMap
+        added: '4.3.6'
+        description: A mapping from storage domain type name to a list of
+            supported block size.
+        key-type: string
+        name: SupportedBlockSizeMap
+        type: map
+        value-type:
+        -   int
 
     DriveVmPayload: &DriveVmPayload
         added: '3.1'
@@ -1583,8 +1587,8 @@ types:
         description: Information about one script within a hook.
         name: HookScriptInfo
         properties:
-        -   description: The md5 sum of the script
-            name: md5
+        -   description: The sha256 digest of the script
+            name: checksum
             type: string
         type: object
 
@@ -1978,6 +1982,21 @@ types:
                 cap to the traffic class traffic.
             name: out
             type: *HostBandwidthParams
+        type: object
+
+    DeviceQoSParams: &DeviceQoSParams
+        added: '4.4'
+        description: Device host networking QoS parameters.
+        name: DeviceQoSParams
+        properties:
+        - description: host traffic QoS params.
+          name: hostQos
+          type: *HostQoSParams
+
+        - defaultvalue: -1
+          description: network vlan-id of the hostQos Params.
+          name: vlan
+          type: int
         type: object
 
     NumaNodeMemoryStats: &NumaNodeMemoryStats
@@ -2910,6 +2929,15 @@ types:
         -   description: The memory device specification
             name: memory
             type: *VmMemoryDevice
+            defaultvalue: null
+            modified: '4.4'
+
+        -   name: xml
+            description: XML snippet containing <devices> element with exactly
+                    one memory device.
+            type: string
+            defaultvalue: null
+            added: '4.4'
         type: object
 
     VmInterfaceDeviceSpecParams: &VmInterfaceDeviceSpecParams
@@ -3454,6 +3482,12 @@ types:
             description: use libvirt's tunneled migration. default it False.
             name: tunneled
             type: boolean
+
+        -   name: encrypted
+            type: boolean
+            defaultvalue: false
+            description: whether to use TLS migration
+            added: '4.4'
 
         -   defaultvalue: needs updating
             description: initial actions and actions to perform when stalling
@@ -4639,6 +4673,12 @@ types:
             type: boolean
 
         -   defaultvalue: no-default
+            description: List of host traffic QoS entries on the interface
+            name: qos
+            type:
+            - *DeviceQoSParams
+
+        -   defaultvalue: no-default
             description: Specify Switch. Legacy is used if not passed
             name: switch
             type: string
@@ -4884,6 +4924,12 @@ types:
                 nic device
             name: addr
             type: string
+
+        -   defaultvalue: no-default
+            description: List of host traffic QoS entries on the interface
+            name: qos
+            type:
+            - *DeviceQoSParams
         type: object
 
     NetInfoNicMap: &NetInfoNicMap
@@ -6185,6 +6231,19 @@ types:
                 metadata for block storage domains (optional)
             name: vgMetadataDevice
             type: string
+
+        -   description: Logical block size in bytes of the underlying storage
+                (512, 4096).
+            name: block_size
+            type: int
+            added: '4.3.6'
+
+        -   description: Size of clusterlock resource in bytes (1048576,
+                2097152, 4194304, 8388608).
+            name: alignment
+            type: int
+            added: '4.3.6'
+
         type: object
 
     StorageDomainStatus: &StorageDomainStatus
@@ -7174,6 +7233,30 @@ types:
                 - int
             added: '4.3'
 
+        -   defaultvalue: null
+            description: Map of supported block size per storage domain type.
+            name: supported_block_size
+            type: *SupportedBlockSizeMap
+            added: '4.3.6'
+
+        -   defaultvalue: false
+            description: Indicates if the host is running in the FIPS mode
+            name: fipsEnabled
+            type: boolean
+            added: '4.3'
+
+        -   defaultvalue: ''
+            description: TSC frequency of the CPU
+            name: tscFrequency
+            type: string
+            added: '4.4'
+
+        -   defaultvalue: false
+            description: "Indicates if the host's CPU supports TSC scaling"
+            name: tscScaling
+            type: boolean
+            added: '4.4'
+
         type: object
 
     VdsmNetworkCapabilities: &VdsmNetworkCapabilities
@@ -8156,6 +8239,39 @@ types:
                 type: *StringMap
         type: object
 
+    BackupConfig: &BackupConfig
+        added: '4.4'
+        description: Backup configuration.
+        name: BackupConfig
+        properties:
+        -   description: A UUID of the backup
+            name: backup_id
+            type: *UUID
+
+        -   description: List of disks which should be backed up.
+                If 'to_checkpoint_id' is specified, these disks will
+                be included in the checkpoint. A new bitmap will be
+                created on all the disks.
+            name: disks
+            type:
+            - *VolumeInfo
+
+        -   defaultvalue: null
+            description: If specified, perform incremental backup
+                including all checkpoints since that checkpoint
+                (including this checkpoint).
+            name: from_checkpoint_id
+            type: *UUID
+
+        -   defaultvalue: null
+            description: If specified, create a new checkpoint
+                when starting the backup. The next backup can use
+                the new checkpoint to perform incremental backup.
+                The backup does not include the data referenced by
+                this checkpoint.
+            name: to_checkpoint_id
+            type: *UUID
+
 Host.setupNetworks:
     added: '3.1'
     description: Reconfigure host networking by adding, removing, and editing
@@ -8346,6 +8462,17 @@ Host.getNetworkStatistics:
     return:
         description: Host network statistics
         type: *HostNetworkStatistics
+
+Host.echo:
+    added: '4.4'
+    description: Log a user message and echo it
+    params:
+    -   description: Message to log with api.Host logger
+        name: message
+        type: string
+    return:
+        description: The logged message
+        type: string
 
 Host.getHardwareInfo:
     added: '3.2'
@@ -8970,43 +9097,6 @@ Image.getVolumes:
         type:
         - *UUID
 
-Image.mergeSnapshots:
-    added: '3.1'
-    deprecated: '4.1'
-    description: Merge snapshot successor into ancestor.
-    params:
-    -   description: The UUID of the Image
-        name: imageID
-        type: *UUID
-
-    -   description: The UUID of the Storage Pool associated with the Image
-        name: storagepoolID
-        type: *UUID
-
-    -   description: The UUID of the Storage Domain associated with the Image
-        name: storagedomainID
-        type: *UUID
-
-    -   description: A Volume UUID representing the parent snapshot
-        name: ancestor
-        type: *UUID
-
-    -   description: A Volume UUID representing the child snapshot
-        name: successor
-        type: *UUID
-
-    -   description: If True, overwrite successor with zeroes after conversion
-        name: postZero
-        type: boolean
-
-    -   defaultvalue: false
-        description: If true, discard the successor after conversion
-        name: discard
-        type: boolean
-    return:
-        description: A task UUID
-        type: *UUID
-
 Image.move:
     added: '3.1'
     description: Move or copy an image to another Storage Domain within the
@@ -9048,44 +9138,10 @@ Image.move:
         description: A task UUID
         type: *UUID
 
-Image.sparsify:
-    added: '3.6'
-    description: Create a copy of a sparse volume to a destination volume
-        within the sameStorage Pool with free space removed from the source
-        volume.
-    params:
-    -   description: The UUID of the Image
-        name: imageID
-        type: *UUID
-
-    -   description: The UUID of the Storage Pool associated with the Image
-        name: storagepoolID
-        type: *UUID
-
-    -   description: The UUID of the Storage Domain associated with the Image
-        name: storagedomainID
-        type: *UUID
-
-    -   description: The UUID of the snapshot volume
-        name: tmpVolUUID
-        type: *UUID
-
-    -   description: The UUID of the destination storage domain
-        name: dstSdUUID
-        type: *UUID
-
-    -   description: The UUID of the destination image
-        name: dstImgUUID
-        type: *UUID
-
-    -   description: The UUID of the destination volume
-        name: dstVolUUID
-        type: *UUID
-
 Image.cloneStructure:
     added: '3.2'
-    description: Clone an image structure from a source domain to a destination
-        domainwithin the same Storage Pool.
+    description: Deprecated. Clone an image structure from a source domain to a
+        destination domainwithin the same Storage Pool.
     params:
     -   description: The UUID of the Image
         name: imageID
@@ -9108,8 +9164,8 @@ Image.cloneStructure:
 
 Image.syncData:
     added: '3.2'
-    description: Synchronize image data between storage domains within same
-        Storage Pool.
+    description: Deprecated. Synchronize image data between storage domains
+        within same Storage Pool.
     params:
     -   description: The UUID of the Image
         name: imageID
@@ -9816,17 +9872,6 @@ StoragePool.disconnectStorageServer:
         description: The status of each connection attempt
         type:
         - *ConnectStorageServerStatus
-
-StoragePool.fence:
-    added: '3.1'
-    description: Fence the SPM host via the storage.
-    params:
-    -   description: The UUID of the Storage Pool
-        name: storagepoolID
-        type: *UUID
-    return:
-        description: SPM status information for the Storage Pool
-        type: *SpmStatus
 
 StoragePool.getBackedUpVmsInfo:
     added: '3.1'
@@ -10828,7 +10873,8 @@ VM.seal:
 
 Volume.copy:
     added: '3.1'
-    description: Duplicate a volume to produce a new template image.
+    description: Deprecated. Duplicate a volume to produce a new template
+        image.
     params:
     -   description: The UUID of the Volume
         name: volumeID
@@ -11453,30 +11499,10 @@ VM.start_backup:
         name: vmID
         type: *UUID
 
-    -   description: A UUID of the backup
-        name: backup_id
-        type: *UUID
+    -   description: The backup configuration
+        name: config
+        type: *BackupConfig
 
-    -   description: List of disks which should be backed up.
-            If 'to_checkpont_id' is specified, these disks will be included
-            in the checkpoint. A new bitmap will be created on all the disks.
-        name: disks
-        type:
-        - *VolumeInfo
-
-    -   defaultvalue: null
-        description: If specified, perform incremental backup including all
-            checkpoints since that checkpoint (including this checkpoint).
-        name: from_checkpoint_id
-        type: *UUID
-
-    -   defaultvalue: null
-        description: If specified, create a new checkpoint when starting
-            the backup. The next backup can use the new checkpoint to
-            perform incremental backup. The backup does not include the
-            data referenced by this checkpoint.
-        name: to_checkpoint_id
-        type: *UUID
     return:
         description: Information about the started backup.
         type: *BackupInfo

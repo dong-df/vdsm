@@ -23,204 +23,218 @@ from __future__ import division
 
 import os
 import stat
+import sys
 
 import pytest
 
-from vdsm.storage import constants as sc
 from vdsm.storage import fileUtils
-from testlib import VdsmTestCase
-from testlib import expandPermutations, permutations
 from testlib import namedTemporaryDir
 from testlib import temporaryPath
+from . marks import requires_unprivileged_user, requires_root
+from . storagetestlib import get_umask
+
+# createdir tests
 
 
-class TestCreatedir(VdsmTestCase):
+def test_createdir_no_mode():
+    with namedTemporaryDir() as base:
+        path = os.path.join(base, "a", "b")
+        assert not os.path.isdir(path)
+        fileUtils.createdir(path)
+        assert os.path.isdir(path)
 
-    def test_create_dirs_no_mode(self):
-        with namedTemporaryDir() as base:
-            path = os.path.join(base, "a", "b")
-            self.assertFalse(os.path.isdir(path))
-            fileUtils.createdir(path)
-            self.assertTrue(os.path.isdir(path))
 
-    def test_create_dirs_with_mode(self):
-        with namedTemporaryDir() as base:
-            path = os.path.join(base, "a", "b")
-            mode = 0o700
+def test_createdir_with_mode():
+    with namedTemporaryDir() as base:
+        path = os.path.join(base, "a", "b")
+        mode = 0o700
+        fileUtils.createdir(path, mode=mode)
+        assert os.path.isdir(path)
+        actual_mode = stat.S_IMODE(os.lstat(path).st_mode)
+        assert actual_mode == mode
+
+
+def test_createdir_with_mode_intermediate():
+    with namedTemporaryDir() as base:
+        intermediate = os.path.join(base, "a")
+        path = os.path.join(intermediate, "b")
+        mode = 0o700
+        fileUtils.createdir(path, mode=mode)
+        assert os.path.isdir(path)
+        actual_mode = stat.S_IMODE(os.lstat(intermediate).st_mode)
+        # TODO: remove when all platforms support python-3.7
+        if sys.version_info[:2] == (3, 6):
+            assert actual_mode == mode
+        else:
+            # os.makedirs() behavior changed since python 3.7,
+            # os.makedirs() will not respect the 'mode' parameter for
+            # intermediate directories and will create them with the
+            # default mode=0o777
+            assert oct(actual_mode) == oct(0o777 & ~get_umask())
+
+
+@requires_unprivileged_user
+def test_createdir_raise_errors():
+    with namedTemporaryDir() as base:
+        path = os.path.join(base, "a", "b")
+        mode = 0o400
+        # TODO: remove when all platforms support    python-3.7
+        if sys.version_info[:2] == (3, 6):
+            with pytest.raises(OSError):
+                fileUtils.createdir(path, mode=mode)
+        else:
+            # os.makedirs() behavior changed since python 3.7,
+            # os.makedirs() will not respect the 'mode' parameter for
+            # intermediate directories and will create them with the
+            # default mode=0o777
             fileUtils.createdir(path, mode=mode)
-            self.assertTrue(os.path.isdir(path))
-            while path != base:
-                pathmode = stat.S_IMODE(os.lstat(path).st_mode)
-                self.assertEqual(pathmode, mode)
-                path = os.path.dirname(path)
-
-    @pytest.mark.skipif(os.geteuid() == 0, reason="requires unprivileged user")
-    def test_create_raise_errors(self):
-        with namedTemporaryDir() as base:
-            path = os.path.join(base, "a", "b")
-            self.assertRaises(OSError, fileUtils.createdir, path, 0o400)
-
-    def test_directory_exists_no_mode(self):
-        with namedTemporaryDir() as base:
-            fileUtils.createdir(base)
-
-    def test_directory_exists_other_mode(self):
-        with namedTemporaryDir() as base:
-            self.assertRaises(OSError, fileUtils.createdir, base, 0o755)
-
-    def test_file_exists_with_mode(self):
-        with namedTemporaryDir() as base:
-            path = os.path.join(base, "file")
-            with open(path, "w"):
-                mode = stat.S_IMODE(os.lstat(path).st_mode)
-                self.assertRaises(OSError, fileUtils.createdir, path, mode)
-
-    def test_file_exists_no_mode(self):
-        with namedTemporaryDir() as base:
-            path = os.path.join(base, "file")
-            with open(path, "w"):
-                self.assertRaises(OSError, fileUtils.createdir, path)
+            actual_mode = stat.S_IMODE(os.lstat(path).st_mode)
+            assert oct(actual_mode) == oct(mode & ~get_umask())
 
 
-class TestChown(VdsmTestCase):
-    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root")
-    def test(self):
-        targetId = 666
-        with temporaryPath() as srcPath:
-            fileUtils.chown(srcPath, targetId, targetId)
-            stat = os.stat(srcPath)
-            self.assertTrue(stat.st_uid == stat.st_gid == targetId)
-
-    @pytest.mark.skipif(os.geteuid() != 0, reason="requires root")
-    def testNames(self):
-        # I convert to some id because I have no
-        # idea what users are defined and what
-        # there IDs are apart from root
-        tmpId = 666
-        with temporaryPath() as srcPath:
-            fileUtils.chown(srcPath, tmpId, tmpId)
-            stat = os.stat(srcPath)
-            self.assertTrue(stat.st_uid == stat.st_gid == tmpId)
-
-            fileUtils.chown(srcPath, "root", "root")
-            stat = os.stat(srcPath)
-            self.assertTrue(stat.st_uid == stat.st_gid == 0)
+def test_createdir_directory_exists_no_mode():
+    with namedTemporaryDir() as base:
+        fileUtils.createdir(base)
 
 
-class TestCopyUserModeToGroup(VdsmTestCase):
-    MODE_MASK = 0o777
-
-    # format: initialMode, expectedMode
-    modesList = [
-        (0o770, 0o770), (0o700, 0o770), (0o750, 0o770), (0o650, 0o660),
-    ]
-
-    def testCopyUserModeToGroup(self):
-        with temporaryPath() as path:
-            for initialMode, expectedMode in self.modesList:
-                os.chmod(path, initialMode)
-                fileUtils.copyUserModeToGroup(path)
-                self.assertEqual(os.stat(path).st_mode & self.MODE_MASK,
-                                 expectedMode)
+def test_createdir_directory_exists_other_mode():
+    with namedTemporaryDir() as base:
+        with pytest.raises(OSError):
+            fileUtils.createdir(base, mode=0o755)
 
 
-class TestAtomicSymlink(VdsmTestCase):
+def test_createdir_file_exists_with_mode():
+    with namedTemporaryDir() as base:
+        path = os.path.join(base, "file")
+        with open(path, "w"):
+            mode = stat.S_IMODE(os.lstat(path).st_mode)
+            with pytest.raises(OSError):
+                fileUtils.createdir(path, mode=mode)
 
-    def test_create_new(self):
-        with namedTemporaryDir() as tmpdir:
-            target = os.path.join(tmpdir, "target")
-            link = os.path.join(tmpdir, "link")
+
+def test_createdir_file_exists_no_mode():
+    with namedTemporaryDir() as base:
+        path = os.path.join(base, "file")
+        with open(path, "w"):
+            with pytest.raises(OSError):
+                fileUtils.createdir(path)
+
+# chown tests
+
+
+@requires_root
+def test_chown():
+    targetId = 666
+    with temporaryPath() as srcPath:
+        fileUtils.chown(srcPath, targetId, targetId)
+        stat = os.stat(srcPath)
+        assert stat.st_uid == stat.st_gid == targetId
+
+
+@requires_root
+def test_chown_names():
+    # I convert to some id because I have no
+    # idea what users are defined and what
+    # there IDs are apart from root
+    tmpId = 666
+    with temporaryPath() as srcPath:
+        fileUtils.chown(srcPath, tmpId, tmpId)
+        stat = os.stat(srcPath)
+        assert stat.st_uid == stat.st_gid == tmpId
+
+        fileUtils.chown(srcPath, "root", "root")
+        stat = os.stat(srcPath)
+        assert stat.st_uid == stat.st_gid == 0
+
+# atomic symlink tests
+
+
+def test_atomic_symlink_create_new():
+    with namedTemporaryDir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        link = os.path.join(tmpdir, "link")
+        fileUtils.atomic_symlink(target, link)
+        assert os.readlink(link) == target
+        assert not os.path.exists(link + ".tmp")
+
+
+def test_atomic_symlink_keep_current():
+    with namedTemporaryDir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        link = os.path.join(tmpdir, "link")
+        fileUtils.atomic_symlink(target, link)
+        fileUtils.atomic_symlink(target, link)
+        assert os.readlink(link) == target
+        assert not os.path.exists(link + ".tmp")
+
+
+def test_atomic_symlink_replace_stale():
+    with namedTemporaryDir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        link = os.path.join(tmpdir, "link")
+        fileUtils.atomic_symlink("stale", link)
+        fileUtils.atomic_symlink(target, link)
+        assert os.readlink(link) == target
+        assert not os.path.exists(link + ".tmp")
+
+
+def test_atomic_symlink_replace_stale_temporary():
+    with namedTemporaryDir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        link = os.path.join(tmpdir, "link")
+        tmp_link = link + ".tmp"
+        fileUtils.atomic_symlink("stale", tmp_link)
+        fileUtils.atomic_symlink(target, link)
+        assert os.readlink(link) == target
+        assert not os.path.exists(tmp_link)
+
+
+def test_atomic_symlink_error_isfile():
+    with namedTemporaryDir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        link = os.path.join(tmpdir, "link")
+        with open(link, 'w') as f:
+            f.write('data')
+        with pytest.raises(OSError):
             fileUtils.atomic_symlink(target, link)
-            self.assertEqual(os.readlink(link), target)
-            self.assertFalse(os.path.exists(link + ".tmp"))
 
-    def test_keep_current(self):
-        with namedTemporaryDir() as tmpdir:
-            target = os.path.join(tmpdir, "target")
-            link = os.path.join(tmpdir, "link")
+
+def test_atomic_symlink_error_isdir():
+    with namedTemporaryDir() as tmpdir:
+        target = os.path.join(tmpdir, "target")
+        link = os.path.join(tmpdir, "link")
+        os.mkdir(link)
+        with pytest.raises(OSError):
             fileUtils.atomic_symlink(target, link)
-            fileUtils.atomic_symlink(target, link)
-            self.assertEqual(os.readlink(link), target)
-            self.assertFalse(os.path.exists(link + ".tmp"))
 
-    def test_replace_stale(self):
-        with namedTemporaryDir() as tmpdir:
-            target = os.path.join(tmpdir, "target")
-            link = os.path.join(tmpdir, "link")
-            fileUtils.atomic_symlink("stale", link)
-            fileUtils.atomic_symlink(target, link)
-            self.assertEqual(os.readlink(link), target)
-            self.assertFalse(os.path.exists(link + ".tmp"))
-
-    def test_replace_stale_temporary_link(self):
-        with namedTemporaryDir() as tmpdir:
-            target = os.path.join(tmpdir, "target")
-            link = os.path.join(tmpdir, "link")
-            tmp_link = link + ".tmp"
-            fileUtils.atomic_symlink("stale", tmp_link)
-            fileUtils.atomic_symlink(target, link)
-            self.assertEqual(os.readlink(link), target)
-            self.assertFalse(os.path.exists(tmp_link))
-
-    def test_error_isfile(self):
-        with namedTemporaryDir() as tmpdir:
-            target = os.path.join(tmpdir, "target")
-            link = os.path.join(tmpdir, "link")
-            with open(link, 'w') as f:
-                f.write('data')
-            self.assertRaises(OSError, fileUtils.atomic_symlink, target, link)
-
-    def test_error_isdir(self):
-        with namedTemporaryDir() as tmpdir:
-            target = os.path.join(tmpdir, "target")
-            link = os.path.join(tmpdir, "link")
-            os.mkdir(link)
-            self.assertRaises(OSError, fileUtils.atomic_symlink, target, link)
+# normalize path tests
 
 
-@expandPermutations
-class TestNormalizePath(VdsmTestCase):
+@pytest.mark.parametrize("path, normalized_path", [
+    ("server:/path", "server:/path"),
+    ("server://path", "server:/path"),
+    ("server:///path", "server:/path"),
+    ("server:/path/", "server:/path"),
+    ("server:/pa:th", "server:/pa:th"),
+    ("server:/path//", "server:/path"),
+    ("server:/", "server:/"),
+    ("server://", "server:/"),
+    ("server:///", "server:/"),
+    ("12.34.56.78:/", "12.34.56.78:/"),
+    ("[2001:db8::60fe:5bf:febc:912]:/", "[2001:db8::60fe:5bf:febc:912]:/"),
+    ("server:01234:/", "server:01234:"),
 
-    @permutations([
-        # Remote paths without a port
-        ("server:/path", "server:/path"),
-        ("server://path", "server:/path"),
-        ("server:///path", "server:/path"),
-        ("server:/path/", "server:/path"),
-        ("server:/pa:th", "server:/pa:th"),
-        ("server:/path//", "server:/path"),
-        ("server:/", "server:/"),
-        ("server://", "server:/"),
-        ("server:///", "server:/"),
-        ("12.34.56.78:/", "12.34.56.78:/"),
-        ("[2001:db8::60fe:5bf:febc:912]:/", "[2001:db8::60fe:5bf:febc:912]:/"),
-        ("server:01234:/", "server:01234:"),
+    # Remote paths with a port (relevant for cephfs mounts)
+    ("server:6789:/path", "server:6789:/path"),
+    ("server:6789:/", "server:6789:/"),
 
-        # Remote paths with a port (relevant for cephfs mounts)
-        ("server:6789:/path", "server:6789:/path"),
-        ("server:6789:/", "server:6789:/"),
+    # Local paths
+    ("/path/to/device", "/path/to/device"),
+    ("/path/to//device/", "/path/to/device"),
 
-        # Local paths
-        ("/path/to/device", "/path/to/device"),
-        ("/path/to//device/", "/path/to/device"),
-
-        # Other paths
-        ("proc", "proc"),
-        ("path//to///device/", "path/to/device"),
-    ])
-    def test_normalize_path_equals(self, path, normalized_path):
-        self.assertEqual(normalized_path, fileUtils.normalize_path(path))
-
-
-@pytest.mark.parametrize("orig_size, expected_size", [
-    (4096 - 1, 4096),
-    (4096, 4096),
-    (4096 + 1, 4096 + sc.BLOCK_SIZE),
+    # Other paths
+    ("proc", "proc"),
+    ("path//to///device/", "path/to/device"),
 ])
-def test_pad_to_block_size(tmpdir, orig_size, expected_size):
-    path = str(tmpdir.join("file"))
-    with open(path, "w") as f:
-        f.truncate(orig_size)
-    fileUtils.padToBlockSize(path)
-    padded_size = os.stat(path).st_size
-    assert padded_size == expected_size
+def test_normalize_path_equals(path, normalized_path):
+    assert normalized_path == fileUtils.normalize_path(path)

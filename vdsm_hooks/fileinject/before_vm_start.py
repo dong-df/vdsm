@@ -1,4 +1,6 @@
-#!/usr/bin/python
+#!/usr/bin/python3
+
+from __future__ import absolute_import
 
 import os
 import sys

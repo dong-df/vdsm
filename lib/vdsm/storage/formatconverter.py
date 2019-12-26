@@ -31,11 +31,14 @@ Version 4 is different from version 3 by supporting qcow version 1.1 as
 well the old qcow 0.10 version which was supported in version 3 and below.
 """
 from __future__ import absolute_import
+from __future__ import division
 
 import logging
 
-from vdsm import constants
+import six
+
 from vdsm.common import cmdutils
+from vdsm.common.units import MiB
 from vdsm.storage import blockSD
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -43,60 +46,6 @@ from vdsm.storage import qemuimg
 from vdsm.storage import sd
 
 log = logging.getLogger("storage.format")
-
-
-def __convertDomainMetadataToTags(domain, targetVersion):
-    newMetadata = blockSD.TagBasedSDMetadata(domain.sdUUID)
-    oldMetadata = domain._metadata
-
-    # We use _dict to bypass the validators in order to copy all metadata
-    metadata = oldMetadata._dict.copy()
-    metadata[sd.DMDK_VERSION] = str(targetVersion)  # Must be a string
-
-    log.debug("Converting domain %s to tag based metadata", domain.sdUUID)
-    newMetadata._dict.update(metadata)
-
-    try:
-        # If we can't clear the old metadata we don't have any clue on what
-        # actually happened. We prepare the convertError exception to raise
-        # later on if we discover that the upgrade didn't take place.
-        oldMetadata._dict.clear()
-    except Exception as convertError:
-        log.error("Could not clear the old metadata", exc_info=True)
-    else:
-        # We don't have any valuable information to add here
-        convertError = RuntimeError("Unknown metadata conversion error")
-
-    # If this fails, there's nothing we can do, let's bubble the exception
-    chkMetadata = blockSD.selectMetadata(domain.sdUUID)
-
-    if chkMetadata[sd.DMDK_VERSION] == int(targetVersion):
-        # Switching to the newMetadata (successful upgrade), the oldMetadata
-        # was cleared after all.
-        domain.replaceMetadata(chkMetadata)
-        log.debug("Conversion of domain %s to tag based metadata completed, "
-                  "target version = %s", domain.sdUUID, targetVersion)
-    else:
-        # The upgrade failed, cleaning up the new metadata
-        log.error("Could not convert domain %s to tag based metadata, "
-                  "target version = %s", domain.sdUUID, targetVersion)
-        newMetadata._dict.clear()
-        # Raising the oldMetadata_dict.clear() exception or the default one
-        raise convertError
-
-
-def v2DomainConverter(repoPath, hostId, domain, isMsd):
-    targetVersion = 2
-
-    if domain.getStorageType() in sd.BLOCK_DOMAIN_TYPES:
-        log.debug("Trying to upgrade domain %s to tag based metadata "
-                  "version %s", domain.sdUUID, targetVersion)
-
-        __convertDomainMetadataToTags(domain, targetVersion)
-
-    else:
-        log.debug("Skipping the upgrade to tag based metadata version %s "
-                  "for the domain %s", targetVersion, domain.sdUUID)
 
 
 def _v3_reset_meta_volsize(vol):
@@ -110,26 +59,25 @@ def _v3_reset_meta_volsize(vol):
     Arguments:
         vol (Volume): Volume to reset
     """
-    V2META_BLOCKSIZE = 512
 
-    # BZ811880 Verifiying that the volume size is the same size advertised
+    # BZ811880 Verifying that the volume size is the same size advertised
     # by the metadata
     log.debug("Checking the volume size for the volume %s", vol.volUUID)
 
-    metaVolSize = int(vol.getMetaParam(sc.SIZE))
+    meta_vol_size = int(vol.getMetaParam(sc.CAPACITY))
 
     if vol.getFormat() == sc.COW_FORMAT:
         qemuVolInfo = qemuimg.info(vol.getVolumePath(),
                                    qemuimg.FORMAT.QCOW2)
-        virtVolSize = qemuVolInfo["virtualsize"] / V2META_BLOCKSIZE
+        virtual_vol_size = qemuVolInfo["virtualsize"]
     else:
-        virtVolSize = vol.getVolumeSize()
+        virtual_vol_size = vol.getVolumeSize()
 
-    if metaVolSize != virtVolSize:
-        log.warn("Fixing the mismatch between the metadata volume size "
-                 "(%s) and the volume virtual size (%s) for the volume "
-                 "%s", metaVolSize, virtVolSize, vol.volUUID)
-        vol.setMetaParam(sc.SIZE, virtVolSize)
+    if meta_vol_size != virtual_vol_size:
+        log.warning("Fixing the mismatch between the metadata volume size "
+                    "(%s) and the volume virtual size (%s) for the volume "
+                    "%s", meta_vol_size, virtual_vol_size, vol.volUUID)
+        vol.setMetaParam(sc.CAPACITY, virtual_vol_size)
 
 
 def v3DomainConverter(repoPath, hostId, domain, isMsd):
@@ -139,18 +87,9 @@ def v3DomainConverter(repoPath, hostId, domain, isMsd):
     log.debug("Starting conversion for domain %s from version %s "
               "to version %s", domain.sdUUID, currentVersion, targetVersion)
 
-    targetVersion = 3
-    currentVersion = domain.getVersion()
-
     # For block domains if we're upgrading from version 0 we need to first
     # upgrade to version 2 and then proceed to upgrade to version 3.
     if domain.getStorageType() in sd.BLOCK_DOMAIN_TYPES:
-        if currentVersion == 0:
-            log.debug("Upgrading domain %s from version %s to version 2",
-                      domain.sdUUID, currentVersion)
-            v2DomainConverter(repoPath, hostId, domain, isMsd)
-            currentVersion = domain.getVersion()
-
         if currentVersion != 2:
             log.debug("Unsupported conversion from version %s to version %s",
                       currentVersion, targetVersion)
@@ -180,7 +119,7 @@ def v3DomainConverter(repoPath, hostId, domain, isMsd):
                       "domain %s", domain.sdUUID)
             return
 
-        leasesSize = domain.getLeasesFileSize() / constants.MEGAB
+        leasesSize = domain.getLeasesFileSize() // MiB
         metaMaxSlot = leasesSize - blockSD.RESERVED_LEASES - 1
 
         log.debug("Starting metadata reallocation check for domain %s with "
@@ -188,7 +127,7 @@ def v3DomainConverter(repoPath, hostId, domain, isMsd):
                   metaMaxSlot, leasesSize)
 
         # Updating the volumes one by one, doesn't require activation
-        for volUUID, (imgUUIDs, parentUUID) in allVolumes.iteritems():
+        for volUUID, (imgUUIDs, parentUUID) in six.iteritems(allVolumes):
             # The first imgUUID is the imgUUID of the template or the only
             # imgUUID where the volUUID appears.
             vol = domain.produceVolume(imgUUIDs[0], volUUID)
@@ -229,7 +168,7 @@ def v3DomainConverter(repoPath, hostId, domain, isMsd):
         v3ReallocateMetadataSlot(domain, allVolumes)
 
         # Updating the volumes one by one, doesn't require activation
-        for volUUID, (imgUUIDs, parentUUID) in allVolumes.iteritems():
+        for volUUID, (imgUUIDs, parentUUID) in six.iteritems(allVolumes):
             log.debug("Converting volume: %s", volUUID)
 
             # Maintaining a dict of {images: parent_image}
@@ -379,7 +318,13 @@ def v4DomainConverter(repoPath, hostId, domain, isMsd):
         # We have either a new or existing volume. Always format it to make
         # sure it is properly formatted - formatting is cheap.
         xleases_path = domain.external_leases_path()
-        domain.format_external_leases(domain.sdUUID, xleases_path)
+
+        # V4 domain always uses 1m alignment and 512 bytes block size.
+        domain.format_external_leases(
+            domain.sdUUID,
+            xleases_path,
+            alignment=sc.ALIGNMENT_1M,
+            block_size=sc.BLOCK_SIZE_512)
 
     # We may have now a good external leases volume, try to change the domain
     # version to 4. If this fail, conversion will fail, and the domain will
@@ -422,7 +367,6 @@ def v5DomainConverter(repoPath, hostId, domain, isMsd):
 
 
 _IMAGE_REPOSITORY_CONVERSION_TABLE = {
-    ('0', '2'): v2DomainConverter,
     ('0', '3'): v3DomainConverter,
     ('2', '3'): v3DomainConverter,
     ('3', '4'): v4DomainConverter,

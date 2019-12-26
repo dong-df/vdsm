@@ -26,15 +26,17 @@ import logging
 import six
 
 from vdsm.common.cache import memoized
-from vdsm.common.config import config as vdsm_config
 from vdsm.common.time import monotonic_time
 from vdsm.network import connectivity
 from vdsm.network import dns
+from vdsm.network import ifacetracking
 from vdsm.network import ifacquire
 from vdsm.network import legacy_switch
 from vdsm.network import errors as ne
 from vdsm.network import nmstate
+from vdsm.network import sourceroute
 from vdsm.network.configurators.ifcfg import Ifcfg, ConfigWriter
+from vdsm.network.configurators import qos
 from vdsm.network.ip import address
 from vdsm.network.ip import dhclient
 from vdsm.network.link import dpdk
@@ -47,8 +49,11 @@ from vdsm.network.ovs import switch as ovs_switch
 from vdsm.network.link import bond
 from vdsm.network.link.setup import SetupBonds
 from vdsm.network.netinfo import bridges
-from vdsm.network.netinfo.cache import (get as netinfo_get,
-                                        CachingNetInfo, NetInfo)
+from vdsm.network.netinfo.cache import (
+    get as netinfo_get,
+    CachingNetInfo,
+    NetInfo,
+)
 from vdsm.network.netinfo.cache import get_net_iface_from_config
 
 from . import validator
@@ -81,7 +86,8 @@ def _split_switch_type_entries(entries, running_entries):
             ovs_entries[name] = attrs
         else:
             raise ne.ConfigNetworkError(
-                ne.ERR_BAD_PARAMS, 'Invalid switch type %s' % attrs['switch'])
+                ne.ERR_BAD_PARAMS, 'Invalid switch type %s' % attrs['switch']
+            )
 
     for name, attrs in six.iteritems(entries):
         if 'remove' in attrs:
@@ -92,9 +98,11 @@ def _split_switch_type_entries(entries, running_entries):
             # type from the netinfo report.
             # This is not always possible, specifically with bonds owned by ovs
             # but not successfully deployed (not saved in running config).
-            if (switch_type == legacy_switch.SWITCH_TYPE and
-                    bond.Bond(name).exists() and
-                    not Ifcfg.owned_device(name)):
+            if (
+                switch_type == legacy_switch.SWITCH_TYPE
+                and bond.Bond(name).exists()
+                and not Ifcfg.owned_device(name)
+            ):
                 # If not owned by Legacy, assume OVS and let it be removed in
                 # the OVS way.
                 switch_type = ovs_switch.SWITCH_TYPE
@@ -108,23 +116,32 @@ def _split_switch_type_entries(entries, running_entries):
 
 def _split_switch_type(nets, bonds, net_info):
     legacy_nets, ovs_nets = _split_switch_type_entries(
-        nets, net_info['networks'])
+        nets, net_info['networks']
+    )
     legacy_bonds, ovs_bonds = _split_switch_type_entries(
-        bonds, net_info['bondings'])
+        bonds, net_info['bondings']
+    )
     return legacy_nets, ovs_nets, legacy_bonds, ovs_bonds
 
 
 def validate(networks, bondings, net_info):
     legacy_nets, ovs_nets, legacy_bonds, ovs_bonds = _split_switch_type(
-        networks, bondings, net_info)
+        networks, bondings, net_info
+    )
 
     use_legacy_switch = legacy_nets or legacy_bonds
     use_ovs_switch = ovs_nets or ovs_bonds
-    if use_legacy_switch and use_ovs_switch:
+
+    if (
+        not nmstate.is_nmstate_backend()
+        and use_legacy_switch
+        and use_ovs_switch
+    ):
         raise ne.ConfigNetworkError(
             ne.ERR_BAD_PARAMS,
             'Mixing of legacy and OVS networks is not supported inside one '
-            'setupNetworks() call.')
+            'setupNetworks() call.',
+        )
 
     validator.validate_southbound_devices_usages(networks, NetInfo(net_info))
     validator.validate_network_setup(networks, bondings, net_info)
@@ -133,7 +150,7 @@ def validate(networks, bondings, net_info):
 
 
 def setup(networks, bondings, options, net_info, in_rollback):
-    if vdsm_config.getboolean('vars', 'net_nmstate_enabled'):
+    if nmstate.is_nmstate_backend():
         _setup_nmstate(networks, bondings, options, in_rollback)
     else:
         _setup(networks, bondings, options, in_rollback, net_info)
@@ -149,12 +166,14 @@ def persist():
 
 def _setup(networks, bondings, options, in_rollback, net_info):
     legacy_nets, ovs_nets, legacy_bonds, ovs_bonds = _split_switch_type(
-        networks, bondings, net_info)
+        networks, bondings, net_info
+    )
     use_legacy_switch = legacy_nets or legacy_bonds
     use_ovs_switch = ovs_nets or ovs_bonds
     if use_legacy_switch:
         _setup_legacy(
-            legacy_nets, legacy_bonds, options, net_info, in_rollback)
+            legacy_nets, legacy_bonds, options, net_info, in_rollback
+        )
     elif use_ovs_switch:
         _setup_ovs(ovs_nets, ovs_bonds, options, net_info, in_rollback)
 
@@ -171,17 +190,108 @@ def _setup_nmstate(networks, bondings, options, in_rollback):
     logging.info('Processing setup through nmstate')
     desired_state = nmstate.generate_state(networks, bondings)
     logging.info('Desired state: %s', desired_state)
+    _setup_dynamic_src_routing(networks)
     nmstate.setup(desired_state, verify_change=not in_rollback)
-    with Transaction(in_rollback=in_rollback) as config:
-        config.networks = {
-            name: attrs for name, attrs in six.viewitems(networks)
-            if not attrs.get('remove')
-        }
-        config.bonds = {
-            name: attrs for name, attrs in six.viewitems(bondings)
-            if not attrs.get('remove')
-        }
+    net_info = NetInfo(netinfo_get())
+
+    with Transaction(in_rollback=in_rollback, persistent=False) as config:
+        _setup_qos(networks, net_info, config.networks)
+        for net_name, net_attrs in six.viewitems(networks):
+            if net_attrs.get('remove'):
+                config.removeNetwork(net_name)
+        for net_name, net_attrs in six.viewitems(networks):
+            if not net_attrs.get('remove'):
+                config.setNetwork(net_name, net_attrs)
+        for bond_name, bond_attrs in six.viewitems(bondings):
+            if bond_attrs.get('remove'):
+                config.removeBonding(bond_name)
+        for bond_name, bond_attrs in six.viewitems(bondings):
+            if not bond_attrs.get('remove'):
+                config.setBonding(bond_name, bond_attrs)
+        _setup_static_src_routing(networks)
+        config.save()
         connectivity.check(options)
+
+
+def _setup_static_src_routing(networks):
+    for net_name, net_attrs in six.viewitems(networks):
+        gateway = net_attrs.get('gateway')
+        if gateway:
+            ip_address = net_attrs.get('ipaddr')
+            netmask = net_attrs.get('netmask')
+            next_hop = get_next_hop_interface(net_name, net_attrs)
+            sourceroute.add(next_hop, ip_address, netmask, gateway)
+
+
+def _setup_qos(networks, net_info, rnetworks):
+    for net_name, net_attrs in _order_networks(networks):
+        rnet_attrs = rnetworks.get(net_name, {})
+        out = _get_qos_out(net_attrs)
+        rout = _get_qos_out(rnet_attrs)
+
+        if net_attrs.get('remove') or (rout and not out):
+            _remove_qos(rnet_attrs, net_info)
+        elif out:
+            _configure_qos(net_attrs, out)
+
+
+def _get_qos_out(net_attrs):
+    return net_attrs.get('hostQos', {}).get('out')
+
+
+def get_next_hop_interface(net_name, net_attributes):
+    if net_attributes.get('bridged'):
+        return net_name
+    else:
+        vlan = net_attributes.get('vlan')
+        next_hop_base_iface = _get_base_iface(net_attributes)
+        return (
+            next_hop_base_iface
+            if not vlan
+            else '{}.{}'.format(next_hop_base_iface, vlan)
+        )
+
+
+def _setup_dynamic_src_routing(networks):
+    for net_name, net_attrs in six.viewitems(networks):
+        is_remove = net_attrs.get('remove', False)
+        is_dynamic = net_attrs.get('bootproto') == 'dhcp'
+        if is_dynamic and not is_remove:
+            ifacetracking.add(_get_network_iface(net_name, net_attrs))
+
+
+def _configure_qos(net_attrs, out):
+    vlan = net_attrs.get('vlan')
+    base_iface = _get_base_iface(net_attrs)
+    qos.configure_outbound(out, base_iface, vlan)
+
+
+def _remove_qos(net_attrs, net_info):
+    vlan = net_attrs.get('vlan')
+    base_iface = _get_base_iface(net_attrs)
+    if (
+        base_iface in net_info.nics
+        or base_iface in net_info.bondings
+        and net_attrs.get('hostQos')
+    ):
+        qos.remove_outbound(base_iface, vlan, net_info)
+
+
+def _get_network_iface(net_name, net_attrs):
+    bridged = net_attrs.get('bridged')
+    vlan = net_attrs.get('vlan')
+    base_iface = _get_base_iface(net_attrs)
+    return (
+        net_name
+        if bridged
+        else '{}.{}'.format(base_iface, vlan)
+        if vlan
+        else base_iface
+    )
+
+
+def _get_base_iface(net_attrs):
+    return net_attrs.get('nic') or net_attrs.get('bonding')
 
 
 def _setup_legacy(networks, bondings, options, net_info, in_rollback):
@@ -191,26 +301,45 @@ def _setup_legacy(networks, bondings, options, net_info, in_rollback):
         # from this point forward, any exception thrown will be handled by
         # Configurator.__exit__.
 
-        legacy_switch.remove_networks(networks, bondings, configurator,
-                                      _netinfo)
+        legacy_switch.remove_networks(
+            networks, bondings, configurator, _netinfo
+        )
 
-        legacy_switch.bonds_setup(bondings, configurator, _netinfo,
-                                  in_rollback)
+        legacy_switch.bonds_setup(
+            bondings, configurator, _netinfo, in_rollback
+        )
 
-        legacy_switch.add_missing_networks(configurator, networks,
-                                           bondings, _netinfo)
+        legacy_switch.add_missing_networks(
+            configurator, _order_networks(networks), bondings, _netinfo
+        )
 
         connectivity.check(options)
+
+
+def _order_networks(networks):
+    vlanned_nets = (
+        (net, attr) for net, attr in six.viewitems(networks) if 'vlan' in attr
+    )
+    non_vlanned_nets = (
+        (net, attr)
+        for net, attr in six.viewitems(networks)
+        if 'vlan' not in attr
+    )
+
+    for net, attr in vlanned_nets:
+        yield net, attr
+    for net, attr in non_vlanned_nets:
+        yield net, attr
 
 
 def _setup_ovs(networks, bondings, options, net_info, in_rollback):
     _ovs_info = ovs_info.OvsInfo()
     ovs_nets = ovs_info.create_netinfo(_ovs_info)['networks']
 
-    nets2add, nets2edit, nets2remove = _split_setup_actions(
-        networks, ovs_nets)
+    nets2add, nets2edit, nets2remove = _split_setup_actions(networks, ovs_nets)
     bonds2add, bonds2edit, bonds2remove = _split_setup_actions(
-        bondings, net_info['bondings'])
+        bondings, net_info['bondings']
+    )
 
     # TODO: If a nework is to be edited, we remove it and recreate again.
     # We should implement editation.
@@ -224,14 +353,6 @@ def _setup_ovs(networks, bondings, options, net_info, in_rollback):
             _remove_networks(nets2remove, _ovs_info, config)
 
             setup_bonds.remove_bonds()
-
-            # Post removal of nets, update ovs_nets.
-            ovs_nets = ovs_info.create_netinfo(_ovs_info)['networks']
-            kernel_bonds = bond.Bond.bonds()
-            validator.validate_nic_usage(
-                nets2add, bonds2add,
-                _get_kernel_nets_nics(ovs_nets, kernel_bonds),
-                _get_kernel_bonds_slaves(kernel_bonds))
 
             acq.acquire(setup_bonds.ifaces_for_acquirement)
             setup_bonds.edit_bonds()
@@ -248,18 +369,6 @@ def _setup_ovs(networks, bondings, options, net_info, in_rollback):
             _setup_ovs_dns(nets2add)
 
             connectivity.check(options)
-
-
-def _get_kernel_nets_nics(ovs_networks, kernel_bonds):
-    return {netattr['southbound'] for netattr in six.itervalues(ovs_networks)
-            if netattr['southbound'] not in kernel_bonds}
-
-
-def _get_kernel_bonds_slaves(kernel_bonds):
-    kernel_bonds_slaves = set()
-    for bond_name in kernel_bonds:
-        kernel_bonds_slaves |= bond.Bond(bond_name).slaves
-    return kernel_bonds_slaves
 
 
 def _remove_networks(nets2remove, ovs_info, config):
@@ -322,14 +431,23 @@ def _set_static_ip_config(iface, attrs):
 
 
 def _ipv4_conf_params(attrs):
-    return (attrs.get('ipaddr'), attrs.get('netmask'), attrs.get('gateway'),
-            attrs.get('defaultRoute'), attrs.get('bootproto'))
+    return (
+        attrs.get('ipaddr'),
+        attrs.get('netmask'),
+        attrs.get('gateway'),
+        attrs.get('defaultRoute'),
+        attrs.get('bootproto'),
+    )
 
 
 def _ipv6_conf_params(attrs):
-    return (attrs.get('ipv6addr'), attrs.get('ipv6gateway'),
-            attrs.get('defaultRoute'), attrs.get('ipv6autoconf'),
-            attrs.get('dhcpv6'))
+    return (
+        attrs.get('ipv6addr'),
+        attrs.get('ipv6gateway'),
+        attrs.get('defaultRoute'),
+        attrs.get('ipv6autoconf'),
+        attrs.get('dhcpv6'),
+    )
 
 
 def set_ovs_links_up(nets2add, bonds2add, bonds2edit):
@@ -348,19 +466,23 @@ def ovs_remove_port(bridge, port):
 
 def _gather_ovs_ifaces(nets2add, bonds2add, bonds2edit):
     nets_and_bonds = set(
-        itertools.chain.from_iterable([nets2add, bonds2add, bonds2edit]))
+        itertools.chain.from_iterable([nets2add, bonds2add, bonds2edit])
+    )
 
-    nets_nics = {attrs['nic'] for attrs in six.itervalues(nets2add)
-                 if 'nic' in attrs}
+    nets_nics = {
+        attrs['nic'] for attrs in six.itervalues(nets2add) if 'nic' in attrs
+    }
 
     bonds_nics = set()
     for bonds in (bonds2add, bonds2edit):
         bond_nics = itertools.chain.from_iterable(
-            attrs['nics'] for attrs in six.itervalues(bonds))
+            attrs['nics'] for attrs in six.itervalues(bonds)
+        )
         bonds_nics.update(bond_nics)
 
     return itertools.chain.from_iterable(
-        [nets_and_bonds, nets_nics, bonds_nics])
+        [nets_and_bonds, nets_nics, bonds_nics]
+    )
 
 
 def netcaps(compatibility):
@@ -383,10 +505,11 @@ def netinfo(vdsmnets=None, compatibility=None):
 
         running_networks = RunningConfig().networks
         bridgeless_ovs_nets = [
-            net for net, attrs in six.iteritems(running_networks)
-            if attrs['switch'] == 'ovs' and not attrs['bridged']]
-        ovs_info.fake_bridgeless(
-            ovs_netinfo, _netinfo, bridgeless_ovs_nets)
+            net
+            for net, attrs in six.iteritems(running_networks)
+            if attrs['switch'] == 'ovs' and not attrs['bridged']
+        ]
+        ovs_info.fake_bridgeless(ovs_netinfo, _netinfo, bridgeless_ovs_nets)
 
         for type, entries in six.iteritems(ovs_netinfo):
             _netinfo[type].update(entries)
@@ -436,8 +559,10 @@ def _set_bond_type_by_usage(_netinfo):
     its switch type accordingly.
     """
     for bond_name, bond_attrs in six.iteritems(RunningConfig().bonds):
-        if (bond_attrs['switch'] == ovs_switch.SWITCH_TYPE and
-                bond_name in _netinfo['bondings']):
+        if (
+            bond_attrs['switch'] == ovs_switch.SWITCH_TYPE
+            and bond_name in _netinfo['bondings']
+        ):
             _netinfo['bondings'][bond_name]['switch'] = ovs_switch.SWITCH_TYPE
 
 
@@ -530,16 +655,19 @@ def validate_switch_type_change(nets, bonds, running_config):
             if 'remove' in attrs:
                 raise ne.ConfigNetworkError(
                     ne.ERR_BAD_PARAMS,
-                    'Switch type change request cannot contain removals')
+                    'Switch type change request cannot contain removals',
+                )
 
     if frozenset(running_config.networks) != frozenset(nets):
         raise ne.ConfigNetworkError(
             ne.ERR_BAD_PARAMS,
-            'All networks must be reconfigured on switch type change')
+            'All networks must be reconfigured on switch type change',
+        )
     if frozenset(running_config.bonds) != frozenset(bonds):
         raise ne.ConfigNetworkError(
             ne.ERR_BAD_PARAMS,
-            'All bondings must be reconfigured on switch type change')
+            'All bondings must be reconfigured on switch type change',
+        )
 
 
 def _setup_ovs_dns(nets):

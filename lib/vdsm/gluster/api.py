@@ -33,13 +33,15 @@ from vdsm.common import commands
 from vdsm.common import supervdsm as svdsm
 from vdsm.common.define import doneCode
 from vdsm.gluster import exception as ge
-from vdsm.gluster import fstab
+
 from vdsm.storage import mount
 from vdsm import constants
 from pwd import getpwnam
 
+from . import fstab
 from . import gluster_mgmt_api
 from . import safeWrite
+
 import logging
 
 _SUCCESS = {'status': doneCode}
@@ -230,20 +232,21 @@ def mountMetaVolume(metaVolumeName):
                     err=['Mount Point creation failed', str(e)])
 
     command = [constants.EXT_MOUNT, META_VOL_MOUNT_POINT]
-    rc, out, err = commands.execCmd(command)
-    if rc:
-        raise ge.GlusterMetaVolumeMountFailedException(
-            rc, out, err)
+    try:
+        out = commands.run(command)
+    except cmdutils.Error as e:
+        raise ge.GlusterMetaVolumeMountFailedException(e.rc, out, e.err)
     return True
 
 
 @gluster_mgmt_api
 def snapshotScheduleDisable():
     command = [_snapSchedulerPath.cmd, "disable_force"]
-    rc, out, err = commands.execCmd(command)
-    if rc not in [0, SNAP_SCHEDULER_ALREADY_DISABLED_RC]:
-        raise ge.GlusterDisableSnapshotScheduleFailedException(
-            rc)
+    try:
+        commands.run(command)
+    except cmdutils.Error as e:
+        if e.rc != SNAP_SCHEDULER_ALREADY_DISABLED_RC:
+            raise ge.GlusterDisableSnapshotScheduleFailedException(e.rc)
     return True
 
 
@@ -279,9 +282,10 @@ def snapshotScheduleFlagUpdate(value):
 @gluster_mgmt_api
 def processesStop():
     command = ["/bin/sh", _stopAllProcessesPath.cmd]
-    rc, out, err = commands.execCmd(command)
-    if rc:
-        raise ge.GlusterProcessesStopFailedException(rc)
+    try:
+        commands.run(command)
+    except cmdutils.Error as e:
+        raise ge.GlusterProcessesStopFailedException(e.rc)
 
 
 class GlusterApi(object):
@@ -475,15 +479,15 @@ class GlusterApi(object):
 
     @exportAsVerb
     def hookUpdate(self, glusterCmd, hookLevel, hookName, hookData,
-                   hookMd5Sum, options=None):
+                   hookChecksum, options=None):
         self.svdsmProxy.glusterHookUpdate(glusterCmd, hookLevel, hookName,
-                                          hookData, hookMd5Sum)
+                                          hookData, hookChecksum)
 
     @exportAsVerb
-    def hookAdd(self, glusterCmd, hookLevel, hookName, hookData, hookMd5Sum,
+    def hookAdd(self, glusterCmd, hookLevel, hookName, hookData, hookChecksum,
                 enable=False, options=None):
         self.svdsmProxy.glusterHookAdd(glusterCmd, hookLevel, hookName,
-                                       hookData, hookMd5Sum, enable)
+                                       hookData, hookChecksum, enable)
 
     @exportAsVerb
     def hookRemove(self, glusterCmd, hookLevel, hookName, options=None):

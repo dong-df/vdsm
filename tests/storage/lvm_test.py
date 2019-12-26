@@ -31,13 +31,13 @@ import pytest
 from vdsm.common import commands
 from vdsm.common import concurrent
 from vdsm.common import constants
+from vdsm.common.units import MiB, GiB
 
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import lvm
-from vdsm.storage import misc
 
-from . marks import requires_root, xfail_python3
+from . marks import requires_root
 
 
 # TODO: replace the filter tests with cmd tests.
@@ -79,6 +79,7 @@ def test_build_config():
         ' write_cache_state=0 '
         ' disable_after_error_count=3 '
         ' filter=["a|^/dev/a$|^/dev/b$|", "r|.*|"] '
+        ' hints="none" '
         '} '
         'global { '
         ' locking_type=1 '
@@ -153,7 +154,7 @@ def test_build_command_read_only(fake_devices):
     assert " locking_type=4 " in cmd[3]
 
 
-class FakeRunner(object):
+class FakeRunner(lvm.LVMRunner):
     """
     Simulate a command failing multiple times before suceeding. This is the
     case when running lvm read-only command with a very busy SPM.
@@ -174,8 +175,8 @@ class FakeRunner(object):
         self.delay = delay
         self.calls = []
 
-    def __call__(self, cmd, **kwargs):
-        self.calls.append((cmd, kwargs))
+    def _run_command(self, cmd):
+        self.calls.append(cmd)
 
         if self.delay:
             time.sleep(self.delay)
@@ -188,22 +189,20 @@ class FakeRunner(object):
 
 
 @pytest.fixture
-def fake_runner(monkeypatch):
-    runner = FakeRunner()
-    monkeypatch.setattr(misc, "execCmd", runner)
+def no_delay(monkeypatch):
     # Disable delay to speed up testing.
     monkeypatch.setattr(lvm.LVMCache, "RETRY_DELAY", 0)
-    return runner
 
 
-def test_cmd_success(fake_devices, fake_runner):
-    lc = lvm.LVMCache()
+def test_cmd_success(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     rc, out, err = lc.cmd(["lvs", "-o", "+tags"])
 
     assert rc == 0
     assert len(fake_runner.calls) == 1
 
-    cmd, kwargs = fake_runner.calls[0]
+    cmd = fake_runner.calls[0]
     assert cmd == [
         constants.EXT_LVM,
         "lvs",
@@ -214,11 +213,10 @@ def test_cmd_success(fake_devices, fake_runner):
         "-o", "+tags",
     ]
 
-    assert kwargs == {"sudo": True}
 
-
-def test_cmd_error(fake_devices, fake_runner):
-    lc = lvm.LVMCache()
+def test_cmd_error(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
 
     # Require 2 calls to succeed.
     assert lc.READ_ONLY_RETRIES > 1
@@ -232,10 +230,11 @@ def test_cmd_error(fake_devices, fake_runner):
     assert len(fake_runner.calls) == 1
 
 
-def test_cmd_retry_filter_stale(fake_devices, fake_runner):
+def test_cmd_retry_filter_stale(fake_devices, no_delay):
     # Make a call to load the cache.
     initial_devices = fake_devices[:]
-    lc = lvm.LVMCache()
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.cmd(["fake"])
     del fake_runner.calls[:]
 
@@ -253,7 +252,7 @@ def test_cmd_retry_filter_stale(fake_devices, fake_runner):
     assert len(fake_runner.calls) == 2
 
     # The first call used the stale cache filter.
-    cmd, kwargs = fake_runner.calls[0]
+    cmd = fake_runner.calls[0]
     assert cmd == [
         constants.EXT_LVM,
         "fake",
@@ -262,10 +261,9 @@ def test_cmd_retry_filter_stale(fake_devices, fake_runner):
             dev_filter=lvm._buildFilter(initial_devices),
             locking_type="1"),
     ]
-    assert kwargs == {"sudo": True}
 
     # The seocnd call used a wider filter.
-    cmd, kwargs = fake_runner.calls[1]
+    cmd = fake_runner.calls[1]
     assert cmd == [
         constants.EXT_LVM,
         "fake",
@@ -274,11 +272,11 @@ def test_cmd_retry_filter_stale(fake_devices, fake_runner):
             dev_filter=lvm._buildFilter(fake_devices),
             locking_type="1"),
     ]
-    assert kwargs == {"sudo": True}
 
 
-def test_cmd_read_only(fake_devices, fake_runner):
-    lc = lvm.LVMCache()
+def test_cmd_read_only(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.set_read_only(True)
 
     # Require 3 calls to succeed.
@@ -293,8 +291,9 @@ def test_cmd_read_only(fake_devices, fake_runner):
     assert len(set(repr(c) for c in fake_runner.calls)) == 1
 
 
-def test_cmd_read_only_max_retries(fake_devices, fake_runner):
-    lc = lvm.LVMCache()
+def test_cmd_read_only_max_retries(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.set_read_only(True)
 
     # Require max retries to succeed.
@@ -307,8 +306,9 @@ def test_cmd_read_only_max_retries(fake_devices, fake_runner):
     assert len(set(repr(c) for c in fake_runner.calls)) == 1
 
 
-def test_cmd_read_only_max_retries_fail(fake_devices, fake_runner):
-    lc = lvm.LVMCache()
+def test_cmd_read_only_max_retries_fail(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.set_read_only(True)
 
     # Require max retries + 1 to succeed.
@@ -321,10 +321,11 @@ def test_cmd_read_only_max_retries_fail(fake_devices, fake_runner):
     assert len(fake_runner.calls) == lc.READ_ONLY_RETRIES + 1
 
 
-def test_cmd_read_only_filter_stale(fake_devices, fake_runner):
+def test_cmd_read_only_filter_stale(fake_devices, no_delay):
     # Make a call to load the cache.
     initial_devices = fake_devices[:]
-    lc = lvm.LVMCache()
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.cmd(["fake"])
     del fake_runner.calls[:]
 
@@ -344,7 +345,7 @@ def test_cmd_read_only_filter_stale(fake_devices, fake_runner):
     assert len(fake_runner.calls) == lc.READ_ONLY_RETRIES + 2
 
     # The first call used the stale cache filter.
-    cmd, kwargs = fake_runner.calls[0]
+    cmd = fake_runner.calls[0]
     assert cmd == [
         constants.EXT_LVM,
         "fake",
@@ -353,10 +354,9 @@ def test_cmd_read_only_filter_stale(fake_devices, fake_runner):
             dev_filter=lvm._buildFilter(initial_devices),
             locking_type="4"),
     ]
-    assert kwargs == {"sudo": True}
 
     # The seocnd call used a wider filter.
-    cmd, kwargs = fake_runner.calls[1]
+    cmd = fake_runner.calls[1]
     assert cmd == [
         constants.EXT_LVM,
         "fake",
@@ -365,15 +365,15 @@ def test_cmd_read_only_filter_stale(fake_devices, fake_runner):
             dev_filter=lvm._buildFilter(fake_devices),
             locking_type="4"),
     ]
-    assert kwargs == {"sudo": True}
 
     # And then indentical retries with the wider filter.
     assert len(set(repr(c) for c in fake_runner.calls[1:])) == 1
 
 
-def test_cmd_read_only_filter_stale_fail(fake_devices, fake_runner):
+def test_cmd_read_only_filter_stale_fail(fake_devices, no_delay):
     # Make a call to load the cache.
-    lc = lvm.LVMCache()
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.cmd(["fake"])
     del fake_runner.calls[:]
 
@@ -390,6 +390,36 @@ def test_cmd_read_only_filter_stale_fail(fake_devices, fake_runner):
     # Call should fail after max retries + 2 calls.
     assert rc == 1
     assert len(fake_runner.calls) == lc.READ_ONLY_RETRIES + 2
+
+
+def test_suppress_warnings(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    fake_runner.err = b"""\
+  before
+  WARNING: This metadata update is NOT backed up.
+  WARNING: Combining activation change with other commands is not advised.
+  Configuration setting "global/event_activation" unknown.
+  after"""
+
+    lc = lvm.LVMCache(fake_runner)
+    rc, out, err = lc.cmd(["fake"])
+    assert rc == 0
+    assert err == [u"  before", u"  after"]
+
+
+def test_suppress_multiple_lvm_warnings(fake_devices, no_delay):
+    fake_runner = FakeRunner()
+    fake_runner.err = b"""\
+  before
+  Configuration setting "global/event_activation" unknown.
+  Configuration setting "global/event_activation" unknown.
+  Configuration setting "global/event_activation" unknown.
+  after"""
+
+    lc = lvm.LVMCache(fake_runner)
+    rc, out, err = lc.cmd(["fake"])
+    assert rc == 0
+    assert err == [u"  before", u"  after"]
 
 
 class Workers(object):
@@ -417,9 +447,10 @@ def workers():
 
 
 @pytest.mark.parametrize("read_only", [True, False])
-def test_command_concurrency(fake_devices, fake_runner, workers, read_only):
+def test_command_concurrency(fake_devices, no_delay, workers, read_only):
     # Test concurrent commands to reveal locking issues.
-    lc = lvm.LVMCache()
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
     lc.set_read_only(read_only)
 
     fake_runner.delay = 0.2
@@ -439,10 +470,11 @@ def test_command_concurrency(fake_devices, fake_runner, workers, read_only):
     assert elapsed < fake_runner.delay * count / lc.MAX_COMMANDS + 1.0
 
 
-def test_change_read_only_mode(fake_devices, fake_runner, workers):
+def test_change_read_only_mode(fake_devices, no_delay, workers):
     # Test that changing read only wait for running commands, and new commands
     # wait for the read only change.
-    lc = lvm.LVMCache()
+    fake_runner = FakeRunner()
+    lc = lvm.LVMCache(fake_runner)
 
     def run_after(delay, func, *args):
         time.sleep(delay)
@@ -471,11 +503,11 @@ def test_change_read_only_mode(fake_devices, fake_runner, workers):
     assert len(fake_runner.calls) == 4
 
     # The first 2 commands should run in read-write mode.
-    for cmd, kwargs in fake_runner.calls[:2]:
+    for cmd in fake_runner.calls[:2]:
         assert " locking_type=1 " in cmd[3]
 
     # The last 2 command should run in not read-only mode.
-    for cmd, kwargs in fake_runner.calls[2:]:
+    for cmd in fake_runner.calls[2:]:
         assert " locking_type=4 " in cmd[3]
 
     # The last 2 command can start only after the first 2 command finished.
@@ -483,11 +515,10 @@ def test_change_read_only_mode(fake_devices, fake_runner, workers):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_vg_create_remove_single_device(tmp_storage, read_only):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
 
@@ -502,7 +533,7 @@ def test_vg_create_remove_single_device(tmp_storage, read_only):
     assert vg.name == vg_name
     assert vg.pv_name == (dev,)
     assert vg.tags == ("initial-tag",)
-    assert int(vg.extent_size) == 128 * 1024**2
+    assert int(vg.extent_size) == 128 * MiB
 
     pv = lvm.getPV(dev)
     assert pv.name == dev
@@ -530,11 +561,10 @@ def test_vg_create_remove_single_device(tmp_storage, read_only):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_vg_create_multiple_devices(tmp_storage, read_only):
-    dev_size = 10 * 1024**3
+    dev_size = 10 * GiB
     dev1 = tmp_storage.create_device(dev_size)
     dev2 = tmp_storage.create_device(dev_size)
     dev3 = tmp_storage.create_device(dev_size)
@@ -588,10 +618,9 @@ def test_vg_create_multiple_devices(tmp_storage, read_only):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 def test_vg_extend_reduce(tmp_storage):
-    dev_size = 10 * 1024**3
+    dev_size = 10 * GiB
     dev1 = tmp_storage.create_device(dev_size)
     dev2 = tmp_storage.create_device(dev_size)
     dev3 = tmp_storage.create_device(dev_size)
@@ -635,10 +664,9 @@ def test_vg_extend_reduce(tmp_storage):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 def test_vg_add_delete_tags(tmp_storage):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
 
@@ -664,7 +692,7 @@ def test_vg_add_delete_tags(tmp_storage):
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_vg_check(tmp_storage, read_only):
-    dev_size = 10 * 1024**3
+    dev_size = 10 * GiB
     dev1 = tmp_storage.create_device(dev_size)
     dev2 = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
@@ -680,11 +708,10 @@ def test_vg_check(tmp_storage, read_only):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_lv_create_remove(tmp_storage, read_only):
-    dev_size = 10 * 1024**3
+    dev_size = 10 * GiB
     dev1 = tmp_storage.create_device(dev_size)
     dev2 = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
@@ -704,7 +731,7 @@ def test_lv_create_remove(tmp_storage, read_only):
     lv = lvm.getLV(vg_name, lv_any)
     assert lv.name == lv_any
     assert lv.vg_name == vg_name
-    assert int(lv.size) == 1024**3
+    assert int(lv.size) == GiB
     assert lv.tags == ()
     assert lv.writeable
     assert not lv.opened
@@ -737,36 +764,38 @@ def test_lv_create_remove(tmp_storage, read_only):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 def test_lv_add_delete_tags(tmp_storage):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
-    lv_name = str(uuid.uuid4())
+    lv1_name = str(uuid.uuid4())
+    lv2_name = str(uuid.uuid4())
 
     lvm.set_read_only(False)
 
     lvm.createVG(vg_name, [dev], "initial-tag", 128)
 
-    lvm.createLV(vg_name, lv_name, 1024, activate=False)
+    lvm.createLV(vg_name, lv1_name, 1024, activate=False)
+    lvm.createLV(vg_name, lv2_name, 1024, activate=False)
 
-    lvm.changeLVTags(
+    lvm.changeLVsTags(
         vg_name,
-        lv_name,
+        (lv1_name, lv2_name),
         delTags=("initial-tag",),
         addTags=("new-tag-1", "new-tag-2"))
 
-    lv = lvm.getLV(vg_name, lv_name)
-    assert sorted(lv.tags) == ["new-tag-1", "new-tag-2"]
+    lv1 = lvm.getLV(vg_name, lv1_name)
+    lv2 = lvm.getLV(vg_name, lv2_name)
+    assert sorted(lv1.tags) == ["new-tag-1", "new-tag-2"]
+    assert sorted(lv2.tags) == ["new-tag-1", "new-tag-2"]
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_lv_activate_deactivate(tmp_storage, read_only):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
     lv_name = str(uuid.uuid4())
@@ -793,10 +822,9 @@ def test_lv_activate_deactivate(tmp_storage, read_only):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 def test_lv_extend_reduce(tmp_storage):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
     lv_name = str(uuid.uuid4())
@@ -810,20 +838,35 @@ def test_lv_extend_reduce(tmp_storage):
     lvm.extendLV(vg_name, lv_name, 2048)
 
     lv = lvm.getLV(vg_name, lv_name)
-    assert int(lv.size) == 2 * 1024**3
+    assert int(lv.size) == 2 * GiB
+
+    # Extending LV to same does nothing.
+
+    lvm.extendLV(vg_name, lv_name, 2048)
+
+    lvm.invalidateVG(vg_name)
+    lv = lvm.getLV(vg_name, lv_name)
+    assert int(lv.size) == 2 * GiB
+
+    # Extending LV to smaller size does nothing.
+
+    lvm.extendLV(vg_name, lv_name, 1024)
+
+    lvm.invalidateVG(vg_name)
+    lv = lvm.getLV(vg_name, lv_name)
+    assert int(lv.size) == 2 * GiB
 
     # Reducing active LV requires force.
     lvm.reduceLV(vg_name, lv_name, 1024, force=True)
     lv = lvm.getLV(vg_name, lv_name)
-    assert int(lv.size) == 1 * 1024**3
+    assert int(lv.size) == 1 * GiB
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_lv_refresh(tmp_storage, read_only):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
     lv_name = str(uuid.uuid4())
@@ -848,7 +891,7 @@ def test_lv_refresh(tmp_storage, read_only):
     # Refreshing LV invalidates the cache to pick up changes from storage.
     lvm.refreshLVs(vg_name, [lv_name])
     lv = lvm.getLV(vg_name, lv_name)
-    assert int(lv.size) == 2 * 1024**3
+    assert int(lv.size) == 2 * GiB
 
     # Simulate extending the LV on the SPM.
     commands.run([
@@ -861,14 +904,13 @@ def test_lv_refresh(tmp_storage, read_only):
     # Activate active LV refreshes it.
     lvm.activateLVs(vg_name, [lv_name])
     lv = lvm.getLV(vg_name, lv_name)
-    assert int(lv.size) == 3 * 1024**3
+    assert int(lv.size) == 3 * GiB
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 def test_lv_rename(tmp_storage):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
     lv_name = str(uuid.uuid4())
@@ -888,11 +930,10 @@ def test_lv_rename(tmp_storage):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("read_only", [True, False])
 def test_bootstrap(tmp_storage, read_only):
-    dev_size = 20 * 1024**3
+    dev_size = 20 * GiB
 
     lvm.set_read_only(False)
 
@@ -940,7 +981,6 @@ def test_bootstrap(tmp_storage, read_only):
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 def test_retry_with_wider_filter(tmp_storage):
     lvm.set_read_only(False)
@@ -950,7 +990,7 @@ def test_retry_with_wider_filter(tmp_storage):
     lvm.getAllPVs()
 
     # Create a device - this device in not the lvm cached filter yet.
-    dev = tmp_storage.create_device(20 * 1024**3)
+    dev = tmp_storage.create_device(20 * GiB)
 
     # We run vgcreate with explicit devices argument, so the filter is correct
     # and it succeeds.
@@ -963,3 +1003,60 @@ def test_retry_with_wider_filter(tmp_storage):
 
     vg = lvm.getVG(vg_name)
     assert vg.pv_name == (dev,)
+
+
+@requires_root
+@pytest.mark.root
+def test_reload_lvs_with_stale_lv(tmp_storage):
+    dev_size = 10 * GiB
+    dev1 = tmp_storage.create_device(dev_size)
+    dev2 = tmp_storage.create_device(dev_size)
+    vg_name = str(uuid.uuid4())
+    lv1 = "lv1"
+    lv2 = "lv2"
+
+    # Creating VG and LV requires read-write mode.
+    lvm.set_read_only(False)
+    lvm.createVG(vg_name, [dev1, dev2], "initial-tag", 128)
+
+    # Create the LVs.
+    lvm.createLV(vg_name, lv1, 1024)
+    lvm.createLV(vg_name, lv2, 1024)
+
+    # Make sure that LVs are in the cache.
+    expected_lv1 = lvm.getLV(vg_name, lv1)
+    expected_lv2 = lvm.getLV(vg_name, lv2)
+
+    # Simulate LV removed on the SPM while this host keeps it in the cache.
+    commands.run([
+        "lvremove", "-f",
+        "--config", tmp_storage.lvm_config(),
+        "{}/{}".format(vg_name, lv2)
+    ])
+
+    # Test removing staled LVs in LVMCache._reloadlvs() which can be invoked
+    # e.g. by calling lvm.getLv(vg_name).
+    lvs = lvm.getLV(vg_name)
+
+    # And verify that first LV is still correctly reported.
+    assert expected_lv1 in lvs
+    assert expected_lv2 not in lvs
+
+
+def test_normalize_args():
+    assert lvm.normalize_args(u"arg") == [u"arg"]
+    assert lvm.normalize_args("arg") == [u"arg"]
+
+    assert lvm.normalize_args(("arg1", "arg2")) == (u"arg1", u"arg2")
+    assert lvm.normalize_args((u"arg1", u"arg2")) == (u"arg1", u"arg2")
+    assert lvm.normalize_args(["arg1", "arg2"]) == [u"arg1", u"arg2"]
+    assert lvm.normalize_args([u"arg1", u"arg2"]) == [u"arg1", u"arg2"]
+
+    assert list(lvm.normalize_args(iter(("arg1", "arg2")))) == [
+        u"arg1", u"arg2"]
+    assert list(lvm.normalize_args(iter((u"arg1", u"arg2")))) == [
+        u"arg1", u"arg2"]
+    assert list(lvm.normalize_args(iter(["arg1", "arg2"]))) == [
+        u"arg1", u"arg2"]
+    assert list(lvm.normalize_args(iter([u"arg1", u"arg2"]))) == [
+        u"arg1", u"arg2"]

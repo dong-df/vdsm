@@ -41,7 +41,6 @@ from vdsm.common import cpuarch
 from vdsm.common import define
 from vdsm.common import exception
 from vdsm.common import libvirtconnection
-from vdsm.common import password
 from vdsm.common import response
 from vdsm.common import xmlutils
 
@@ -90,15 +89,6 @@ _VM_PARAMS = {
 _TICKET_PARAMS = {
     'userName': 'admin',
     'userId': 'fdfc627c-d875-11e0-90f0-83df133b58cc'
-}
-
-
-_GRAPHICS_DEVICE_PARAMS = {
-    'deviceType': hwclass.GRAPHICS,
-    'password': password.ProtectedPassword('12345678'),
-    'ttl': 0,
-    'existingConnAction': 'disconnect',
-    'params': _TICKET_PARAMS
 }
 
 
@@ -809,7 +799,7 @@ class TestVmDeviceHandling(TestCaseBase):
         devices = [fake.Device('device_{}'.format(i)) for i in range(3)]
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertNotRaises(testvm._setup_devices)
             self.assertEqual(devices[0].state, fake.SETUP)
             self.assertEqual(devices[1].state, fake.SETUP)
@@ -820,7 +810,7 @@ class TestVmDeviceHandling(TestCaseBase):
                    [fake.Device('device_{}'.format(i)) for i in range(1, 3)])
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertRaises(ExpectedError, testvm._setup_devices)
             self.assertEqual(devices[0].state, fake.SETUP)
             self.assertEqual(devices[1].state, fake.CREATED)
@@ -832,7 +822,7 @@ class TestVmDeviceHandling(TestCaseBase):
                    fake.Device('device_2')]
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertRaises(ExpectedError, testvm._setup_devices)
             self.assertEqual(devices[0].state, fake.TEARDOWN)
             self.assertEqual(devices[1].state, fake.SETUP)
@@ -843,7 +833,7 @@ class TestVmDeviceHandling(TestCaseBase):
                    fake.Device('device_2', fail_setup=ExpectedError)]
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertRaises(ExpectedError, testvm._setup_devices)
             self.assertEqual(devices[0].state, fake.TEARDOWN)
             self.assertEqual(devices[1].state, fake.TEARDOWN)
@@ -857,7 +847,7 @@ class TestVmDeviceHandling(TestCaseBase):
                    fake.Device('device_2', fail_setup=UnexpectedError)]
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertRaises(ExpectedError, testvm._setup_devices)
             self.assertEqual(devices[0].state, fake.TEARDOWN)
             self.assertEqual(devices[1].state, fake.SETUP)
@@ -867,7 +857,7 @@ class TestVmDeviceHandling(TestCaseBase):
         devices = [fake.Device('device_{}'.format(i)) for i in range(3)]
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertNotRaises(testvm._setup_devices)
             self.assertNotRaises(testvm._teardown_devices)
             self.assertEqual(devices[0].state, fake.TEARDOWN)
@@ -880,7 +870,7 @@ class TestVmDeviceHandling(TestCaseBase):
                    for i in range(3)]
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
-            testvm._devices[hwclass.GENERAL] = devices
+            testvm._devices['general'] = devices
             self.assertNotRaises(testvm._setup_devices)
             self.assertNotRaises(testvm._teardown_devices)
             self.assertEqual(devices[0].state, fake.TEARDOWN)
@@ -943,7 +933,7 @@ class TestVmDeviceHandling(TestCaseBase):
     def test_xml_device_processing(self):
         with fake.VM({'xml': self.xml_conf}) as vm:
             devices = vm._make_devices()
-            self.assertEqual(sum([len(v) for v in devices.values()]), 4)
+            self.assertEqual(sum([len(v) for v in devices.values()]), 2)
 
 
 VM_EXITS = tuple(product((define.NORMAL, define.ERROR),
@@ -987,8 +977,6 @@ _VM_PARAMS = {'displayPort': -1, 'displaySecurePort': -1,
 
 
 class TestVmStats(TestCaseBase):
-
-    DEV_BALLOON = [{'type': 'balloon', 'specParams': {'model': 'virtio'}}]
 
     def testGetNicStats(self):
         GBPS = 10 ** 9 // 8
@@ -1110,19 +1098,21 @@ class TestLibVirtCallbacks(TestCaseBase):
             self.assertIsNone(testvm._pause_code)  # no error recorded
 
     @permutations([
-        ['dimm0', set(('balloon',))],
-        ['balloon', set(('dimm0', 'balloon',))],
-        ['missing', set(('dimm0', 'balloon',))],
+        ['net1', set()],
+        ['missing', set(('net1',))],
     ])
     def test_onDeviceRemoved(self, alias, kept_aliases):
         devices = '''
-<memory model="dimm">
-  <alias name="dimm0"/>
-  <target><size unit='KiB'>524288</size><node>1</node></target>
-</memory>
-<memballoon model="none">
-  <alias name="balloon"/>
-</memballoon>
+<interface type='bridge'>
+  <alias name="net1"/>
+  <mac address='00:11:22:33:44:55'/>
+  <source bridge='ovirtmgmt'/>
+  <target dev='vnet0'/>
+  <model type='virtio'/>
+    <filterref filter='vdsm-no-mac-spoofing'/>
+    <address type='pci' domain='0x0000' bus='0x00' slot='0x03'
+             function='0x0'/>
+</interface>
 '''
         with fake.VM(_VM_PARAMS, xmldevices=devices,
                      create_device_objects=True) as testvm:
@@ -1227,7 +1217,6 @@ class TestVmBalloon(TestCaseBase):
 
     def testGetBalloonInfo(self):
         with fake.VM() as testvm:
-            self.assertEqual(testvm._devices[hwclass.BALLOON], [])
             self.assertEqual(testvm.get_balloon_info(), {})
 
     def testSkipBalloonModelNone(self):

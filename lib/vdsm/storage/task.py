@@ -50,7 +50,6 @@ from __future__ import absolute_import
 import logging
 import os
 import threading
-import types
 import uuid
 
 from contextlib import contextmanager
@@ -64,11 +63,10 @@ from vdsm.common.logutils import SimpleLogAdapter
 from vdsm.common.threadlocal import vars
 from vdsm.config import config
 from vdsm.storage import exception as se
+from vdsm.storage import constants as sc
 from vdsm.storage import outOfProcess as oop
 from vdsm.storage import resourceManager
 
-
-getProcPool = oop.getGlobalProcPool
 
 KEY_SEPARATOR = "="
 KEY_SEPARATOR_ENCODED = "_eq_"
@@ -84,6 +82,10 @@ FIELD_SEP = ","
 TASK_METADATA_VERSION = 1
 
 ROLLBACK_SENTINEL = "rollback sentinel"
+
+
+def getProcPool():
+    return oop.getProcessPool(sc.GLOBAL_OOP)
 
 
 def _eq_encode(s):
@@ -229,6 +231,9 @@ class State:
     def __ne__(self, state):
         return self.state != state
 
+    def __hash__(self):
+        return hash(self.state)
+
 
 class EnumType(object):
     def __init__(self, enum):
@@ -248,6 +253,9 @@ class EnumType(object):
 
     def __ne__(self, x):
         return not self.__eq__(x)
+
+    def __hash__(self):
+        return hash(self.value)
 
 
 class TaskPersistType(EnumType):
@@ -277,13 +285,13 @@ class ParamList:
 
         if type(params) == list:
             for i in params:
-                if not isinstance(i, types.StringTypes):
+                if not isinstance(i, six.string_types):
                     raise ValueError("ParamsList: param item %s not a string"
                                      " (%s)" % (i, type(i)))
                 if sep in i:
                     raise ValueError("ParamsList: sep %s in %s" % (sep, i))
             self.params = params
-        elif isinstance(params, types.StringTypes):
+        elif isinstance(params, six.string_types):
             self.params = [s.strip() for s in params.split(sep)]
         else:
             raise ValueError("ParamList: params type not supported (%s)" %
@@ -462,7 +470,8 @@ class Task:
 
     def __init__(self, id, name="", tag="",
                  recovery=TaskRecoveryType.none,
-                 priority=TaskPriority.low):
+                 priority=TaskPriority.low,
+                 abort_callback=None):
         """
         id - Unique ID
         name - human readable name
@@ -494,6 +503,8 @@ class Task:
         self.mng = None
         self._abort_lock = threading.Lock()
         self._abort_callbacks = set()
+        if abort_callback is not None:
+            self._abort_callbacks.add(abort_callback)
         self._aborting = False
         self._forceAbort = False
         self.ref = 0
@@ -502,6 +513,9 @@ class Task:
         self.jobs = []
         self.nrecoveries = 0    # just utility count - used by save/load
         self.njobs = 0          # just utility count - used by save/load
+
+        # Used by tests to wait for a task from another thread.
+        self._is_done = threading.Event()
 
         self.log = SimpleLogAdapter(self.log, {"Task": self.id})
 
@@ -535,8 +549,9 @@ class Task:
         pass
 
     def __state_acquiring(self, fromState):
-        if self.resOwner.requestsGranted():
-            self._updateState(State.queued)
+        # TODO: see if acquiring state can be removed since we always move
+        # into a queued state.
+        self._updateState(State.queued)
 
     def __state_queued(self, fromState):
         try:
@@ -566,8 +581,9 @@ class Task:
         pass
 
     def __state_racquiring(self, fromState):
-        if self.resOwner.requestsGranted():
-            self._updateState(State.recovering)
+        # TODO: see if racquiring state can be removed since we always move to
+        # recovering state.
+        self._updateState(State.recovering)
 
     def __state_recovering(self, fromState):
         self._recover()
@@ -630,7 +646,7 @@ class Task:
         try:
             for line in getProcPool().readLines(filename):
                 # process current line
-                line = line.encode('utf8')
+                line = line.decode('utf-8')
                 if line.find(KEY_SEPARATOR) < 0:
                     continue
                 parts = line.split(KEY_SEPARATOR)
@@ -677,7 +693,7 @@ class Task:
     def _saveMetaFile(cls, filename, obj, fields):
         try:
             getProcPool().writeLines(filename,
-                                     [l.encode('utf8') + "\n"
+                                     [l.encode('utf-8') + b"\n"
                                       for l in cls._dump(obj, fields)])
         except Exception:
             cls.log.error("Unexpected error", exc_info=True)
@@ -852,23 +868,6 @@ class Task:
         finally:
             self._decref()
 
-    def resourceRegistered(self, namespace, resource, locktype):
-        self._incref()
-        try:
-            self.callbackLock.acquire()
-            try:
-                # Callback from resourceManager.Owner. May be called
-                # by another thread.
-                self.log.debug("_resourcesAcquired: %s.%s (%s)",
-                               namespace, resource, locktype)
-                # Protect against races with stop/abort
-                if self.state == State.preparing:
-                    self._updateState(State.blocked)
-            finally:
-                self.callbackLock.release()
-        finally:
-            self._decref()
-
     def _setError(self, e=se.TaskAborted("Unknown error encountered"),
                   expected=False):
         if not expected:
@@ -916,6 +915,8 @@ class Task:
                     0, 'running job {0} of {1}'.format(i + 1, len(self.jobs)),
                     '')
                 result = self._run(j.run)
+                if self.aborting():
+                    raise se.TaskAborted("shutting down")
                 if result is None:
                     result = ""
                 i += 1
@@ -949,7 +950,6 @@ class Task:
                     self.log.warning("Task._doAbort %s: ignoring - "
                                      "at state %s", self, self.state)
                     return
-                self.resOwner.cancelAll()
                 if self.state.canAbort():
                     self._updateState(State.aborting)
                 else:
@@ -1000,8 +1000,11 @@ class Task:
         self.lock.release()
 
         self.log.debug("ref %d aborting %s", ref, self.aborting())
-        if ref == 0 and self.aborting():
-            self._doAbort(force)
+        if ref == 0:
+            if self.aborting():
+                self._doAbort(force)
+            if self.state.isDone():
+                self._is_done.set()
         return ref
 
     ##########################################################################
@@ -1305,6 +1308,9 @@ class Task:
             self._decref(force=True)
         self.log.debug('(recover): recovered: state %s', self.state)
 
+    def wait(self, timeout=None):
+        return self._is_done.wait(timeout)
+
     def getState(self):
         return str(self.state)
 
@@ -1348,7 +1354,8 @@ class Task:
     def __str__(self):
         return str(self.id)
 
-    # FIXME : Use StringIO and enumerate()
+    # FIXME : Use six.StringIO and enumerate()
+    # TODO: Or six.ByteIO?
     def dumpTask(self):
         s = "Task: %s" % self._dump(self, Task.fields)
         i = 0

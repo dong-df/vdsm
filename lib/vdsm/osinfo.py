@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2017 Red Hat, Inc.
+# Copyright 2016-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -69,7 +69,6 @@ class OSName:
     FEDORA = 'Fedora'
     RHEVH = 'RHEV Hypervisor'
     DEBIAN = 'Debian'
-    POWERKVM = 'PowerKVM'
 
 
 class KdumpStatus(object):
@@ -117,8 +116,6 @@ def _release_name():
         return OSName.RHEL
     elif os.path.exists('/etc/debian_version'):
         return OSName.DEBIAN
-    elif os.path.exists('/etc/ibm_powerkvm-release'):
-        return OSName.POWERKVM
     else:
         return OSName.UNKNOWN
 
@@ -225,11 +222,7 @@ def version():
             version = linecache.getline('/etc/debian_version', 1).strip("\n")
             release_name = ""  # Debian just has a version entry
         else:
-            if osname == OSName.POWERKVM:
-                release_path = '/etc/ibm_powerkvm-release'
-            else:
-                release_path = '/etc/redhat-release'
-
+            release_path = '/etc/redhat-release'
             ts = rpm.TransactionSet()
             for er in ts.dbMatch('basenames', release_path):
 
@@ -257,7 +250,7 @@ def package_versions():
     pkgs = {'kernel': runtime_kernel_flags().version}
 
     if _release_name() in (OSName.RHEVH, OSName.OVIRT, OSName.FEDORA,
-                           OSName.RHEL, OSName.POWERKVM):
+                           OSName.RHEL,):
         KEY_PACKAGES = {
             'glusterfs-cli': ('glusterfs-cli',),
             'librbd1': ('librbd1',),
@@ -286,8 +279,8 @@ def package_versions():
                                   KEY_PACKAGES[pkg])
                 else:
                     pkgs[pkg] = {
-                        'version': mi['version'],
-                        'release': mi['release'],
+                        'version': mi['version'].decode('utf-8'),
+                        'release': mi['release'].decode('utf-8'),
                     }
         except Exception:
             logging.error('', exc_info=True)
@@ -365,10 +358,4 @@ def nested_virtualization():
 
 
 def kernel_features():
-    return {
-        'PTI': supervdsm.getProxy().get_pti(),
-        'RETP': supervdsm.getProxy().get_retp(),
-        'IBRS': supervdsm.getProxy().get_ibrs(),
-        'SSBD': supervdsm.getProxy().get_ssbd(),
-        'MDS': supervdsm.getProxy().get_mds(),
-    }
+    return supervdsm.getProxy().get_cpu_vulnerabilities()

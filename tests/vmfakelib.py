@@ -106,7 +106,7 @@ class ClientIF(object):
         self.irs = IRS()  # just to make sure nothing ever happens
         self.log = logging.getLogger('fake.ClientIF')
         self.channelListener = None
-        self.vmContainerLock = threading.Lock()
+        self.vm_container_lock = threading.Lock()
         self.vmContainer = {}
         self.vmRequests = {}
         self.bindings = {}
@@ -120,8 +120,10 @@ class ClientIF(object):
     def getInstance(self):
         return self
 
-    def prepareVolumePath(self, drive, vmId=None):
-        if isinstance(drive, dict):
+    def prepareVolumePath(self, drive, vmId=None, path=None):
+        if path is not None:
+            return path
+        elif isinstance(drive, dict):
             return drive['path']
         else:
             return drive
@@ -130,7 +132,7 @@ class ClientIF(object):
         pass
 
     def getVMs(self):
-        with self.vmContainerLock:
+        with self.vm_container_lock:
             return self.vmContainer.copy()
 
     def pop_unknown_vm_ids(self):

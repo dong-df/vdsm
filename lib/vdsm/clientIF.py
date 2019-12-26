@@ -90,7 +90,8 @@ class clientIF(object):
         :param log: a log object to be used for this object's logging.
         :type log: :class:`logging.Logger`
         """
-        self.vmContainerLock = threading.Lock()
+        self.vm_container_lock = threading.Lock()
+        self.vm_start_stop_lock = threading.Lock()
         self._networkSemaphore = threading.Semaphore()
         self._shutdownSemaphore = threading.Semaphore()
         self.irs = irs
@@ -161,7 +162,7 @@ class clientIF(object):
         Get a snapshot of the currently registered VMs.
         Return value will be a dict of {vmUUID: VM_object}
         """
-        with self.vmContainerLock:
+        with self.vm_container_lock:
             return self.vmContainer.copy()
 
     def pop_unknown_vm_ids(self):
@@ -173,7 +174,7 @@ class clientIF(object):
 
         This is intended to serve for detection of external VMs.
         """
-        with self.vmContainerLock:
+        with self.vm_container_lock:
             unknown_vm_ids = [vm_id for vm_id in self._unknown_vm_ids
                               if vm_id not in self.vmContainer]
             self._unknown_vm_ids = set()
@@ -186,7 +187,7 @@ class clientIF(object):
         :param vm_id: VM id to add
         :type vm_id: basestring
         """
-        with self.vmContainerLock:
+        with self.vm_container_lock:
             self._unknown_vm_ids.add(vm_id)
 
     @property
@@ -241,8 +242,8 @@ class clientIF(object):
         libvirtVms = libvirtCon.listAllDomains(
             libvirt.VIR_CONNECT_LIST_DOMAINS_PAUSED)
 
-        with self.vmContainerLock:
-            self.log.info("vmContainerLock acquired")
+        with self.vm_start_stop_lock:
+            self.log.info("vm_start_stop_lock acquired")
             for libvirtVm in libvirtVms:
                 state = libvirtVm.state(0)
                 if state[1] == libvirt.VIR_DOMAIN_PAUSED_IOERROR:
@@ -403,7 +404,17 @@ class clientIF(object):
                                         name='Reactor thread')
         self.thread.start()
 
-    def prepareVolumePath(self, drive, vmId=None):
+    def prepareVolumePath(self, drive, vmId=None, path=None):
+        """
+        :param drive: the drive to prepare path for
+        :type drive: dict, string or None
+        :param vmId: VM UUID
+        :type vmId: string or None
+        :param path: defines payload path for devices providing
+            payload; if omitted and `drive` is a payload device then
+            the path will be generated
+        :type path: string or None
+        """
         if type(drive) is dict:
             device = drive['device']
             # PDIV drive format
@@ -468,7 +479,7 @@ class clientIF(object):
                 params = drive['specParams']
                 if 'vmPayload' in params:
                     volPath = self._prepareVolumePathFromPayload(
-                        vmId, device, params['vmPayload'])
+                        vmId, device, params['vmPayload'], path)
                 # next line can be removed in future, when < 3.3 engine
                 # is not supported
                 elif (params.get('path', '') == '' and
@@ -501,22 +512,21 @@ class clientIF(object):
         self.log.info("prepared volume path: %s", volPath)
         return volPath
 
-    def _prepareVolumePathFromPayload(self, vmId, device, payload):
+    def _prepareVolumePathFromPayload(self, vmId, device, payload, path):
         """
-        param vmId:
-            VM UUID or None
-        param device:
-            either 'floppy' or 'cdrom'
-        param payload:
-            a dict formed like this:
+        :param vmId: VM UUID or None
+        :param device: either 'floppy' or 'cdrom'
+        :param payload: a dict formed like this:
             {'volId': 'volume id',   # volId is optional
              'file': {'filename': 'content', ...}}
+        :param path: payload path as a string; if not given, it will
+           be generated
         """
         funcs = {'cdrom': 'mkIsoFs', 'floppy': 'mkFloppyFs'}
         if device not in funcs:
             raise vm.VolumeError("Unsupported 'device': %s" % device)
         func = getattr(supervdsm.getProxy(), funcs[device])
-        return func(vmId, payload['file'], payload.get('volId'))
+        return func(vmId, payload['file'], payload.get('volId'), path=path)
 
     def teardownVolumePath(self, drive):
         res = {'status': doneCode}
@@ -555,22 +565,23 @@ class clientIF(object):
         return {'status': doneCode, 'alignment': aligning}
 
     def createVm(self, vmParams, vmRecover=False):
-        with self.vmContainerLock:
+        with self.vm_start_stop_lock:
             if not vmRecover:
                 if vmParams['vmId'] in self.vmContainer:
                     return errCode['exist']
             vm = Vm(self, vmParams, vmRecover)
             ret = vm.run()
             if not response.is_error(ret):
-                self.vmContainer[vm.id] = vm
+                with self.vm_container_lock:
+                    self.vmContainer[vm.id] = vm
             return ret
 
     def getAllVmStats(self):
-        return [v.getStats() for v in self.vmContainer.values()]
+        return [v.getStats() for v in self.getVMs().values()]
 
     def getAllVmIoTunePolicies(self):
         vm_io_tune_policies = {}
-        for v in self.vmContainer.values():
+        for v in self.getVMs().values():
             info = v.io_tune_policy_values()
             if info:
                 vm_io_tune_policies[v.id] = info
@@ -696,7 +707,7 @@ class clientIF(object):
     def _waitForDomainsUp(self):
         while self._enabled:
             launching = sum(int(v.lastStatus == vmstatus.WAIT_FOR_LAUNCH)
-                            for v in self.vmContainer.values())
+                            for v in self.getVMs().values())
             if not launching:
                 break
             else:
@@ -712,7 +723,7 @@ class clientIF(object):
             time.sleep(5)
 
     def _preparePathsForRecoveredVMs(self):
-        vm_objects = list(self.vmContainer.values())
+        vm_objects = list(self.getVMs().values())
         num_vm_objects = len(vm_objects)
         for idx, vm_obj in enumerate(vm_objects):
             # Let's recover as much VMs as possible

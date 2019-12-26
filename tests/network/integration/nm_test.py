@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2018 Red Hat, Inc.
+# Copyright 2016-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,8 +28,8 @@ import unittest
 from dbus.exceptions import DBusException
 
 from network.nettestlib import dummy_devices
-from network.nettestlib import requires_systemctl
 from network.nmnettestlib import iface_name, NMService, nm_connections
+from .netintegtestlib import requires_systemctl
 
 from vdsm.network.nm import networkmanager
 
@@ -58,13 +58,11 @@ def teardown_module():
 
 
 class TestNMService(unittest.TestCase):
-
     def test_network_manager_service_is_running(self):
         self.assertTrue(networkmanager.is_running())
 
 
 class TestNMConnectionCleanup(unittest.TestCase):
-
     def test_remove_all_non_active_connection_from_a_device(self):
         iface = iface_name()
         with dummy_devices(1) as nics:
@@ -94,14 +92,18 @@ class TestNMIfcfg2Connection(unittest.TestCase):
         """
         iface = iface_name()
         with dummy_devices(1) as nics:
-            with nm_connections(iface, IPV4ADDR, slaves=nics, con_count=3,
-                                save=True):
+            with nm_connections(
+                iface, IPV4ADDR, slaves=nics, con_count=3, save=True
+            ):
                 device = networkmanager.Device(iface)
-                expected_uuids = {con.connection.uuid
-                                  for con in device.connections()}
+                expected_uuids = {
+                    con.connection.uuid for con in device.connections()
+                }
 
-                actual_uuids = {networkmanager.ifcfg2connection(file)[0]
-                                for file in self._ifcfg_files()}
+                actual_uuids = {
+                    networkmanager.ifcfg2connection(file)[0]
+                    for file in self._ifcfg_files()
+                }
 
                 self.assertLessEqual(expected_uuids, actual_uuids)
 

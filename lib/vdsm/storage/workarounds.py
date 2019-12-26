@@ -27,8 +27,9 @@ from vdsm.storage import qemuimg
 
 log = logging.getLogger('storage.workarounds')
 
-# Size in blocks of the conf file generated during RAM snapshot operation.
-VM_CONF_SIZE_BLK = 20
+# Size in bytes of the conf file generated during RAM snapshot operation.
+# Engine sends value of 20 * 512 == 10240 bytes.
+VM_CONF_SIZE = 10240
 
 
 def invalid_vm_conf_disk(vol):
@@ -47,7 +48,8 @@ def invalid_vm_conf_disk(vol):
     Since VM metadata volumes with this problem may still exist in storage we
     must keep using this workaround to avoid problems with copying VM disks.
     """
-    if vol.getFormat() == sc.COW_FORMAT and vol.getSize() == VM_CONF_SIZE_BLK:
+    if (vol.getFormat() == sc.COW_FORMAT and
+            vol.getCapacity() == VM_CONF_SIZE):
         info = qemuimg.info(vol.getVolumePath())
         actual_format = info['format']
 

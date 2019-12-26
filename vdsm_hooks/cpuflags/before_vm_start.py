@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 #
 # Copyright 2017 Red Hat, Inc.
 #
@@ -18,6 +18,9 @@
 #
 # Refer to the README and COPYING files for full details of the license
 #
+
+from __future__ import absolute_import
+from __future__ import print_function
 
 '''
 VDSM cpuflags hook

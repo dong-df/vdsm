@@ -20,9 +20,14 @@
 from __future__ import absolute_import
 from __future__ import division
 
+import binascii
+import logging
 import os
 import shutil
 import tempfile
+import threading
+
+import six
 
 from contextlib import contextmanager
 
@@ -39,6 +44,8 @@ from . import qemuio
 
 from monkeypatch import MonkeyPatchScope
 
+from vdsm import utils
+from vdsm.common.units import KiB, MiB
 from vdsm.storage import blockSD
 from vdsm.storage import blockVolume
 from vdsm.storage import constants as sc
@@ -54,9 +61,10 @@ from vdsm.storage import qemuimg
 from vdsm.storage import sd
 from vdsm.storage import volume
 
+NR_PVS = 2        # The number of fake PVs we use to make a fake VG by default
+WAIT_TIMEOUT = 5  # Used for Callable event default wait timeout
 
-NR_PVS = 2       # The number of fake PVs we use to make a fake VG by default
-MB = 1024 ** 2   # Used to convert bytes to MB
+log = logging.getLogger("test")
 
 
 @contextmanager
@@ -177,7 +185,7 @@ def fake_env(storage_type, sd_version=3, data_center=None,
 
 
 @contextmanager
-def fake_volume(storage_type='file', size=MB, format=sc.RAW_FORMAT):
+def fake_volume(storage_type='file', size=MiB, format=sc.RAW_FORMAT):
     img_id = make_uuid()
     vol_id = make_uuid()
     with fake_env(storage_type) as env:
@@ -235,6 +243,9 @@ def make_sd_metadata(sduuid, version=3, dom_class=sd.DATA_DOMAIN, pools=None):
     md[sd.DMDK_VERSION] = version
     md[sd.DMDK_CLASS] = dom_class
     md[sd.DMDK_POOLS] = pools if pools is not None else [make_uuid()]
+    if version > 4:
+        md[sd.DMDK_ALIGNMENT] = sc.ALIGNMENT_1M
+        md[sd.DMDK_BLOCK_SIZE] = sc.BLOCK_SIZE_512
     return md
 
 
@@ -251,8 +262,10 @@ def make_blocksd_manifest(tmpdir, fake_lvm, sduuid=None, devices=None,
     fake_lvm.createLV(sduuid, sd.METADATA, blockSD.SD_METADATA_SIZE)
 
     # Create the rest of the special LVs
-    special = blockSD.BlockStorageDomainManifest.special_volumes(sd_version)
-    for name, size_mb in sd.SPECIAL_VOLUME_SIZES_MIB.iteritems():
+    bsd = blockSD.BlockStorageDomain
+    special = bsd.special_volumes(sd_version)
+    sizes_mb = bsd.special_volumes_size_mb(sc.ALIGNMENT_1M)
+    for name, size_mb in six.iteritems(sizes_mb):
         if name in special:
             fake_lvm.createLV(sduuid, name, size_mb)
 
@@ -275,7 +288,7 @@ def make_blocksd_manifest(tmpdir, fake_lvm, sduuid=None, devices=None,
 
 
 def get_random_devices(count=NR_PVS):
-    return ['/dev/mapper/{0}'.format(os.urandom(16).encode('hex'))
+    return ['/dev/mapper/{0}'.format(binascii.hexlify(os.urandom(16)))
             for _ in range(count)]
 
 
@@ -327,14 +340,13 @@ def make_file_volume(sd_manifest, size, imguuid, voluuid,
     for mdfile in mdfiles:
         make_file(mdfile)
 
-    size_blk = size // sc.BLOCK_SIZE
     vol_class = sd_manifest.getVolumeClass()
     vol_class.newMetadata(
         (volpath,),
         sd_manifest.sdUUID,
         imguuid,
         parent_vol_id,
-        size_blk,
+        size,
         sc.type2name(vol_format),
         sc.type2name(prealloc),
         sc.type2name(vol_type),
@@ -355,14 +367,16 @@ def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
     if not os.path.exists(imagedir):
         os.makedirs(imagedir)
 
-    size_blk = (size + sc.BLOCK_SIZE - 1) // sc.BLOCK_SIZE
     lv_size = sd_manifest.getVolumeClass().calculate_volume_alloc_size(
-        prealloc, size_blk, None)
-    lvm.createLV(sduuid, voluuid, lv_size)
+        prealloc, vol_format, size, None)
+    lv_size_mb = (utils.round(lv_size, MiB) // MiB)
+    lvm.createLV(sduuid, voluuid, lv_size_mb)
+
     # LVM may create the volume with a larger size due to extent granularity
-    lv_size_blk = int(lvm.getLV(sduuid, voluuid).size) // sc.BLOCK_SIZE
-    if lv_size_blk > size_blk:
-        size_blk = lv_size_blk
+    if vol_format == sc.RAW_FORMAT:
+        lv_size = int(lvm.getLV(sduuid, voluuid).size)
+        if lv_size > size:
+            size = lv_size
 
     if vol_format == sc.COW_FORMAT:
         volpath = lvm.lvPath(sduuid, voluuid)
@@ -382,10 +396,12 @@ def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
             f.truncate(int(lvm.getLV(sduuid, voluuid).size))
 
     with sd_manifest.acquireVolumeMetadataSlot(voluuid) as slot:
-        lvm.addtag(sduuid, voluuid, "%s%s" % (sc.TAG_PREFIX_MD, slot))
-        lvm.addtag(sduuid, voluuid, "%s%s" % (sc.TAG_PREFIX_PARENT,
-                                              parent_vol_id))
-        lvm.addtag(sduuid, voluuid, "%s%s" % (sc.TAG_PREFIX_IMAGE, imguuid))
+        add_tags = [
+            "%s%s" % (sc.TAG_PREFIX_MD, slot),
+            "%s%s" % (sc.TAG_PREFIX_PARENT, parent_vol_id),
+            "%s%s" % (sc.TAG_PREFIX_IMAGE, imguuid),
+        ]
+        lvm.changeLVsTags(sduuid, (voluuid,), addTags=add_tags)
 
     vol_class = sd_manifest.getVolumeClass()
     vol_class.newMetadata(
@@ -393,7 +409,7 @@ def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
         sduuid,
         imguuid,
         parent_vol_id,
-        size_blk,
+        size,
         sc.type2name(vol_format),
         sc.type2name(prealloc),
         sc.type2name(vol_type),
@@ -414,13 +430,13 @@ def write_qemu_chain(vol_list):
     # This allows us to verify the integrity of the whole chain.
     for i, vol in enumerate(vol_list):
         vol_fmt = sc.fmt2str(vol.getFormat())
-        offset = i * 1024
+        offset = i * KiB
         pattern = 0xf0 + i
         qemuio.write_pattern(
             vol.volumePath,
             vol_fmt,
             offset=offset,
-            len=1024,
+            len=KiB,
             pattern=pattern)
 
 
@@ -431,7 +447,7 @@ def verify_qemu_chain(vol_list):
     top_vol = vol_list[-1]
     top_vol_fmt = sc.fmt2str(top_vol.getFormat())
     for i, vol in enumerate(vol_list):
-        offset = i * 1024
+        offset = i * KiB
         pattern = 0xf0 + i
 
         # Check that the correct pattern can be read through the top volume
@@ -439,7 +455,7 @@ def verify_qemu_chain(vol_list):
             top_vol.volumePath,
             top_vol_fmt,
             offset=offset,
-            len=1024,
+            len=KiB,
             pattern=pattern)
 
         # Check the volume where the pattern was originally written
@@ -448,18 +464,18 @@ def verify_qemu_chain(vol_list):
             vol.volumePath,
             vol_fmt,
             offset=offset,
-            len=1024,
+            len=KiB,
             pattern=pattern)
 
         # Check that the next offset contains zeroes.  If we know this layer
         # has zeroes at next_offset we can be sure that data read at the same
         # offset in the next layer belongs to that layer.
-        next_offset = (i + 1) * 1024
+        next_offset = (i + 1) * KiB
         qemuio.verify_pattern(
             vol.volumePath,
             vol_fmt,
             offset=next_offset,
-            len=1024,
+            len=KiB,
             pattern=0)
 
 
@@ -525,3 +541,54 @@ class Aborting(object):
     def __call__(self):
         self.count -= 1
         return self.count < 0
+
+
+class Callable(object):
+
+    def __init__(self, hang_timeout=0, result=None):
+        self._hang_timeout = hang_timeout
+        self._result = result
+        self._running = threading.Event()
+        self._blocking = threading.Event()
+        self._done = threading.Event()
+        self.args = None
+
+    def __call__(self, args=None):
+        self.args = args
+        self._running.set()
+        log.info("callable is running")
+        if self._hang_timeout:
+            log.info("callable is hung (timeout=%s)", self._hang_timeout)
+            if not self._blocking.wait(self._hang_timeout):
+                raise RuntimeError("Timeout waiting for task switch off")
+
+        self._done.set()
+        log.info("callable is finished")
+        if isinstance(self._result, Exception):
+            raise self._result
+
+        return self._result
+
+    def finish(self, timeout=WAIT_TIMEOUT):
+        self._blocking.set()
+        log.info("finishing callable (timeout=%s)", timeout)
+        if not self._done.wait(timeout):
+            raise RuntimeError("Timeout waiting for task completion")
+
+    def wait_until_running(self, timeout=WAIT_TIMEOUT):
+        log.info("waiting for callable to run (timeout=%s)", timeout)
+        if not self._running.wait(timeout):
+            raise RuntimeError("Timeout waiting for task to start")
+
+    def was_called(self):
+        return self._running.is_set()
+
+    def is_finished(self):
+        return self._done.is_set()
+
+
+def get_umask():
+    # Note that get_umask() is not thread safe
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return current_umask

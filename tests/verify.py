@@ -44,21 +44,13 @@ class DeviceMixin(object):
                     device['specParams'].get('iommuPlaceholder', False)):
                 continue
 
-            # Graphics device is a bit specific in a sense that it doesn't
-            # have alias or address. Port or tlsPort has to be present,
-            # everything else is unrelated to graphics devices
-            if device['type'] == hwclass.GRAPHICS:
-                self.assertTrue('port' in device or 'tlsPort' in device)
-                continue
-
             # Each device has alias.
             self.assertIn('alias', device)
             aliases.append(device['alias'])
 
             # Also, each device has an address with an exception of console,
             # balloon (which we treat as "none" balloon) and possibly a hostdev
-            if device['type'] not in (hwclass.CONSOLE, hwclass.BALLOON,
-                                      hwclass.HOSTDEV):
+            if device['type'] not in (hwclass.HOSTDEV,):
                 self.assertIn('address', device)
 
             # NIC devices have an additional name and linkActive attributes

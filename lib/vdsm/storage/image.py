@@ -23,20 +23,18 @@ from __future__ import absolute_import
 import os
 import logging
 import threading
-import uuid
 from contextlib import contextmanager
 
-from vdsm import constants
 from vdsm import utils
-from vdsm import virtsparsify
 from vdsm.config import config
 from vdsm.common import cmdutils
 from vdsm.common import logutils
+from vdsm.common.marks import deprecated
 from vdsm.common.threadlocal import vars
+from vdsm.common.units import MiB
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import imageSharing
-from vdsm.storage import misc
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import sd
@@ -98,13 +96,6 @@ class Image:
             operation.run()
         self.log.debug('qemu-img operation has completed')
 
-    def deletedVolumeName(self, uuid):
-        """
-        Create REMOVED_IMAGE_PREFIX + <random> + uuid string.
-        """
-        randomStr = misc.randomStr(RENAME_RANDOM_STRING_LEN)
-        return "%s%s_%s" % (sc.REMOVED_IMAGE_PREFIX, randomStr, uuid)
-
     def estimate_qcow2_size(self, src_vol_params, dst_sd_id):
         """
         Calculate volume allocation size for converting raw/qcow2
@@ -116,7 +107,7 @@ class Image:
             dst_sd_id(str) : Destination volume storage domain id
 
         Returns:
-            Volume allocation in blocks
+            Volume allocation in bytes
         """
         # measure required size.
         qemu_measure = qemuimg.measure(
@@ -127,20 +118,20 @@ class Image:
         # Adds extra room so we don't have to extend this disk immediately
         # when a vm is started.
         chunk_size_mb = config.getint("irs", "volume_utilization_chunk_mb")
-        chunk_size = chunk_size_mb * constants.MEGAB
-        size_blk = (qemu_measure["required"] + chunk_size) // sc.BLOCK_SIZE
+        chunk_size = chunk_size_mb * MiB
+        required = (qemu_measure["required"] + chunk_size)
         # Limit estimates size by maximum size.
         vol_class = sdCache.produce(dst_sd_id).getVolumeClass()
-        max_size = vol_class.max_size(src_vol_params['size'] * sc.BLOCK_SIZE,
+        max_size = vol_class.max_size(src_vol_params['capacity'],
                                       sc.COW_FORMAT)
-        size_blk = min(size_blk, max_size // sc.BLOCK_SIZE)
+        allocation = min(required, max_size)
 
-        # Return estimated size of allocation blocks.
+        # Return estimated size of allocation.
         self.log.debug("Estimated allocation for qcow2 volume:"
-                       "%d blocks", size_blk)
-        return size_blk
+                       "%d", allocation)
+        return allocation
 
-    def estimateChainSize(self, sdUUID, imgUUID, volUUID, size):
+    def estimateChainSize(self, sdUUID, imgUUID, volUUID, capacity):
         """
         Compute an estimate of the whole chain size
         using the sum of the actual size of the chain's volumes
@@ -149,17 +140,17 @@ class Image:
         log_str = logutils.volume_chain_to_str(vol.volUUID for vol in chain)
         self.log.info("chain=%s ", log_str)
 
-        newsize = 0
+        chain_allocation = 0
         template = chain[0].getParentVolume()
         if template:
-            newsize = template.getVolumeSize()
+            chain_allocation = template.getVolumeSize()
         for vol in chain:
-            newsize += vol.getVolumeSize()
-        if newsize > size:
-            newsize = size
+            chain_allocation += vol.getVolumeSize()
+        if chain_allocation > capacity:
+            chain_allocation = capacity
         # allocate %10 more for cow metadata
-        newsize = int(newsize * sc.COW_OVERHEAD)
-        return newsize
+        chain_allocation = int(chain_allocation * sc.COW_OVERHEAD)
+        return chain_allocation
 
     def getChain(self, sdUUID, imgUUID, volUUID=None):
         """
@@ -259,7 +250,8 @@ class Image:
                 try:
                     # Create fake parent volume
                     destDom.createVolume(
-                        imgUUID=volParams['imgUUID'], size=volParams['size'],
+                        imgUUID=volParams['imgUUID'],
+                        capacity=volParams['capacity'],
                         volFormat=sc.COW_FORMAT,
                         preallocate=sc.SPARSE_VOL,
                         diskType=volParams['disktype'],
@@ -367,7 +359,7 @@ class Image:
                 # Create the dst volume
                 try:
                     # find out src volume parameters
-                    volParams = srcVol.getVolumeParams(bs=1)
+                    volParams = srcVol.getVolumeParams()
 
                     # To avoid prezeroing preallocated volumes on NFS domains
                     # we create the target as a sparse volume (since it will be
@@ -379,21 +371,22 @@ class Image:
                     else:
                         tmpVolPreallocation = sc.PREALLOCATED_VOL
 
-                    destDom.createVolume(imgUUID=imgUUID,
-                                         size=volParams['size'],
-                                         volFormat=volParams['volFormat'],
-                                         preallocate=tmpVolPreallocation,
-                                         diskType=volParams['disktype'],
-                                         volUUID=srcVol.volUUID,
-                                         desc=volParams['descr'],
-                                         srcImgUUID=pimg,
-                                         srcVolUUID=volParams['parent'])
+                    destDom.createVolume(
+                        imgUUID=imgUUID,
+                        capacity=volParams['capacity'],
+                        volFormat=volParams['volFormat'],
+                        preallocate=tmpVolPreallocation,
+                        diskType=volParams['disktype'],
+                        volUUID=srcVol.volUUID,
+                        desc=volParams['descr'],
+                        srcImgUUID=pimg,
+                        srcVolUUID=volParams['parent'])
 
                     dstVol = destDom.produceVolume(imgUUID=imgUUID,
                                                    volUUID=srcVol.volUUID)
 
                     # Extend volume (for LV only) size to the actual size
-                    dstVol.extend((volParams['apparentsize'] + 511) / 512)
+                    dstVol.extend(volParams['apparentsize'])
 
                     # Change destination volume metadata to preallocated in
                     # case we've used a sparse volume to accelerate the
@@ -552,77 +545,11 @@ class Image:
                       OP_TYPES[op], imgUUID)
         return True
 
-    def _getSparsifyVolume(self, sdUUID, imgUUID, volUUID):
-        # FIXME:
-        # sdCache.produce.produceVolume gives volumes that return getVolumePath
-        # with a colon (:) for NFS servers. So, we're using volClass().
-        # https://bugzilla.redhat.com/1128942
-        # If, and when the bug gets solved, use
-        # sdCache.produce(...).produceVolume(...) to create the volumes.
-        volClass = sdCache.produce(sdUUID).getVolumeClass()
-        return volClass(self.repoPath, sdUUID, imgUUID, volUUID)
-
-    def sparsify(self, tmpSdUUID, tmpImgUUID, tmpVolUUID, dstSdUUID,
-                 dstImgUUID, dstVolUUID):
-        """
-        Reduce sparse image size by converting free space on image to free
-        space on storage domain using virt-sparsify.
-        """
-        self.log.info("tmpSdUUID=%s, tmpImgUUID=%s, tmpVolUUID=%s, "
-                      "dstSdUUID=%s, dstImgUUID=%s, dstVolUUID=%s", tmpSdUUID,
-                      tmpImgUUID, tmpVolUUID, dstSdUUID, dstImgUUID,
-                      dstVolUUID)
-
-        tmpVolume = self._getSparsifyVolume(tmpSdUUID, tmpImgUUID, tmpVolUUID)
-        dstVolume = self._getSparsifyVolume(dstSdUUID, dstImgUUID, dstVolUUID)
-
-        if not dstVolume.isSparse():
-            raise se.VolumeNotSparse()
-
-        srcVolume = self._getSparsifyVolume(tmpSdUUID, tmpImgUUID,
-                                            tmpVolume.getParent())
-
-        tmpVolume.prepare()
-        try:
-            dstVolume.prepare()
-            try:
-                # By definition "sparsification" is implemented writing a file
-                # with zeroes as large as the entire file-system. So at least
-                # tmpVolume needs to be as large as the virtual disk size for
-                # the worst case.
-                # TODO: Some extra space may be needed for QCOW2 headers
-                tmpVolume.extend(tmpVolume.getSize())
-                # For the dstVolume we may think of an optimization where the
-                # extension is as large as the source (and at the end we
-                # shrinkToOptimalSize).
-                # TODO: Extend the dstVolume only as much as the actual size of
-                # srcVolume
-                # TODO: Some extra space may be needed for QCOW2 headers
-                dstVolume.extend(tmpVolume.getSize())
-
-                srcFormat = sc.fmt2str(srcVolume.getFormat())
-                dstFormat = sc.fmt2str(dstVolume.getFormat())
-
-                virtsparsify.sparsify(srcVolume.getVolumePath(),
-                                      tmpVolume.getVolumePath(),
-                                      dstVolume.getVolumePath(),
-                                      src_format=srcFormat,
-                                      dst_format=dstFormat)
-            except Exception:
-                self.log.exception('Unexpected error sparsifying %s',
-                                   tmpVolUUID)
-                raise se.CannotSparsifyVolume(tmpVolUUID)
-            finally:
-                dstVolume.teardown(sdUUID=dstSdUUID, volUUID=dstVolUUID)
-        finally:
-            tmpVolume.teardown(sdUUID=tmpSdUUID, volUUID=tmpVolUUID)
-
-        self._shrinkVolumeToOptimalSize(tmpVolume)
-        self._shrinkVolumeToOptimalSize(dstVolume)
-
+    @deprecated
     def cloneStructure(self, sdUUID, imgUUID, dstSdUUID):
         self._createTargetImage(sdCache.produce(dstSdUUID), sdUUID, imgUUID)
 
+    @deprecated
     def syncData(self, sdUUID, imgUUID, dstSdUUID, syncType):
         srcChain = self.getChain(sdUUID, imgUUID)
         log_str = logutils.volume_chain_to_str(vol.volUUID for vol in srcChain)
@@ -742,25 +669,31 @@ class Image:
                     dstVolFormat = volParams['volFormat']
 
                 # TODO: This is needed only when copying to qcow2-thin volume
-                # on block storage. Move into calculate_initial_size_blk.
-                dstVolAllocBlk = self.calculate_vol_alloc(
+                # on block storage. Move into calculate_initial_size.
+                dst_vol_allocation = self.calculate_vol_alloc(
                     sdUUID, volParams, dstSdUUID, dstVolFormat)
 
                 # Find out dest volume parameters
                 if preallocate in [sc.PREALLOCATED_VOL, sc.SPARSE_VOL]:
                     volParams['prealloc'] = preallocate
 
-                initialSizeBlk = self.calculate_initial_size_blk(
+                initial_size = self.calculate_initial_size(
                     destDom.supportsSparseness,
                     dstVolFormat,
                     volParams['prealloc'],
-                    dstVolAllocBlk)
+                    dst_vol_allocation)
 
-                self.log.info("Copy source %s:%s:%s to destination %s:%s:%s "
-                              "size=%s blocks, initial size=%s blocks",
-                              sdUUID, srcImgUUID, srcVolUUID, dstSdUUID,
-                              dstImgUUID, dstVolUUID, volParams['size'],
-                              initialSizeBlk)
+                self.log.info(
+                    "Copy source %s:%s:%s to destination %s:%s:%s "
+                    "capacity=%s, initial size=%s",
+                    sdUUID,
+                    srcImgUUID,
+                    srcVolUUID,
+                    dstSdUUID,
+                    dstImgUUID,
+                    dstVolUUID,
+                    volParams['capacity'],
+                    initial_size)
 
                 # If image already exists check whether it illegal/fake,
                 # overwrite it
@@ -777,7 +710,7 @@ class Image:
 
                 destDom.createVolume(
                     imgUUID=dstImgUUID,
-                    size=volParams['size'],
+                    capacity=volParams['capacity'],
                     volFormat=dstVolFormat,
                     preallocate=volParams['prealloc'],
                     diskType=volParams['disktype'],
@@ -785,7 +718,7 @@ class Image:
                     desc=descr,
                     srcImgUUID=sc.BLANK_UUID,
                     srcVolUUID=sc.BLANK_UUID,
-                    initialSize=initialSizeBlk)
+                    initial_size=initial_size)
 
                 dstVol = sdCache.produce(dstSdUUID).produceVolume(
                     imgUUID=dstImgUUID, volUUID=dstVolUUID)
@@ -852,8 +785,8 @@ class Image:
         finally:
             self.__cleanupCopy(srcVol=srcVol, dstVol=dstVol)
 
-    def calculate_initial_size_blk(self, is_file, format, prealloc,
-                                   estimate_blk):
+    def calculate_initial_size(self, is_file, format, prealloc,
+                               estimate):
         """
         Return the initial size for creating a volume during copyCollapsed.
 
@@ -861,7 +794,7 @@ class Image:
             is_file (bool): destination storage domain is file domain.
             format (int): destination volume format enum.
             prealloc (int): destination volume preallocation enum.
-            estimate_blk (int): estimated allocation in 512 blocks.
+            estimate (int): estimated allocation in bytes.
         """
         if is_file:
             # Avoid slow preallocation of raw-preallocated volumes on file
@@ -873,7 +806,7 @@ class Image:
             # volume on block storage.
             # TODO: Calculate the value here.
             if format == sc.COW_FORMAT and prealloc == sc.SPARSE_VOL:
-                return estimate_blk
+                return estimate
 
         # Otherwise no initial size is used.
         return None
@@ -891,12 +824,12 @@ class Image:
             dst_vol_format (int): One of sc.RAW_FORMAT, sc.COW_FORMAT
 
         Returns:
-            Volume allocation in blocks
+            Volume allocation in bytes
         """
         if dst_vol_format == sc.RAW_FORMAT:
             # destination 'raw'.
             # The actual volume size must be the src virtual size.
-            return src_vol_params['size']
+            return src_vol_params['capacity']
         else:
             # destination 'cow'.
             # The actual volume size can be more than virtual size
@@ -909,8 +842,10 @@ class Image:
                     if src_vol_params['prealloc'] != sc.SPARSE_VOL:
                         raise se.IncorrectFormat(self)
                     return self.estimateChainSize(
-                        src_sd_id, src_vol_params['imgUUID'],
-                        src_vol_params['volUUID'], src_vol_params['size'])
+                        src_sd_id,
+                        src_vol_params['imgUUID'],
+                        src_vol_params['volUUID'],
+                        src_vol_params['capacity'])
                 else:
                     # source 'cow' without parent.
                     # Use estimate for supporting compressed source images, for
@@ -920,278 +855,6 @@ class Image:
                 # source 'raw'.
                 # Add additional space for qcow2 metadata.
                 return self.estimate_qcow2_size(src_vol_params, dst_sd_id)
-
-    def markIllegalSubChain(self, sdDom, imgUUID, chain):
-        """
-        Mark all volumes in the sub-chain as illegal
-        """
-        if not chain:
-            raise se.InvalidParameterException("chain", str(chain))
-
-        volclass = sdDom.getVolumeClass()
-        ancestor = chain[0]
-        successor = chain[-1]
-        tmpVol = volclass(self.repoPath, sdDom.sdUUID, imgUUID, successor)
-        dstParent = volclass(self.repoPath, sdDom.sdUUID, imgUUID,
-                             ancestor).getParent()
-
-        # Mark all volumes as illegal
-        while tmpVol and dstParent != tmpVol.volUUID:
-            vol = tmpVol.getParentVolume()
-            tmpVol.setLegality(sc.ILLEGAL_VOL)
-            tmpVol = vol
-
-    def __teardownSubChain(self, sdUUID, imgUUID, chain):
-        """
-        Teardown all volumes in the sub-chain
-        """
-        if not chain:
-            raise se.InvalidParameterException("chain", str(chain))
-
-        # Teardown subchain ('ancestor' ->...-> 'successor') volumes
-        # before they will deleted.
-        # This subchain include volumes that were merged (rebased)
-        # into 'successor' and now should be deleted.
-        # We prepared all these volumes as part of preparing the whole
-        # chain before rebase, but during rebase we detached all of them from
-        # the chain and couldn't teardown they properly.
-        # So, now we must teardown them to release they resources.
-        volclass = sdCache.produce(sdUUID).getVolumeClass()
-        ancestor = chain[0]
-        successor = chain[-1]
-        srcVol = volclass(self.repoPath, sdUUID, imgUUID, successor)
-        dstParent = volclass(self.repoPath, sdUUID, imgUUID,
-                             ancestor).getParent()
-
-        while srcVol and dstParent != srcVol.volUUID:
-            try:
-                self.log.info("Teardown volume %s from image %s",
-                              srcVol.volUUID, imgUUID)
-                vol = srcVol.getParentVolume()
-                srcVol.teardown(sdUUID=srcVol.sdUUID, volUUID=srcVol.volUUID,
-                                justme=True)
-                srcVol = vol
-            except Exception:
-                self.log.info("Failure to teardown volume %s in subchain %s "
-                              "-> %s", srcVol.volUUID, ancestor, successor,
-                              exc_info=True)
-
-    def removeSubChain(self, sdDom, imgUUID, chain, postZero, discard):
-        """
-        Remove all volumes in the sub-chain
-        """
-        if not chain:
-            raise se.InvalidParameterException("chain", str(chain))
-
-        volclass = sdDom.getVolumeClass()
-        ancestor = chain[0]
-        successor = chain[-1]
-        srcVol = volclass(self.repoPath, sdDom.sdUUID, imgUUID, successor)
-        dstParent = volclass(self.repoPath, sdDom.sdUUID, imgUUID,
-                             ancestor).getParent()
-
-        while srcVol and dstParent != srcVol.volUUID:
-            self.log.info("Remove volume %s from image %s", srcVol.volUUID,
-                          imgUUID)
-            vol = srcVol.getParentVolume()
-            srcVol.delete(postZero=postZero, force=True, discard=discard)
-            chain.remove(srcVol.volUUID)
-            srcVol = vol
-
-    def _internalVolumeMerge(self, sdDom, srcVolParams, volParams, newSize,
-                             chain):
-        """
-        Merge internal volume
-        """
-        srcVol = sdDom.produceVolume(imgUUID=srcVolParams['imgUUID'],
-                                     volUUID=srcVolParams['volUUID'])
-        # Extend successor volume to new accumulated subchain size
-        srcVol.extend(newSize)
-
-        srcVol.prepare(rw=True, chainrw=True, setrw=True)
-        try:
-            backingVolPath = volume.getBackingVolumePath(
-                srcVolParams['imgUUID'], volParams['volUUID'])
-            srcVol.rebase(volParams['volUUID'], backingVolPath,
-                          volParams['volFormat'], unsafe=False, rollback=True)
-        finally:
-            srcVol.teardown(sdUUID=srcVol.sdUUID, volUUID=srcVol.volUUID)
-
-        # Prepare chain for future erase
-        chain.remove(srcVolParams['volUUID'])
-        self.__teardownSubChain(sdDom.sdUUID, srcVolParams['imgUUID'], chain)
-
-        return chain
-
-    def _baseCowVolumeMerge(self, sdDom, srcVolParams, volParams, newSize,
-                            chain, discard):
-        """
-        Merge snapshot with base COW volume
-        """
-        # FIXME!!! In this case we need workaround to rebase successor
-        # and transform it to be a base volume (without pointing to any backing
-        # volume). Actually this case should be handled by 'qemu-img rebase'
-        # (RFE to kvm). At this point we can achieve this result by 4 steps
-        # procedure:
-        # Step 1: create temporary empty volume similar to ancestor volume
-        # Step 2: Rebase (safely) successor volume on top of this temporary
-        #         volume
-        # Step 3: Rebase (unsafely) successor volume on top of "" (empty
-        #         string)
-        # Step 4: Delete temporary volume
-        srcVol = sdDom.produceVolume(imgUUID=srcVolParams['imgUUID'],
-                                     volUUID=srcVolParams['volUUID'])
-        # Extend successor volume to new accumulated subchain size
-        srcVol.extend(newSize)
-        # Step 1: Create temporary volume with destination volume's parent
-        #         parameters
-        newUUID = str(uuid.uuid4())
-        sdDom.createVolume(
-            imgUUID=srcVolParams['imgUUID'], size=volParams['size'],
-            volFormat=volParams['volFormat'], preallocate=sc.SPARSE_VOL,
-            diskType=volParams['disktype'], volUUID=newUUID,
-            desc="New base volume", srcImgUUID=sc.BLANK_UUID,
-            srcVolUUID=sc.BLANK_UUID)
-
-        tmpVol = sdDom.produceVolume(imgUUID=srcVolParams['imgUUID'],
-                                     volUUID=newUUID)
-        tmpVol.prepare(rw=True, justme=True, setrw=True)
-
-        # We should prepare/teardown volume for every single rebase.
-        # The reason is recheckIfLeaf at the end of the rebase, that change
-        # volume permissions to RO for internal volumes.
-        srcVol.prepare(rw=True, chainrw=True, setrw=True)
-        try:
-            # Step 2: Rebase successor on top of tmpVol
-            #   qemu-img rebase -b tmpBackingFile -F backingFormat -f srcFormat
-            #   src
-            backingVolPath = volume.getBackingVolumePath(
-                srcVolParams['imgUUID'], newUUID)
-            srcVol.rebase(newUUID, backingVolPath, volParams['volFormat'],
-                          unsafe=False, rollback=True)
-        finally:
-            srcVol.teardown(sdUUID=srcVol.sdUUID, volUUID=srcVol.volUUID)
-
-        srcVol.prepare(rw=True, chainrw=True, setrw=True)
-        try:
-            # Step 3: Remove pointer to backing file from the successor by
-            #         'unsafed' rebase qemu-img rebase -u -b "" -F
-            #         backingFormat -f srcFormat src
-            srcVol.rebase(sc.BLANK_UUID, "", volParams['volFormat'],
-                          unsafe=True, rollback=False)
-        finally:
-            srcVol.teardown(sdUUID=srcVol.sdUUID, volUUID=srcVol.volUUID)
-
-        # Step 4: Delete temporary volume
-        tmpVol.teardown(sdUUID=tmpVol.sdUUID, volUUID=tmpVol.volUUID,
-                        justme=True)
-        tmpVol.delete(postZero=False, force=True, discard=discard)
-
-        # Prepare chain for future erase
-        chain.remove(srcVolParams['volUUID'])
-        self.__teardownSubChain(sdDom.sdUUID, srcVolParams['imgUUID'], chain)
-
-        return chain
-
-    def _baseRawVolumeMerge(self, sdDom, srcVolParams, volParams, chain):
-        """
-        Merge snapshot with base RAW volume
-        """
-        # In this case we need convert ancestor->successor subchain to new
-        # volume and rebase successor's children (if exists) on top of it.
-        # Step 1: Create an empty volume named sucessor_MERGE similar to
-        #         ancestor volume.
-        # Step 2: qemuimg.convert successor -> sucessor_MERGE
-        # Step 3: Rename successor to _remove_me__successor
-        # Step 4: Rename successor_MERGE to successor
-        # Step 5: Unsafely rebase successor's children on top of temporary
-        #         volume
-        srcVol = chain[-1]
-        with srcVol.scopedPrepare(rw=True, chainrw=True, setrw=True):
-            # Find out successor's children list
-            chList = srcVolParams['children']
-            # Step 1: Create an empty volume named sucessor_MERGE with
-            # destination volume's parent parameters
-            newUUID = srcVol.volUUID + "_MERGE"
-            sdDom.createVolume(
-                imgUUID=srcVolParams['imgUUID'], size=srcVolParams['size'],
-                volFormat=volParams['volFormat'],
-                preallocate=volParams['prealloc'],
-                diskType=volParams['disktype'], volUUID=newUUID,
-                desc=srcVolParams['descr'], srcImgUUID=sc.BLANK_UUID,
-                srcVolUUID=sc.BLANK_UUID)
-
-            newVol = sdDom.produceVolume(imgUUID=srcVolParams['imgUUID'],
-                                         volUUID=newUUID)
-            with newVol.scopedPrepare(rw=True, justme=True, setrw=True):
-                # Step 2: Convert successor to new volume
-                #   qemu-img convert -f qcow2 successor -O raw newUUID
-                try:
-                    operation = qemuimg.convert(
-                        srcVolParams['path'],
-                        newVol.getVolumePath(),
-                        srcFormat=sc.fmt2str(srcVolParams['volFormat']),
-                        dstFormat=sc.fmt2str(volParams['volFormat']),
-                        dstQcow2Compat=sdDom.qcow2_compat(),
-                        unordered_writes=sdDom.recommends_unordered_writes(
-                            volParams['volFormat']))
-                    with utils.stopwatch("Copy volume %s"
-                                         % srcVol.volUUID):
-                        self._run_qemuimg_operation(operation)
-                except cmdutils.Error:
-                    self.log.exception('conversion failure for volume %s',
-                                       srcVol.volUUID)
-                    raise se.MergeSnapshotsError(newUUID)
-
-        if chList:
-            newVol.setInternal()
-
-        # Step 3: Rename successor as to _remove_me__successor
-        tmpUUID = self.deletedVolumeName(srcVol.volUUID)
-        srcVol.rename(tmpUUID)
-        # Step 4: Rename successor_MERGE to successor
-        newVol.rename(srcVolParams['volUUID'])
-
-        # Step 5: Rebase children 'unsafely' on top of new volume
-        #   qemu-img rebase -u -b tmpBackingFile -F backingFormat -f srcFormat
-        #   src
-        for ch in chList:
-            ch.prepare(rw=True, chainrw=True, setrw=True, force=True)
-            backingVolPath = volume.getBackingVolumePath(
-                srcVolParams['imgUUID'], srcVolParams['volUUID'])
-            try:
-                ch.rebase(srcVolParams['volUUID'], backingVolPath,
-                          volParams['volFormat'], unsafe=True, rollback=True)
-            finally:
-                ch.teardown(sdUUID=ch.sdUUID, volUUID=ch.volUUID)
-            ch.recheckIfLeaf()
-
-        # Prepare chain for future erase
-        rmChain = [vol.volUUID for
-                   vol in chain if vol.volUUID != srcVolParams['volUUID']]
-        rmChain.append(tmpUUID)
-
-        return rmChain
-
-    def subChainSizeCalc(self, ancestor, successor, vols):
-        """
-        Do not add additional calls to this function.
-
-        TODO:
-        Should be unified with chainSizeCalc,
-        but merge should be refactored,
-        but this file should probably removed.
-        """
-        chain = []
-        accumulatedChainSize = 0
-        endVolName = vols[ancestor].getParent()  # TemplateVolName or None
-        currVolName = successor
-        while (currVolName != endVolName):
-            chain.insert(0, currVolName)
-            accumulatedChainSize += vols[currVolName].getVolumeSize()
-            currVolName = vols[currVolName].getParent()
-
-        return accumulatedChainSize, chain
 
     def syncVolumeChain(self, sdUUID, imgUUID, volUUID, actualChain):
         """
@@ -1269,115 +932,6 @@ class Image:
         dom.deactivateImage(imgUUID)
         return actualVolumes
 
-    def merge(self, sdUUID, vmUUID, imgUUID, ancestor, successor, postZero,
-              discard):
-        """Merge source volume to the destination volume.
-            'successor' - source volume UUID
-            'ancestor' - destination volume UUID
-        """
-        self.log.info("sdUUID=%s vmUUID=%s imgUUID=%s ancestor=%s successor=%s"
-                      "postZero=%s discard=%s",
-                      sdUUID, vmUUID, imgUUID, ancestor, successor,
-                      str(postZero), discard)
-        sdDom = sdCache.produce(sdUUID)
-        allVols = sdDom.getAllVolumes()
-        volsImgs = sd.getVolsOfImage(allVols, imgUUID)
-        # Since image namespace should be locked is produce all the volumes is
-        # safe. Producing the (eventual) template is safe also.
-        # TODO: Split for block and file based volumes for efficiency sake.
-        vols = {}
-        for vName in volsImgs.iterkeys():
-            vols[vName] = sdDom.produceVolume(imgUUID, vName)
-
-        srcVol = vols[successor]
-        srcVolParams = srcVol.getVolumeParams()
-        srcVolParams['children'] = []
-        for vName, vol in vols.iteritems():
-            if vol.getParent() == successor:
-                srcVolParams['children'].append(vol)
-        dstVol = vols[ancestor]
-        dstParentUUID = dstVol.getParent()
-        if dstParentUUID != sd.BLANK_UUID:
-            volParams = vols[dstParentUUID].getVolumeParams()
-        else:
-            volParams = dstVol.getVolumeParams()
-
-        accSize, chain = self.subChainSizeCalc(ancestor, successor, vols)
-        imageApparentSize = volParams['size']
-        # allocate %10 more for cow metadata
-        reqSize = min(accSize, imageApparentSize) * sc.COW_OVERHEAD
-        try:
-            # Start the actual merge image procedure
-            # IMPORTANT NOTE: volumes in the same image chain might have
-            # different capacity since the introduction of the disk resize
-            # feature. This means that when we merge volumes the ancestor
-            # should get the new size from the successor (in order to be
-            # able to contain the additional data that we are collapsing).
-            if dstParentUUID != sd.BLANK_UUID:
-                # The ancestor isn't a base volume of the chain.
-                self.log.info("Internal volume merge: src = %s dst = %s",
-                              srcVol.getVolumePath(), dstVol.getVolumePath())
-                chainToRemove = self._internalVolumeMerge(
-                    sdDom, srcVolParams, volParams, reqSize, chain)
-            # The ancestor is actually a base volume of the chain.
-            # We have 2 cases here:
-            # Case 1: ancestor is a COW volume (use 'rebase' workaround)
-            # Case 2: ancestor is a RAW volume (use 'convert + rebase')
-            elif volParams['volFormat'] == sc.RAW_FORMAT:
-                self.log.info("merge with convert: src = %s dst = %s",
-                              srcVol.getVolumePath(), dstVol.getVolumePath())
-                chainToRemove = self._baseRawVolumeMerge(
-                    sdDom, srcVolParams, volParams,
-                    [vols[vName] for vName in chain])
-            else:
-                self.log.info("4 steps merge: src = %s dst = %s",
-                              srcVol.getVolumePath(), dstVol.getVolumePath())
-                chainToRemove = self._baseCowVolumeMerge(
-                    sdDom, srcVolParams, volParams, reqSize, chain, discard)
-
-            # This is unrecoverable point, clear all recoveries
-            vars.task.clearRecoveries()
-            # mark all snapshots from 'ancestor' to 'successor' as illegal
-            self.markIllegalSubChain(sdDom, imgUUID, chainToRemove)
-        except ActionStopped:
-            raise
-        except se.StorageException:
-            self.log.error("Unexpected error", exc_info=True)
-            raise
-        except Exception as e:
-            self.log.error(e, exc_info=True)
-            raise se.SourceImageActionError(imgUUID, sdUUID, str(e))
-
-        try:
-            # remove all snapshots from 'ancestor' to 'successor'
-            self.removeSubChain(sdDom, imgUUID, chainToRemove, postZero,
-                                discard)
-        except Exception:
-            self.log.error("Failure to remove subchain %s -> %s in image %s",
-                           ancestor, successor, imgUUID, exc_info=True)
-
-        newVol = sdDom.produceVolume(imgUUID=srcVolParams['imgUUID'],
-                                     volUUID=srcVolParams['volUUID'])
-        try:
-            self._shrinkVolumeToOptimalSize(newVol)
-        except cmdutils.Error:
-            self.log.warning("Auto shrink after merge failed", exc_info=True)
-
-        self.log.info("Merge src=%s with dst=%s was successfully finished.",
-                      srcVol.getVolumePath(), dstVol.getVolumePath())
-
-    def _shrinkVolumeToOptimalSize(self, vol):
-        if not vol.chunked():
-            return
-
-        vol.prepare()
-        try:
-            optimal_size = vol.optimal_size()
-        finally:
-            vol.teardown(vol.sdUUID, vol.volUUID)
-
-        vol.reduce(optimal_size // sc.BLOCK_SIZE)
-
     def _activateVolumeForImportExport(self, domain, imgUUID, volUUID=None):
         chain = self.getChain(domain.sdUUID, imgUUID, volUUID)
         log_str = logutils.volume_chain_to_str(vol.volUUID for vol in chain)
@@ -1407,7 +961,7 @@ class Image:
         vol = self._activateVolumeForImportExport(domain, imgUUID, volUUID)
         try:
             # Extend the volume (if relevant) to the image size
-            vol.extend(imageSharing.getSize(methodArgs) / sc.BLOCK_SIZE)
+            vol.extend(imageSharing.getSize(methodArgs))
             imageSharing.download(vol.getVolumePath(), methodArgs)
         finally:
             domain.deactivateImage(imgUUID)
@@ -1427,8 +981,7 @@ class Image:
         vol = self._activateVolumeForImportExport(domain, imgUUID, volUUID)
         try:
             # Extend the volume (if relevant) to the image size
-            vol.extend(imageSharing.getLengthFromArgs(methodArgs) /
-                       sc.BLOCK_SIZE)
+            vol.extend(imageSharing.getLengthFromArgs(methodArgs))
             imageSharing.copyToImage(vol.getVolumePath(), methodArgs)
         finally:
             domain.deactivateImage(imgUUID)

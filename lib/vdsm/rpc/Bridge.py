@@ -41,10 +41,10 @@ except ImportError:
 class VdsmError(Exception):
     def __init__(self, code, message):
         self.code = code
-        self.message = message
+        self.msg = message
 
     def __str__(self):
-        return '[error %d] %s' % (self.code, self.message)
+        return '[error %d] %s' % (self.code, self.msg)
 
 
 class InvalidCall(Exception):
@@ -354,12 +354,12 @@ command_info = {
     'Host_setupNetworks': {'ret': 'status'},
     'Host_setKsmTune': {'ret': 'status'},
     'Host_setHaMaintenanceMode': {'ret': 'status'},
+    'Host_echo': {'ret': 'logged'},
     'Image_cloneStructure': {'ret': 'uuid'},
     'Image_delete': {'ret': 'uuid'},
     'Image_deleteVolumes': {'ret': 'uuid'},
     'Image_getVolumes': {'ret': 'uuidlist'},
     'Image_download': {'ret': 'uuid'},
-    'Image_mergeSnapshots': {'ret': 'uuid'},
     'Image_move': {'ret': 'uuid'},
     'Image_reconcileVolumeChain': {'ret': 'volumes'},
     'Image_syncData': {'ret': 'uuid'},

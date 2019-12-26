@@ -25,7 +25,6 @@ import logging
 from contextlib import contextmanager
 
 from vdsm import utils
-from vdsm.common import cmdutils
 from vdsm.common import exception
 from vdsm.common.marks import deprecated
 from vdsm.common.threadlocal import vars
@@ -35,7 +34,6 @@ from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fileUtils
 from vdsm.storage import guarded
-from vdsm.storage import misc
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import task
@@ -170,11 +168,11 @@ class VolumeManifest(object):
         except se.MetaDataKeyNotFoundError:
             return False
 
-    def getSize(self):
-        size = int(self.getMetaParam(sc.SIZE))
-        if size < 1:  # Size stored in the metadata is not valid
+    def getCapacity(self):
+        capacity = int(self.getMetaParam(sc.CAPACITY))
+        if capacity < 1:  # Capacity stored in the metadata is not valid
             raise se.MetaDataValidationError()
-        return size
+        return capacity
 
     def getFormat(self):
         return sc.name2type(self.getMetaParam(sc.FORMAT))
@@ -220,7 +218,7 @@ class VolumeManifest(object):
             "format": meta.get(sc.FORMAT, ""),
             "disktype": meta.get(sc.DISKTYPE, ""),
             "voltype": meta.get(sc.VOLTYPE, ""),
-            "size": int(meta.get(sc.SIZE, "0")),
+            "capacity": meta.get(sc.CAPACITY, "0"),
             "parent": self.getParent(),
             "description": meta.get(sc.DESCRIPTION, ""),
             "pool": "",  # deprecated value
@@ -242,10 +240,8 @@ class VolumeManifest(object):
         try:
             meta = self.getMetadata()
             info = self.metadata2info(meta)
-            info["capacity"] = str(int(info["size"]) * sc.BLOCK_SIZE)
-            del info["size"]
             # Get the image actual size on disk
-            vsize = self.getVolumeSize(bs=1)
+            vsize = self.getVolumeSize()
             avsize = self.getVolumeTrueSize()
             info['apparentsize'] = str(vsize)
             info['truesize'] = str(avsize)
@@ -264,7 +260,7 @@ class VolumeManifest(object):
                     leaseinfo.update(leasestatus)
                 info['lease'] = leaseinfo
         except se.StorageException as e:
-            self.log.debug("exception: %s:%s" % (str(e.message), str(e.value)))
+            self.log.debug("Failed to get volume info: %s", e)
             info['apparentsize'] = "0"
             info['truesize'] = "0"
             info['status'] = "INVALID"
@@ -291,7 +287,7 @@ class VolumeManifest(object):
                             sc.fmt2str(self.getFormat()),
                             unsafe=True)
 
-    def getVolumeParams(self, bs=sc.BLOCK_SIZE):
+    def getVolumeParams(self):
         volParams = {}
         volParams['volUUID'] = self.volUUID
         volParams['imgUUID'] = self.getImage()
@@ -299,11 +295,8 @@ class VolumeManifest(object):
         volParams['disktype'] = self.getDiskType()
         volParams['prealloc'] = self.getType()
         volParams['volFormat'] = self.getFormat()
-        # TODO: getSize returns size in 512b multiples, should move all sizes
-        # to byte multiples everywhere to avoid conversion errors and change
-        # only at the end
-        volParams['size'] = self.getSize()
-        volParams['apparentsize'] = self.getVolumeSize(bs=bs)
+        volParams['capacity'] = self.getCapacity()
+        volParams['apparentsize'] = self.getVolumeSize()
         volParams['parent'] = self.getParent()
         volParams['descr'] = self.getDescription()
         volParams['legality'] = self.getLegality()
@@ -468,8 +461,14 @@ class VolumeManifest(object):
             # Note: must match setShared logic
             self.voltype = vol_attr.type
 
-    def setSize(self, size):
-        self.setMetaParam(sc.SIZE, size)
+    def setCapacity(self, capacity):
+        """
+        Sets volume capacity in bytes.
+
+        Arguments:
+                capacity (int) - new capacity value in bytes.
+        """
+        self.setMetaParam(sc.CAPACITY, capacity)
 
     def updateInvalidatedSize(self):
         """
@@ -514,7 +513,7 @@ class VolumeManifest(object):
         # will corrupt the image later when qemu try to access data beyond the
         # wrong virtual size (https://bugzilla.redhat.com/1700189).
         if capacity < virtual_size:
-            self.log.warn(
+            self.log.warning(
                 "Repairing wrong %s for volume %s stored=%d actual=%d",
                 sc.CAPACITY, self.volUUID, capacity, virtual_size)
             self.setMetaParam(sc.CAPACITY, virtual_size)
@@ -538,8 +537,8 @@ class VolumeManifest(object):
             # volume (One of metadata corruptions may be
             # previous volume deletion failure).
             # So, there is no reasons to avoid its deletion
-            self.log.warn("Volume %s metadata error (%s)",
-                          self.volUUID, str(e))
+            self.log.warning("Volume %s metadata error (%s)",
+                             self.volUUID, str(e))
         if self.getChildren():
             raise se.VolumeImageHasChildren(self)
 
@@ -548,12 +547,8 @@ class VolumeManifest(object):
         cls._putMetadata(metaId, meta)
 
     @classmethod
-    def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, size, format, type,
-                    voltype, disktype, desc="", legality=sc.ILLEGAL_VOL):
-        # TODO: VolumeMetadata now operates in bytes and we temporary
-        # convert blocks to bytes there. Needs to be fixed, when
-        # all the volume code will be converted to bytes.
-        capacity = size * sc.BLOCK_SIZE_512
+    def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, capacity, format,
+                    type, voltype, disktype, desc="", legality=sc.ILLEGAL_VOL):
         meta = VolumeMetadata(sdUUID, imgUUID, puuid, capacity, format, type,
                               voltype, disktype, desc, legality)
         cls.createMetadata(metaId, meta)
@@ -755,7 +750,7 @@ class VolumeManifest(object):
     def getImage(self):
         raise NotImplementedError
 
-    def getVolumeSize(self, bs=sc.BLOCK_SIZE):
+    def getVolumeSize(self):
         raise NotImplementedError
 
     def getVolumeTrueSize(self):
@@ -809,8 +804,8 @@ class Volume(object):
     manifestClass = VolumeManifest
 
     @classmethod
-    def _create(cls, dom, imgUUID, volUUID, size, volFormat, preallocate,
-                volParent, srcImgUUID, srcVolUUID, volPath, initialSize=None):
+    def _create(cls, dom, imgUUID, volUUID, capacity, volFormat, preallocate,
+                volParent, srcImgUUID, srcVolUUID, volPath, initial_size=None):
         raise NotImplementedError
 
     def __init__(self, repoPath, sdUUID, imgUUID, volUUID):
@@ -943,78 +938,7 @@ class Volume(object):
                     [metaID[0], str(metaID[1]), self.sdUUID, self.volUUID]))
         self.newVolumeLease(metaID, self.sdUUID, newUUID)
 
-    @classmethod
-    def rebaseVolumeRollback(cls, taskObj, sdUUID, srcImg,
-                             srcVol, dstFormat, srcParent, unsafe):
-        """
-        Rebase volume rollback
-        """
-        cls.log.info('rebase volume rollback (sdUUID=%s srcImg=%s srcVol=%s '
-                     'dstFormat=%s srcParent=%s)', sdUUID, srcImg, srcVol,
-                     dstFormat, srcParent)
-
-        imageResourcesNamespace = rm.getNamespace(sc.IMAGE_NAMESPACE, sdUUID)
-        with rm.acquireResource(imageResourcesNamespace, srcImg, rm.EXCLUSIVE):
-            vol = sdCache.produce(sdUUID).produceVolume(srcImg, srcVol)
-            vol.prepare(rw=True, chainrw=True, setrw=True)
-
-            volumePath = vol.getVolumePath()
-            backingVolPath = getBackingVolumePath(srcImg, srcParent)
-
-            operation = qemuimg.rebase(volumePath,
-                                       backingVolPath,
-                                       sc.fmt2str(vol.getFormat()),
-                                       sc.fmt2str(int(dstFormat)),
-                                       misc.parseBool(unsafe))
-            try:
-                with vars.task.abort_callback(operation.abort):
-                    operation.run()
-                vol.setParent(srcParent)
-                vol.recheckIfLeaf()
-            except cmdutils.Error as e:
-                cls.log.exception('Rollback rebase failed: %s', e)
-                raise se.MergeVolumeRollbackError(srcVol)
-            finally:
-                vol.teardown(sdUUID, srcVol)
-
-    def rebase(self, backingVol, backingVolPath, backingFormat, unsafe,
-               rollback):
-        """
-        Rebase volume on top of new backing volume
-        """
-        if rollback:
-            pvol = self.getParentVolume()
-            if not pvol:
-                self.log.warn("Can't rebase volume %s, parent missing",
-                              self.volUUID)
-                return
-
-            name = "Merge volume: " + self.volUUID
-            vars.task.pushRecovery(
-                task.Recovery(name, "volume", "Volume",
-                              "rebaseVolumeRollback",
-                              [self.sdUUID, self.getImage(),
-                                  self.volUUID, str(pvol.getFormat()),
-                                  pvol.volUUID, str(True)]))
-
-        volumePath = self.getVolumePath()
-
-        operation = qemuimg.rebase(volumePath,
-                                   backingVolPath,
-                                   sc.fmt2str(self.getFormat()),
-                                   sc.fmt2str(backingFormat),
-                                   unsafe)
-        try:
-            with vars.task.abort_callback(operation.abort):
-                operation.run()
-        except cmdutils.Error as e:
-            self.log.exception('Rebase failed: %s', e)
-            raise se.MergeSnapshotsError(self.volUUID)
-
-        self.setParent(backingVol)
-        self.recheckIfLeaf()
-
-    def clone(self, dstPath, volFormat, size_blk):
+    def clone(self, dstPath, volFormat, capacity):
         """
         Clone self volume to the specified dst_image_dir/dst_volUUID
         """
@@ -1037,7 +961,7 @@ class Volume(object):
             # hence we have to provide it.
             operation = qemuimg.create(
                 dstPath,
-                size=size_blk * sc.BLOCK_SIZE,
+                size=capacity,
                 backing=parent,
                 format=sc.fmt2str(volFormat),
                 qcow2Compat=domain.qcow2_compat(),
@@ -1135,20 +1059,35 @@ class Volume(object):
                 fileUtils.cleanupdir(imageDir)
 
     @classmethod
-    def create(cls, repoPath, sdUUID, imgUUID, size, volFormat, preallocate,
-               diskType, volUUID, desc, srcImgUUID, srcVolUUID,
-               initialSize=None):
+    def create(cls, repoPath, sdUUID, imgUUID, capacity, volFormat,
+               preallocate, diskType, volUUID, desc, srcImgUUID, srcVolUUID,
+               initial_size=None):
         """
         Create a new volume with given size or snapshot
-            'size' - in blocks
+            'capacity' - in bytes
             'volFormat' - volume format COW / RAW
             'preallocate' - Preallocate / Sparse
             'diskType' - enum (vdsm.storage.constants.VOL_DISKTYPE)
             'srcImgUUID' - source image UUID
             'srcVolUUID' - source volume UUID
-            'initialSize' - initial volume size in blocks,
-                            in case of thin provisioning
+            'initial_size' - initial volume size in bytes,
+                             in case of thin provisioning
         """
+        # Do the input values validation first.
+        if initial_size is not None:
+            if initial_size < 0:
+                cls.log.error("initial_size %d is negative", initial_size)
+                raise se.InvalidParameterException(
+                    "initial size", initial_size)
+
+        # Round size and initial size to block size. To make code simple,
+        # always round to 4k.
+        # TODO: round the value to cls.align_size so that we can remove
+        # block updating capacity for RAW volume type bellow.
+        capacity = utils.round(capacity, sc.BLOCK_SIZE_4K)
+        if initial_size is not None:
+            initial_size = utils.round(initial_size, sc.BLOCK_SIZE_4K)
+
         dom = sdCache.produce(sdUUID)
         dom.validateCreateVolumeParams(
             volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate)
@@ -1193,11 +1132,11 @@ class Volume(object):
             # Requested capacity must not be smaller then parent capacity,
             # as this will corrupt the new volume when qemu will try to
             # access areas beyond the volume virtual size.
-            parent_size = volParent.getSize()
-            if size < parent_size:
-                cls.log.error("Requested size %d < parent size %d",
-                              size, parent_size)
-                raise se.InvalidParameterException("size", size)
+            if capacity < volParent.getCapacity():
+                cls.log.error(
+                    "Requested capacity %d < parent capacity %d",
+                    capacity, volParent.getCapacity())
+                raise se.InvalidParameterException("capacity", capacity)
 
         try:
             cls.log.info("Creating volume %s", volUUID)
@@ -1218,10 +1157,10 @@ class Volume(object):
 
             # Specific volume creation (block, file, etc...)
             try:
-                metaId = cls._create(dom, imgUUID, volUUID, size, volFormat,
-                                     preallocate, volParent, srcImgUUID,
-                                     srcVolUUID, volPath,
-                                     initialSize=initialSize)
+                metaId = cls._create(dom, imgUUID, volUUID, capacity,
+                                     volFormat, preallocate, volParent,
+                                     srcImgUUID, srcVolUUID, volPath,
+                                     initial_size=initial_size)
             except (se.VolumeAlreadyExists, se.CannotCreateLogicalVolume,
                     se.VolumeCreationError, se.InvalidParameterException) as e:
                 cls.log.error("Failed to create volume %s: %s", volPath, e)
@@ -1233,27 +1172,26 @@ class Volume(object):
             # we need to update the size value so that the metadata reflects
             # the correct state.
             if volFormat == sc.RAW_FORMAT:
-                apparentSize = int(dom.getVSize(imgUUID, volUUID) /
-                                   sc.BLOCK_SIZE)
-                if apparentSize < size:
-                    cls.log.error("The volume %s apparent size %s is smaller "
-                                  "than the requested size %s",
-                                  volUUID, apparentSize, size)
+                apparent_size = dom.getVSize(imgUUID, volUUID)
+                if apparent_size < capacity:
+                    cls.log.error("The volume %s apparent size %s is "
+                                  "smaller than the requested capacity %s",
+                                  volUUID, apparent_size, capacity)
                     raise se.VolumeCreationError()
-                if apparentSize > size:
+                if apparent_size > capacity:
                     cls.log.info("The requested size for volume %s doesn't "
-                                 "match the granularity on domain %s, "
-                                 "updating the volume size from %s to %s",
-                                 volUUID, sdUUID, size, apparentSize)
-                    size = apparentSize
+                                 "match the granularity on domain %s, updating"
+                                 " the volume capacity from %s to %s",
+                                 volUUID, sdUUID, capacity, apparent_size)
+                    capacity = apparent_size
 
             vars.task.pushRecovery(
                 task.Recovery("Create volume metadata rollback", clsModule,
                               clsName, "createVolumeMetadataRollback",
-                              map(str, metaId))
+                              [str(x) for x in metaId])
             )
 
-            cls.newMetadata(metaId, sdUUID, imgUUID, srcVolUUID, size,
+            cls.newMetadata(metaId, sdUUID, imgUUID, srcVolUUID, capacity,
                             sc.type2name(volFormat), sc.type2name(preallocate),
                             volType, diskType, desc, sc.LEGAL_VOL)
 
@@ -1280,13 +1218,13 @@ class Volume(object):
     def validateDelete(self):
         self._manifest.validateDelete()
 
-    def extend(self, newsize):
+    def extend(self, new_size):
         """
         Extend the apparent size of logical volume (thin provisioning)
         """
         pass
 
-    def reduce(self, newsize, allowActive=False):
+    def reduce(self, new_size, allowActive=False):
         """
         reduce a logical volume
         """
@@ -1299,17 +1237,17 @@ class Volume(object):
                            "its format is not RAW", self.volUUID)
             return
 
-        newVolSize = self.getVolumeSize()
-        oldVolSize = self.getSize()
+        new_vol_capacity = self.getVolumeSize()
+        old_vol_capacity = self.getCapacity()
 
-        if oldVolSize == newVolSize:
-            self.log.debug("size metadata %s is up to date for volume %s",
-                           oldVolSize, self.volUUID)
+        if old_vol_capacity == new_vol_capacity:
+            self.log.debug("capacity metadata %s is up to date for volume %s",
+                           old_vol_capacity, self.volUUID)
         else:
             self.log.debug("updating metadata for volume %s changing the "
-                           "size %s to %s", self.volUUID, oldVolSize,
-                           newVolSize)
-            self.setSize(newVolSize)
+                           "capacity %s to %s", self.volUUID, old_vol_capacity,
+                           new_vol_capacity)
+            self.setCapacity(new_vol_capacity)
 
     @classmethod
     def extendSizeFinalize(cls, taskObj, sdUUID, imgUUID, volUUID):
@@ -1320,7 +1258,7 @@ class Volume(object):
         sdCache.produce(sdUUID) \
                .produceVolume(imgUUID, volUUID).syncMetadata()
 
-    def extendSize(self, newSize):
+    def extendSize(self, new_capacity):
         """
         Extend the size (virtual disk size seen by the guest) of the volume.
         """
@@ -1330,7 +1268,7 @@ class Volume(object):
         volFormat = self.getFormat()
         if volFormat == sc.COW_FORMAT:
             self.log.debug("skipping cow size extension for volume %s to "
-                           "size %s", self.volUUID, newSize)
+                           "capacity %s", self.volUUID, new_capacity)
             return
         elif volFormat != sc.RAW_FORMAT:
             raise se.IncorrectFormat(self.volUUID)
@@ -1343,27 +1281,27 @@ class Volume(object):
         if not (isBase or self.isLeaf()):
             raise se.VolumeNonWritable(self.volUUID)
 
-        curRawSize = self.getVolumeSize()
+        cur_raw_capacity = self.getVolumeSize()
 
-        if (newSize < curRawSize):
-            self.log.error("current size of volume %s is larger than the "
-                           "size requested in the extension (%s > %s)",
-                           self.volUUID, curRawSize, newSize)
-            raise se.VolumeResizeValueError(newSize)
+        if new_capacity < cur_raw_capacity:
+            self.log.error("current capacity of volume %s is larger than the "
+                           "capacity requested in the extension (%s > %s)",
+                           self.volUUID, cur_raw_capacity, new_capacity)
+            raise se.VolumeResizeValueError(new_capacity)
 
-        if (newSize == curRawSize):
-            self.log.debug("the requested size %s is equal to the current "
-                           "size %s, skipping extension", newSize,
-                           curRawSize)
+        if new_capacity == cur_raw_capacity:
+            self.log.debug("the requested capacity %s is equal to the current "
+                           "capacity %s, skipping extension", new_capacity,
+                           cur_raw_capacity)
         else:
-            self.log.info("executing a raw size extension for volume %s "
-                          "from size %s to size %s", self.volUUID,
-                          curRawSize, newSize)
+            self.log.info("executing a raw capacity extension for volume %s "
+                          "from capacity %s to capacity %s", self.volUUID,
+                          cur_raw_capacity, new_capacity)
             vars.task.pushRecovery(task.Recovery(
                 "Extend size for volume: " + self.volUUID, "volume",
                 "Volume", "extendSizeFinalize",
                 [self.sdUUID, self.imgUUID, self.volUUID]))
-            self._extendSizeRaw(newSize)
+            self._extendSizeRaw(new_capacity)
 
         self.syncMetadata()  # update the metadata
 
@@ -1398,8 +1336,8 @@ class Volume(object):
     def getVolType(self):
         return self._manifest.getVolType()
 
-    def getSize(self):
-        return self._manifest.getSize()
+    def getCapacity(self):
+        return self._manifest.getCapacity()
 
     @classmethod
     def max_size(cls, virtual_size, format):
@@ -1408,14 +1346,14 @@ class Volume(object):
     def optimal_size(self):
         return self._manifest.optimal_size()
 
-    def getVolumeSize(self, bs=sc.BLOCK_SIZE):
-        return self._manifest.getVolumeSize(bs)
+    def getVolumeSize(self):
+        return self._manifest.getVolumeSize()
 
     def getVolumeTrueSize(self):
         return self._manifest.getVolumeTrueSize()
 
-    def setSize(self, size):
-        self._manifest.setSize(size)
+    def setCapacity(self, capacity):
+        self._manifest.setCapacity(capacity)
 
     def updateInvalidatedSize(self):
         self._manifest.updateInvalidatedSize()
@@ -1459,16 +1397,6 @@ class Volume(object):
         """
         return self._manifest.recheckIfLeaf()
 
-    @contextmanager
-    def scopedPrepare(self, rw=True, justme=False, chainrw=False, setrw=False,
-                      force=False):
-        self.prepare(rw=True, justme=False, chainrw=False, setrw=False,
-                     force=False)
-        try:
-            yield self
-        finally:
-            self.teardown(self.sdUUID, self.volUUID, justme)
-
     def prepare(self, rw=True, justme=False,
                 chainrw=False, setrw=False, force=False):
         return self._manifest.prepare(rw, justme, chainrw, setrw, force)
@@ -1481,10 +1409,10 @@ class Volume(object):
         return self._manifest.metadata2info(meta)
 
     @classmethod
-    def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, size, format, type,
-                    voltype, disktype, desc="", legality=sc.ILLEGAL_VOL):
+    def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, capacity, format,
+                    type, voltype, disktype, desc="", legality=sc.ILLEGAL_VOL):
         return cls.manifestClass.newMetadata(
-            metaId, sdUUID, imgUUID, puuid, size, format, type, voltype,
+            metaId, sdUUID, imgUUID, puuid, capacity, format, type, voltype,
             disktype, desc, legality)
 
     def getInfo(self):
@@ -1529,8 +1457,8 @@ class Volume(object):
         """
         self._manifest.setMetaParam(key, value)
 
-    def getVolumeParams(self, bs=sc.BLOCK_SIZE):
-        return self._manifest.getVolumeParams(bs)
+    def getVolumeParams(self):
+        return self._manifest.getVolumeParams()
 
     def chunked(self):
         return self._manifest.chunked()

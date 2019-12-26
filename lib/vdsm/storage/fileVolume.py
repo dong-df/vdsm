@@ -25,11 +25,13 @@ import os
 
 from vdsm import constants
 from vdsm import utils
+from vdsm.common import cmdutils
+from vdsm.common import commands
 from vdsm.common import exception
-from vdsm.common.commands import grepCmd
 from vdsm.common.compat import glob_escape
 from vdsm.common.marks import deprecated
 from vdsm.common.threadlocal import vars
+from vdsm.common.units import MiB
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fallocate
@@ -45,8 +47,6 @@ from vdsm.storage.volumemetadata import VolumeMetadata
 META_FILEEXT = ".meta"
 LEASE_FILEOFFSET = 0
 
-BLOCK_SIZE = sc.BLOCK_SIZE
-
 
 def getDomUuidFromVolumePath(volPath):
     # fileVolume path has pattern:
@@ -54,6 +54,20 @@ def getDomUuidFromVolumePath(volPath):
     sdPath = os.path.normpath(volPath).rsplit('/images/', 1)[0]
     target, sdUUID = os.path.split(sdPath)
     return sdUUID
+
+
+def grep_files(pattern, paths):
+    cmd = [constants.EXT_GREP, '-E', '-H', pattern]
+    cmd.extend(paths)
+
+    try:
+        out = commands.run(cmd)
+        return out.decode("utf-8").splitlines()
+    except cmdutils.Error as e:
+        if e.rc == 1:
+            return []  # pattern not found
+        else:
+            raise
 
 
 class FileVolumeManifest(volume.VolumeManifest):
@@ -64,7 +78,7 @@ class FileVolumeManifest(volume.VolumeManifest):
     # Raw volumes should be aligned to block size, which is 512 or 4096
     # (not supported yet). qcow2 images should be aligned to cluster size
     # (64K default). To simplify, we use 1M alignment.
-    align_size = constants.MEGAB
+    align_size = MiB
 
     def __init__(self, repoPath, sdUUID, imgUUID, volUUID):
         volume.VolumeManifest.__init__(self, repoPath, sdUUID, imgUUID,
@@ -152,11 +166,13 @@ class FileVolumeManifest(volume.VolumeManifest):
         metaPath = self.getMetaVolumePath(volPath)
 
         try:
-            lines = self.oop.directReadLines(metaPath)
+            data = self.oop.readFile(metaPath, direct=True)
         except Exception as e:
             self.log.error(e, exc_info=True)
             raise se.VolumeMetadataReadError("%s: %s" % (metaId, e))
 
+        data = data.rstrip(b"\0")
+        lines = data.splitlines()
         md = VolumeMetadata.from_lines(lines)
         return md
 
@@ -175,7 +191,7 @@ class FileVolumeManifest(volume.VolumeManifest):
         metaPattern = os.path.join(glob_escape(imgDir), "*.meta")
         metaPaths = oop.getProcessPool(self.sdUUID).glob.glob(metaPattern)
         pattern = "%s.*%s" % (sc.PUUID, self.volUUID)
-        matches = grepCmd(pattern, metaPaths)
+        matches = grep_files(pattern, metaPaths)
         if matches:
             children = []
             for line in matches:
@@ -198,12 +214,12 @@ class FileVolumeManifest(volume.VolumeManifest):
         """
         return self.getVolumePath()
 
-    def getVolumeSize(self, bs=BLOCK_SIZE):
+    def getVolumeSize(self):
         """
-        Return the volume size in blocks
+        Return the volume size in bytes.
         """
         volPath = self.getVolumePath()
-        return int(int(self.oop.os.stat(volPath).st_size) / bs)
+        return self.oop.os.stat(volPath).st_size
 
     def getVolumeTrueSize(self):
         """
@@ -211,7 +227,7 @@ class FileVolumeManifest(volume.VolumeManifest):
         on underlying storage
         """
         volPath = self.getVolumePath()
-        return int(int(self.oop.os.stat(volPath).st_blocks) * BLOCK_SIZE)
+        return self.oop.os.stat(volPath).st_blocks * sc.STAT_BYTES_PER_BLOCK
 
     def setMetadata(self, meta, metaId=None, **overrides):
         """
@@ -252,10 +268,11 @@ class FileVolumeManifest(volume.VolumeManifest):
 
         data = meta.storage_format(sd.getVersion(), **overrides)
 
-        with open(metaPath + ".new", "w") as f:
-            f.write(data)
+        iop = oop.getProcessPool(meta.domain)
+        tmpFilePath = metaPath + ".new"
 
-        oop.getProcessPool(meta.domain).os.rename(metaPath + ".new", metaPath)
+        iop.writeFile(tmpFilePath, data)
+        iop.os.rename(tmpFilePath, metaPath)
 
     def setImage(self, imgUUID):
         """
@@ -292,8 +309,14 @@ class FileVolumeManifest(volume.VolumeManifest):
         leasePath = cls.leaseVolumePath(volPath)
         oop.getProcessPool(sdUUID).truncateFile(leasePath, LEASE_FILEOFFSET)
         cls.file_setrw(leasePath, rw=True)
-        sanlock.write_resource(sdUUID, volUUID, [(leasePath,
-                                                 LEASE_FILEOFFSET)])
+
+        manifest = sdCache.produce_manifest(sdUUID)
+        sanlock.write_resource(
+            sdUUID.encode("utf-8"),
+            volUUID.encode("utf-8"),
+            [(leasePath, LEASE_FILEOFFSET)],
+            align=manifest.alignment,
+            sector=manifest.block_size)
 
     def _shareLease(self, dstImgPath):
         """
@@ -373,9 +396,9 @@ class FileVolumeManifest(volume.VolumeManifest):
             the volume must be prepared when calling this helper.
         """
         if self.getFormat() == sc.RAW_FORMAT:
-            return self.getSize() * sc.BLOCK_SIZE
+            return self.getCapacity()
         else:
-            return self.getVolumeSize() * sc.BLOCK_SIZE
+            return self.getVolumeSize()
 
 
 class FileVolume(volume.Volume):
@@ -420,37 +443,28 @@ class FileVolume(volume.Volume):
             oop.getProcessPool(sdUUID).os.unlink(metaPath)
 
     @classmethod
-    def _create(cls, dom, imgUUID, volUUID, size, volFormat, preallocate,
-                volParent, srcImgUUID, srcVolUUID, volPath,
-                initialSize=None):
+    def _create(cls, dom, imgUUID, volUUID, capacity, volFormat, preallocate,
+                volParent, srcImgUUID, srcVolUUID, volPath, initial_size=None):
         """
         Class specific implementation of volumeCreate.
         """
-        # TODO: Remove _bytes when arguments to _create are fixed.
-        size_bytes = size * BLOCK_SIZE
-        if initialSize is None:
-            initial_size_bytes = None
-        else:
-            initial_size_bytes = initialSize * BLOCK_SIZE
-
         if volFormat == sc.RAW_FORMAT:
             return cls._create_raw_volume(
-                dom, volUUID, size_bytes, volPath, initial_size_bytes,
-                preallocate)
+                dom, volUUID, capacity, volPath, initial_size, preallocate)
         else:
             return cls._create_cow_volume(
-                dom, volUUID, size_bytes, volPath, initial_size_bytes,
-                volParent, imgUUID, srcImgUUID, srcVolUUID)
+                dom, volUUID, capacity, volPath, initial_size, volParent,
+                imgUUID, srcImgUUID, srcVolUUID)
 
     @classmethod
     def _create_raw_volume(
-            cls, dom, vol_id, size, vol_path, initial_size, preallocate):
+            cls, dom, vol_id, capacity, vol_path, initial_size, preallocate):
         """
         Specific implementation of _create() for RAW volumes.
         All the exceptions are properly handled and logged in volume.create()
         """
         if initial_size is None:
-            alloc_size = size
+            alloc_size = capacity
         else:
             if preallocate == sc.SPARSE_VOL:
                 cls.log.error("initial size is not supported for file-based "
@@ -458,31 +472,34 @@ class FileVolume(volume.Volume):
                 raise se.InvalidParameterException(
                     "initial size", initial_size)
 
-            if initial_size < 0 or initial_size > size:
+            if initial_size > capacity:
                 cls.log.error("initial_size %d out of range 0-%s",
-                              initial_size, size)
+                              initial_size, capacity)
                 raise se.InvalidParameterException(
                     "initial size", initial_size)
 
-            alloc_size = initial_size
+            # Always allocate at least 4k, so qemu-img can allocated the first
+            # block of the image, helping qemu to probe the alignment later.
+            alloc_size = max(initial_size, sc.BLOCK_SIZE_4K)
 
-        cls._truncate_volume(vol_path, size, vol_id, dom)
+        cls._truncate_volume(vol_path, 0, vol_id, dom)
 
-        if preallocate == sc.PREALLOCATED_VOL and alloc_size != 0:
-            cls._fallocate_volume(vol_path, alloc_size)
+        cls._allocate_volume(vol_path, alloc_size, preallocate=preallocate)
 
-        cls.log.info("Request to create RAW volume %s with size = %s bytes",
-                     vol_path, size)
+        if alloc_size < capacity:
+            qemuimg.resize(vol_path, capacity, format=qemuimg.FORMAT.RAW)
 
-        # Forcing the volume permissions in case one of the tools we use
-        # (dd, qemu-img, etc.) will mistakenly change the file permissions.
+        cls.log.info("Request to create RAW volume %s with capacity = %s",
+                     vol_path, capacity)
+
+        # Forcing volume permissions in case qemu-img changed the permissions.
         cls._set_permissions(vol_path, dom)
 
         return (vol_path,)
 
     @classmethod
     def _create_cow_volume(
-            cls, dom, vol_id, size, vol_path, initial_size, vol_parent,
+            cls, dom, vol_id, capacity, vol_path, initial_size, vol_parent,
             img_id, src_img_id, src_vol_id):
         """
         specific implementation of _create() for COW volumes.
@@ -496,21 +513,20 @@ class FileVolume(volume.Volume):
         cls._truncate_volume(vol_path, 0, vol_id, dom)
 
         if not vol_parent:
-            cls.log.info("Request to create COW volume %s with size = %s "
-                         "bytes", vol_path, size)
+            cls.log.info("Request to create COW volume %s with capacity = %s",
+                         vol_path, capacity)
 
             operation = qemuimg.create(vol_path,
-                                       size=size,
+                                       size=capacity,
                                        format=sc.fmt2str(sc.COW_FORMAT),
                                        qcow2Compat=dom.qcow2_compat())
             operation.run()
         else:
             # Create hardlink to template and its meta file
             cls.log.info("Request to create snapshot %s/%s of volume %s/%s "
-                         "with size %s (bytes)",
-                         img_id, vol_id, src_img_id, src_vol_id, size)
-            size_blk = size // BLOCK_SIZE
-            vol_parent.clone(vol_path, sc.COW_FORMAT, size_blk)
+                         "with capacity %s",
+                         img_id, vol_id, src_img_id, src_vol_id, capacity)
+            vol_parent.clone(vol_path, sc.COW_FORMAT, capacity)
 
         # Forcing the volume permissions in case one of the tools we use
         # (dd, qemu-img, etc.) will mistakenly change the file permissions.
@@ -519,10 +535,10 @@ class FileVolume(volume.Volume):
         return (vol_path,)
 
     @classmethod
-    def _truncate_volume(cls, vol_path, size, vol_id, dom):
+    def _truncate_volume(cls, vol_path, capacity, vol_id, dom):
         try:
             oop.getProcessPool(dom.sdUUID).truncateFile(
-                vol_path, size, mode=sc.FILE_VOLUME_PERMISSIONS,
+                vol_path, capacity, mode=sc.FILE_VOLUME_PERMISSIONS,
                 creatExcl=True)
         except OSError as e:
             if e.errno == errno.EEXIST:
@@ -530,9 +546,19 @@ class FileVolume(volume.Volume):
             raise
 
     @classmethod
-    def _fallocate_volume(cls, vol_path, size):
+    def _allocate_volume(cls, vol_path, size, preallocate):
+        if preallocate == sc.PREALLOCATED_VOL:
+            preallocation = qemuimg.PREALLOCATION.FALLOC
+        else:
+            preallocation = qemuimg.PREALLOCATION.OFF
+
         try:
-            operation = fallocate.allocate(vol_path, size)
+            operation = qemuimg.create(
+                vol_path,
+                size=size,
+                format=qemuimg.FORMAT.RAW,
+                preallocation=preallocation)
+
             with vars.task.abort_callback(operation.abort):
                 with utils.stopwatch("Preallocating volume %s" % vol_path):
                     operation.run()
@@ -678,7 +704,7 @@ class FileVolume(volume.Volume):
         try:
             self.oop.os.rename(prevLeasePath, leasePath)
         except OSError as e:
-            if e.errno != os.errno.ENOENT:
+            if e.errno != errno.ENOENT:
                 raise
 
         self.renameLease((volPath, LEASE_FILEOFFSET), newUUID,
@@ -695,34 +721,33 @@ class FileVolume(volume.Volume):
         # pylint: disable=no-member
         return self._manifest.getLeaseVolumePath(vol_path)
 
-    def _extendSizeRaw(self, newSize):
+    def _extendSizeRaw(self, new_capacity):
         volPath = self.getVolumePath()
-        curSizeBytes = self.oop.os.stat(volPath).st_size
-        newSizeBytes = newSize * BLOCK_SIZE
+        cur_capacity = self.oop.os.stat(volPath).st_size
 
         # No real sanity checks here, they should be included in the calling
         # function/method. We just validate the sizes to be consistent since
         # they're computed and used in the pre-allocated case.
-        if newSizeBytes == curSizeBytes:
+        if new_capacity == cur_capacity:
             return  # Nothing to do
-        elif curSizeBytes <= 0:
+        elif cur_capacity <= 0:
             raise se.StorageException(
-                "Volume size is impossible: %s" % curSizeBytes)
-        elif newSizeBytes < curSizeBytes:
-            raise se.VolumeResizeValueError(newSize)
+                "Volume capacity is impossible: %s" % cur_capacity)
+        elif new_capacity < cur_capacity:
+            raise se.VolumeResizeValueError(new_capacity)
 
         if self.getType() == sc.PREALLOCATED_VOL:
-            self.log.info("Preallocating volume %s to %s bytes",
-                          volPath, newSizeBytes)
+            self.log.info("Preallocating volume %s to %s",
+                          volPath, new_capacity)
             operation = fallocate.allocate(volPath,
-                                           newSizeBytes - curSizeBytes,
-                                           curSizeBytes)
+                                           new_capacity - cur_capacity,
+                                           cur_capacity)
             with vars.task.abort_callback(operation.abort):
                 with utils.stopwatch("Preallocating volume %s" % volPath):
                     operation.run()
         else:
             # for sparse files we can just truncate to the correct size
             # also good fallback for failed preallocation
-            self.log.info("Truncating volume %s to %s bytes",
-                          volPath, newSizeBytes)
-            self.oop.truncateFile(volPath, newSizeBytes)
+            self.log.info("Truncating volume %s to %s",
+                          volPath, new_capacity)
+            self.oop.truncateFile(volPath, new_capacity)

@@ -191,6 +191,9 @@ parameters = [
         ('fake_sriov_enable', 'false',
          'Enable reporting of fake SR-IOV devices.'),
 
+        ('dpdk_enable', 'false',
+         'Enable experimental dpdk support'),
+
         ('http_enable', 'true', 'Enable the http server'),
 
         ('enable_lldp', 'true', 'Enable LLDP'),
@@ -213,22 +216,6 @@ parameters = [
 
         ('transient_disks_repository', '@VDSMLIBDIR@/transient',  # NOQA: E501 (potentially long line)
             'Local path to the transient disks repository.'),
-
-        ('ssl_protocol', 'sslv23',
-            'SSL protocol used by encrypted connection'),
-
-        ('ssl_excludes', '',
-            'Comma separated protocol values as defined in '
-            'https://docs.python.org/2/library/ssl.html. '
-            'e.g. OP_NO_TLSv1_2 '
-            'Only TLSv1.2+ are supported (depends on underlying openssl '
-            'version).'),
-
-        ('ssl_ciphers', '',
-            'By default we use empty to use python default ciphers set. '
-            'If one is willing to use more secure ciphers one can use '
-            'HIGH or other cipher strings as defined in '
-            'https://www.openssl.org/docs/man1.0.2/apps/ciphers.html.'),
 
         ('verify_client_cert', 'false',
             'Enables whether to verify client fqdn or ip stored '
@@ -497,14 +484,6 @@ parameters = [
             'Maximum number of worker threads to serve the periodic tasks '
             'at the same time.'),
 
-        ('collectd_enable', 'false',
-            'Collect the VM samples using collectd, not using libvirt '
-            'directly.'),
-
-        ('collectd_sock_path', '/var/run/collectd-unixsock',
-            'Unix domain socket to connect to collectd (enable the '
-            'collectd "unixsock" plugin!)'),
-
         ('external_vm_lookup_interval', '60',
             'Number of seconds between lookups for external VMs.'),
     ]),
@@ -582,6 +561,13 @@ parameters = [
         ('allowed_replica_counts', '1,3',
             'Only replica 1 and 3 are supported. This configuration is for '
             'development only. Value is comma delimeted.'),
+
+        ('enable_4k_storage', 'true',
+            "Enable support for gluster storage with 4k sector size. When "
+            "set to 'true', storage sector size is detected when creating "
+            "a storage domain. When set to 'false', storage with 4k sector "
+            "size cannot be used. (default true)."),
+
     ]),
 
     # Section: [performance]

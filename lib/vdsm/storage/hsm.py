@@ -1,5 +1,5 @@
 #
-# Copyright 2009-2017 Red Hat, Inc.
+# Copyright 2009-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@
 This is the Host Storage Manager module.
 """
 from __future__ import absolute_import
+from __future__ import division
 
 import os
 import logging
@@ -32,7 +33,6 @@ from functools import partial
 import errno
 import time
 import signal
-import math
 import numbers
 import stat
 
@@ -41,14 +41,18 @@ from six.moves import map
 
 from vdsm import constants
 from vdsm import jobs
-from vdsm.common import concurrent
-from vdsm.common import function
-from vdsm.common.threadlocal import vars
+from vdsm import utils
 from vdsm.common import api
+from vdsm.common import cmdutils
+from vdsm.common import commands
+from vdsm.common import concurrent
 from vdsm.common import exception
+from vdsm.common import function
 from vdsm.common import supervdsm
 from vdsm.common.marks import deprecated
+from vdsm.common.threadlocal import vars
 from vdsm.common.time import monotonic_time
+from vdsm.common.units import MiB, GiB
 from vdsm.config import config
 from vdsm.storage import blockSD
 from vdsm.storage import clusterlock
@@ -75,15 +79,15 @@ from vdsm.storage import outOfProcess as oop
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import sd
+from vdsm.storage import securable
 from vdsm.storage import sp
 from vdsm.storage import storageServer
 from vdsm.storage import taskManager
 from vdsm.storage import udev
 from vdsm.storage import validators
 from vdsm.storage.constants import STORAGE
-from vdsm.storage.constants import BLOCK_SIZE
 from vdsm.storage.sdc import sdCache
-from vdsm.storage.spbackends import MAX_POOL_DESCRIPTION_SIZE, MAX_DOMAINS
+from vdsm.storage.spbackends import MAX_POOL_DESCRIPTION_SIZE
 from vdsm.storage.spbackends import StoragePoolDiskBackend
 from vdsm.storage.spbackends import StoragePoolMemoryBackend
 
@@ -348,7 +352,10 @@ class HSM(object):
     def getPool(cls, spUUID):
         if cls._pool.is_connected() and cls._pool.spUUID == spUUID:
             return cls._pool
-        raise se.StoragePoolUnknown(spUUID)
+
+        # Calling when pool is not connected or with wrong pool id is client
+        # error.
+        raise exception.expected(se.StoragePoolUnknown(spUUID))
 
     @classmethod
     def setPool(cls, pool):
@@ -435,16 +442,19 @@ class HSM(object):
         """
         Check lvm locking type.
         """
-        rc, out, err = misc.execCmd([constants.EXT_LVM, "dumpconfig",
-                                     "global/locking_type"],
-                                    sudo=True)
-        if rc != 0:
-            self.log.error("Can't validate lvm locking_type. %d %s %s",
-                           rc, out, err)
+        try:
+            out = commands.run(
+                [constants.EXT_LVM, "dumpconfig", "global/locking_type"],
+                sudo=True
+            )
+        except cmdutils.Error as e:
+            self.log.debug("Can't validate lvm locking_type: %s", e)
             return False
 
+        out = out.decode("utf-8").strip()
+
         try:
-            lvmLockingType = int(out[0].split('=')[1])
+            lvmLockingType = int(out.split('=')[1])
         except (ValueError, IndexError):
             self.log.error("Can't parse lvm locking_type. %s", out)
             return False
@@ -585,20 +595,31 @@ class HSM(object):
 
         if domVersion is not None:
             domVersion = int(domVersion)
-            sd.validateDomainVersion(domVersion)
+            sd.StorageDomain.validate_version(domVersion)
 
         # We validate SPM status twice - once before taking the lock, so we can
         # return immediately if the SPM was already started, and once after
         # taking the lock, in case the SPM was stopped while we were waiting
         # for the lock.
-        self.getPool(spUUID).validateNotSPM()
+
+        # Calling on the SPM is client error.
+        try:
+            self.getPool(spUUID).validateNotSPM()
+        except se.IsSpm as e:
+            raise exception.expected(e)
 
         vars.task.getExclusiveLock(STORAGE, spUUID)
         pool = self.getPool(spUUID)
         # We should actually just return true if we are SPM after lock,
         # but seeing as it would break the API with Engine,
         # it's easiest to fail.
-        pool.validateNotSPM()
+
+        # Calling on the SPM is client error.
+        try:
+            pool.validateNotSPM()
+        except se.IsSpm as e:
+            raise exception.expected(e)
+
         self._hsmSchedule("spmStart", pool.startSpm, prevID, prevLVER,
                           maxHostID, domVersion)
 
@@ -668,7 +689,7 @@ class HSM(object):
         :type imgUUID: UUID
         :param volumeUUID: The UUID of the volume you want to extend.
         :type volumeUUID: UUID
-        :param size: Target volume size in MB (desired final size, not by
+        :param size: Target volume size in bytes (desired final size, not by
                      how much to increase)
         :type size: number (anything parsable by int(size))
         :param isShuttingDown: ?
@@ -680,11 +701,16 @@ class HSM(object):
                 "spUUID=%s, sdUUID=%s, volumeUUID=%s, size=%s" %
                 (spUUID, sdUUID, volumeUUID, size)))
         size = misc.validateN(size, "size")
-        # ExtendVolume expects size in MB
-        size = math.ceil(size / 2 ** 20)
+        # ExtendVolume expects size in MiB.
+        size_mb = utils.round(size, MiB) // MiB
 
         pool = self.getPool(spUUID)
-        pool.extendVolume(sdUUID, volumeUUID, size, isShuttingDown)
+        # TODO: extendVolume should use bytes, not MiB.
+        #  When we moved from sectors to bytes we left the code using MiB.
+        #  But we should really convert all code to use bytes.
+        #  Using MiB for lvm is not correct anyway since
+        #  lvm default extent size is 4 MiB, and we use extent size of 128 MiB.
+        pool.extendVolume(sdUUID, volumeUUID, size_mb, isShuttingDown)
 
     @public
     def reduceVolume(self, spUUID, sdUUID, imgUUID, volUUID,
@@ -712,12 +738,12 @@ class HSM(object):
     @public
     def extendVolumeSize(self, spUUID, sdUUID, imgUUID, volUUID, newSize):
         pool = self.getPool(spUUID)
-        newSizeBytes = misc.validateN(newSize, "newSize")
-        newSizeBlocks = (newSizeBytes + BLOCK_SIZE - 1) / BLOCK_SIZE
+        new_capacity = misc.validateN(newSize, "newSize")
+        new_capacity = utils.round(new_capacity, sc.BLOCK_SIZE_4K)
         vars.task.getSharedLock(STORAGE, sdUUID)
         self._spmSchedule(
             spUUID, "extendVolumeSize", pool.extendVolumeSize, sdUUID,
-            imgUUID, volUUID, newSizeBlocks)
+            imgUUID, volUUID, new_capacity)
 
     @public
     def updateVolumeSize(self, spUUID, sdUUID, imgUUID, volUUID, newSize):
@@ -739,7 +765,7 @@ class HSM(object):
         if volFormat != sc.COW_FORMAT:
             # This method is used only with COW volumes (see docstring),
             # for RAW volumes we just return the volume size.
-            return dict(size=str(volToExtend.getVolumeSize(bs=1)))
+            return dict(size=str(volToExtend.getVolumeSize()))
 
         qemuImgFormat = sc.fmt2str(sc.COW_FORMAT)
 
@@ -753,17 +779,16 @@ class HSM(object):
                     newSizeBytes)
                 raise se.VolumeResizeValueError(str(newSizeBytes))
             # Uncommit the current size
-            volToExtend.setSize(0)
+            volToExtend.setCapacity(0)
             qemuimg.resize(volPath, newSizeBytes, qemuImgFormat)
-            roundedSizeBytes = qemuimg.info(volPath,
-                                            qemuImgFormat)['virtualsize']
+            virtual_size = qemuimg.info(volPath,
+                                        qemuImgFormat)['virtualsize']
         finally:
             volToExtend.teardown(sdUUID, volUUID)
 
-        volToExtend.setSize(
-            (roundedSizeBytes + BLOCK_SIZE - 1) / BLOCK_SIZE)
+        volToExtend.setCapacity(virtual_size)
 
-        return dict(size=str(roundedSizeBytes))
+        return dict(size=str(virtual_size))
 
     @public
     def extendStorageDomain(self, sdUUID, spUUID, guids,
@@ -907,18 +932,25 @@ class HSM(object):
             callback will never be called.
 
         """
-        newSize = misc.validateN(newSize, "newSize") / 2 ** 20
+        newSize = misc.validateN(newSize, "newSize")
+        newSize_mb = utils.round(newSize, MiB) // MiB
         try:
             pool = self.getPool(spUUID)
         except se.StoragePoolUnknown:
             pass
         else:
             if pool.hsmMailer:
-                pool.hsmMailer.sendExtendMsg(volDict, newSize, callbackFunc)
+                pool.hsmMailer.sendExtendMsg(volDict, newSize_mb, callbackFunc)
 
     def _spmSchedule(self, spUUID, name, func, *args):
         pool = self.getPool(spUUID)
-        pool.validateSPM()
+
+        # Calling when the host is not the SPM is a caller error.
+        try:
+            pool.validateSPM()
+        except se.SpmStatusError as e:
+            raise exception.expected(e)
+
         self.taskMng.scheduleJob("spm", pool.tasksDir, vars.task,
                                  name, func, *args)
 
@@ -983,14 +1015,6 @@ class HSM(object):
 
         if len(poolName) > MAX_POOL_DESCRIPTION_SIZE:
             raise se.StoragePoolDescriptionTooLongError()
-
-        msd = sdCache.produce(sdUUID=masterDom)
-        msdType = msd.getStorageType()
-        msdVersion = msd.getVersion()
-        if (msdType in sd.BLOCK_DOMAIN_TYPES and
-                msdVersion in blockSD.VERS_METADATA_LV and
-                len(domList) > MAX_DOMAINS):
-            raise se.TooManyDomainsInStoragePoolError()
 
         vars.task.getExclusiveLock(STORAGE, spUUID)
         for dom in sorted(domList):
@@ -1130,7 +1154,11 @@ class HSM(object):
             self.log.warning("Already disconnected from %r", spUUID)
             return
 
-        self.getPool(spUUID).validateNotSPM()
+        # Calling on the SPM is client error.
+        try:
+            self.getPool(spUUID).validateNotSPM()
+        except se.IsSpm as e:
+            raise exception.expected(e)
 
         vars.task.getExclusiveLock(STORAGE, spUUID)
         pool = self.getPool(spUUID)
@@ -1138,7 +1166,12 @@ class HSM(object):
         return self._disconnectPool(pool, hostID, remove)
 
     def _disconnectPool(self, pool, hostID, remove):
-        pool.validateNotSPM()
+        # Calling on the SPM is client error.
+        try:
+            pool.validateNotSPM()
+        except se.IsSpm as e:
+            raise exception.expected(e)
+
         with rm.acquireResource(STORAGE, HSM_DOM_MON_LOCK, rm.EXCLUSIVE):
             res = pool.disconnect()
             self.setPool(sp.DisconnectedPool())
@@ -1168,7 +1201,7 @@ class HSM(object):
 
         vars.task.getExclusiveLock(STORAGE, pool.spUUID)
         # Find out domain list from the pool metadata
-        domList = sorted(pool.getDomains().keys())
+        domList = sorted(pool.getDomains())
         for sdUUID in domList:
             vars.task.getExclusiveLock(STORAGE, sdUUID)
 
@@ -1441,9 +1474,10 @@ class HSM(object):
         dom = sdCache.produce(sdUUID=sdUUID)
         misc.validateUUID(imgUUID, 'imgUUID')
         misc.validateUUID(volUUID, 'volUUID')
-        size = misc.validateSize(size, "size")
-        if initialSize:
-            initialSize = misc.validateSize(initialSize, "initialSize")
+        capacity = misc.validateSize(size, "size")
+        initial_size = None
+        if initialSize is not None:
+            initial_size = misc.validateSize(initialSize, "initialSize")
 
         if srcImgUUID:
             misc.validateUUID(srcImgUUID, 'srcImgUUID')
@@ -1455,8 +1489,8 @@ class HSM(object):
 
         vars.task.getSharedLock(STORAGE, sdUUID)
         self._spmSchedule(spUUID, "createVolume", pool.createVolume, sdUUID,
-                          imgUUID, size, volFormat, preallocate, diskType,
-                          volUUID, desc, srcImgUUID, srcVolUUID, initialSize)
+                          imgUUID, capacity, volFormat, preallocate, diskType,
+                          volUUID, desc, srcImgUUID, srcVolUUID, initial_size)
 
     @public
     def deleteVolume(self, sdUUID, spUUID, imgUUID, volumes, postZero=False,
@@ -1504,7 +1538,7 @@ class HSM(object):
         # on data domains, images should not be deleted if they are templates
         # being used by other images.
         fakeTUUID = None
-        for k, v in volsByImg.iteritems():
+        for k, v in six.iteritems(volsByImg):
             if len(v.imgs) > 1 and v.imgs[0] == imgUUID:
                 if dom.isBackup():
                     fakeTUUID = k
@@ -1547,7 +1581,7 @@ class HSM(object):
                 (qemu_format, meta_format))
 
         # NOTE: Volume size is in blocks.
-        meta_size = vol.getSize() * sc.BLOCK_SIZE
+        meta_size = vol.getCapacity()
         qemu_size = qemu_info["virtualsize"]
         if meta_size < qemu_size:
             raise se.ImageVerificationError(
@@ -1594,19 +1628,20 @@ class HSM(object):
         # Filter volumes related to this image
         srcVolsImgs = sd.getVolsOfImage(srcAllVols, imgUUID)
         # Find the template
-        for volName, imgsPar in srcVolsImgs.iteritems():
+        for volName, imgsPar in six.iteritems(srcVolsImgs):
             if len(imgsPar.imgs) > 1:
                 # This is the template. Should be only one.
                 tName, tImgs = volName, imgsPar.imgs
                 # Template self image is the 1st entry
-                if imgUUID != tImgs[0] and tName not in dstAllVols.keys():
+                if imgUUID != tImgs[0] and tName not in dstAllVols:
                     self.log.error(
                         "img %s can't be moved to dom %s because template "
                         "%s is absent on it", imgUUID, dstDom.sdUUID, tName)
-                    e = se.ImageDoesNotExistInSD(imgUUID, dstDom.sdUUID)
-                    e.absentTemplateUUID = tName
-                    e.absentTemplateImageUUID = tImgs[0]
-                    raise e
+                    raise se.ImageDoesNotExistInSD(
+                        imgUUID,
+                        dstDom.sdUUID,
+                        tmpImgUUID=tImgs[0],
+                        tmpVolUUID=tName)
                 elif imgUUID == tImgs[0] and not srcDom.isBackup():
                     raise se.MoveTemplateImageError(imgUUID)
                 break
@@ -1640,12 +1675,9 @@ class HSM(object):
                 raise
             else:
                 # Create an ad-hoc fake template only on a backup SD
-                tName = e.absentTemplateUUID
-                tImgUUID = e.absentTemplateImageUUID
-                tParams = srcDom.produceVolume(tImgUUID,
-                                               tName).getVolumeParams()
-                image.Image(os.path.join(sc.REPO_DATA_CENTER, spUUID)
-                            ).createFakeTemplate(dstDom.sdUUID, tParams)
+                tmpVol = srcDom.produceVolume(e.tmpImgUUID, e.tmpVolUUID)
+                img = image.Image(os.path.join(sc.REPO_DATA_CENTER, spUUID))
+                img.createFakeTemplate(dstDom.sdUUID, tmpVol.getVolumeParams())
 
         domains = [srcDomUUID, dstDomUUID]
         domains.sort()
@@ -1657,25 +1689,6 @@ class HSM(object):
             spUUID, "moveImage_%s" % imgUUID, pool.moveImage, srcDomUUID,
             dstDomUUID, imgUUID, vmUUID, op, misc.parseBool(postZero),
             misc.parseBool(force), discard)
-
-    @public
-    def sparsifyImage(self, spUUID, tmpSdUUID, tmpImgUUID, tmpVolUUID,
-                      dstSdUUID, dstImgUUID, dstVolUUID):
-        """
-        Reduce sparse image size by converting free space on image to free
-        space on storage domain using virt-sparsify.
-        """
-
-        pool = self.getPool(spUUID)
-
-        sdUUIDs = sorted(set((tmpSdUUID, dstSdUUID)))
-
-        for dom in sdUUIDs:
-            vars.task.getSharedLock(STORAGE, dom)
-
-        self._spmSchedule(spUUID, "sparsifyImage", pool.sparsifyImage,
-                          tmpSdUUID, tmpImgUUID, tmpVolUUID, dstSdUUID,
-                          dstImgUUID, dstVolUUID)
 
     @public
     def cloneImageStructure(self, spUUID, sdUUID, imgUUID, dstSdUUID):
@@ -1765,6 +1778,7 @@ class HSM(object):
                           pool.downloadImageFromStream, methodArgs, callback,
                           sdUUID, imgUUID, volUUID)
 
+    @deprecated
     @public
     def copyImage(
             self, sdUUID, spUUID, vmUUID, srcImgUUID, srcVolUUID, dstImgUUID,
@@ -1856,25 +1870,6 @@ class HSM(object):
         vars.task.getSharedLock(STORAGE, sdUUID)
         return pool.reconcileVolumeChain(sdUUID, imgUUID, leafVolUUID)
 
-    @deprecated
-    @public
-    def mergeSnapshots(self, sdUUID, spUUID, vmUUID, imgUUID, ancestor,
-                       successor, postZero=False, discard=False):
-        """
-        Merge source volume to the destination volume.
-        """
-        argsStr = ("sdUUID=%s, spUUID=%s, vmUUID=%s, imgUUID=%s, "
-                   "ancestor=%s, successor=%s, postZero=%s, discard=%s" %
-                   (sdUUID, spUUID, vmUUID, imgUUID, ancestor, successor,
-                    postZero, discard))
-        vars.task.setDefaultException(se.MergeSnapshotsError("%s" % argsStr))
-        pool = self.getPool(spUUID)
-        sdCache.produce(sdUUID=sdUUID)
-        vars.task.getSharedLock(STORAGE, sdUUID)
-        self._spmSchedule(
-            spUUID, "mergeSnapshots", pool.mergeSnapshots, sdUUID, vmUUID,
-            imgUUID, ancestor, successor, misc.parseBool(postZero), discard)
-
     @public
     def reconstructMaster(self, spUUID, poolName, masterDom, domDict,
                           masterVersion, lockPolicy, lockRenewalIntervalSec,
@@ -1934,7 +1929,7 @@ class HSM(object):
 
         vars.task.getExclusiveLock(STORAGE, spUUID)
 
-        for d, status in domDict.iteritems():
+        for d, status in six.iteritems(domDict):
             misc.validateUUID(d)
             try:
                 sd.validateSDStatus(status)
@@ -2107,7 +2102,7 @@ class HSM(object):
         # TODO: remove support for string value
         force = force in (True, "true", "True")
 
-        MINIMALVGSIZE = 10 * 1024 * constants.MEGAB
+        MINIMALVGSIZE = 10 * GiB
 
         vars.task.setDefaultException(
             se.VolumeGroupCreateError(str(vgname), str(devlist)))
@@ -2132,8 +2127,8 @@ class HSM(object):
         # Minimal size check
         if size < MINIMALVGSIZE:
             raise se.VolumeGroupSizeError(
-                "VG size must be more than %s MiB" %
-                str(MINIMALVGSIZE / constants.MEGAB))
+                "VG size must be at least %s MiB" %
+                str(MINIMALVGSIZE // MiB))
 
         lvm.createVG(vgname, devices, blockSD.STORAGE_UNREADY_DOMAIN_TAG,
                      metadataSize=blockSD.VG_METADATASIZE,
@@ -2190,9 +2185,16 @@ class HSM(object):
         :options: ?
         """
         # getSharedLock(tasksResource...)
+        # Calling on non-SPM is client error.
         if not self._pool.is_connected():
-            raise se.SpmStatusError()
-        allTasksStatus = self._pool.getAllTasksStatuses()
+            raise exception.expected(se.SpmStatusError())
+
+        # Calling on non-SPM is client error.
+        try:
+            allTasksStatus = self._pool.getAllTasksStatuses()
+        except securable.SecureError:
+            raise exception.expected(se.SpmStatusError())
+
         return dict(allTasksStatus=allTasksStatus)
 
     @public
@@ -2230,9 +2232,16 @@ class HSM(object):
         :rtype: dict
         """
         # getSharedLock(tasksResource...)
+        # Calling on non-SPM is client error.
         if not self._pool.is_connected():
-            raise se.SpmStatusError()
-        allTasksInfo = self._pool.getAllTasksInfo()
+            raise exception.expected(se.SpmStatusError())
+
+        # Calling on non-SPM is client error.
+        try:
+            allTasksInfo = self._pool.getAllTasksInfo()
+        except securable.SecureError:
+            raise exception.expected(se.SpmStatusError())
+
         return dict(allTasksInfo=allTasksInfo)
 
     @public
@@ -2351,13 +2360,13 @@ class HSM(object):
         elif domType is sd.NFS_DOMAIN:
             lPath = conObj._mountCon._getLocalPath()
             self.log.debug("nfs local path: %s", lPath)
-            goop = oop.getGlobalProcPool()
+            goop = oop.getProcessPool(sc.GLOBAL_OOP)
             uuids = tuple(os.path.basename(d) for d in
                           goop.glob.glob(os.path.join(lPath, uuidPatern)))
         elif domType is sd.POSIXFS_DOMAIN:
             lPath = conObj._getLocalPath()
             self.log.debug("posix local path: %s", lPath)
-            goop = oop.getGlobalProcPool()
+            goop = oop.getProcessPool(sc.GLOBAL_OOP)
             uuids = tuple(os.path.basename(d) for d in
                           goop.glob.glob(os.path.join(lPath, uuidPatern)))
         elif domType is sd.GLUSTERFS_DOMAIN:
@@ -2514,16 +2523,16 @@ class HSM(object):
             return 0, ""
 
         if isinstance(e, mount.MountError):
-            return se.MountError.code, se.MountError.message
+            return se.MountError.code, se.MountError.msg
         if isinstance(e, iscsi.iscsiadm.IscsiAuthenticationError):
-            return se.iSCSILoginAuthError.code, se.iSCSILoginAuthError.message
+            return se.iSCSILoginAuthError.code, se.iSCSILoginAuthError.msg
         if isinstance(e, iscsi.iscsiadm.IscsiInterfaceError):
-            return se.iSCSIifaceError.code, se.iSCSIifaceError.message
+            return se.iSCSIifaceError.code, se.iSCSIifaceError.msg
         if isinstance(e, iscsi.iscsiadm.IscsiError):
-            return se.iSCSISetupError.code, se.iSCSISetupError.message
+            return se.iSCSISetupError.code, se.iSCSISetupError.msg
 
         if hasattr(e, 'code'):
-            return e.code, e.message
+            return e.code, e.msg
 
         return se.GeneralException.code, str(e)
 
@@ -2545,7 +2554,7 @@ class HSM(object):
         poolInfo = pool.getInfo()
         doms = pool.getDomains()
         domInfo = self._getDomsStats(pool.domainMonitor, doms)
-        for sdUUID in doms.iterkeys():
+        for sdUUID in doms:
             if domInfo[sdUUID]['isoprefix']:
                 poolInfo['isoprefix'] = domInfo[sdUUID]['isoprefix']
                 break
@@ -2559,7 +2568,7 @@ class HSM(object):
                             typeSpecificArg, domClass,
                             domVersion=sc.SUPPORTED_DOMAIN_VERSIONS[0],
                             block_size=sc.BLOCK_SIZE_512,
-                            max_hosts=sc.HOSTS_512_1M, options=None):
+                            max_hosts=sc.HOSTS_4K_1M, options=None):
         """
         Creates a new storage domain.
 
@@ -2581,21 +2590,18 @@ class HSM(object):
                 bigger lockspaces with 4096 block.
             options: unused
         """
-        alignment = clusterlock.alignment(block_size, max_hosts)
         msg = ("storageType=%s, sdUUID=%s, domainName=%s, "
                "domClass=%s, typeSpecificArg=%s domVersion=%s"
-               "block_size=%s, alignment=%s" %
+               "block_size=%s, max_hosts=%s" %
                (storageType, sdUUID, domainName, domClass,
-                typeSpecificArg, domVersion, block_size, alignment))
+                typeSpecificArg, domVersion, block_size, max_hosts))
         domVersion = int(domVersion)
         vars.task.setDefaultException(se.StorageDomainCreationError(msg))
         misc.validateUUID(sdUUID, 'sdUUID')
         self.validateNonDomain(sdUUID)
 
-        if domClass not in sd.DOMAIN_CLASSES.keys():
+        if domClass not in sd.DOMAIN_CLASSES:
             raise se.StorageDomainClassError()
-
-        sd.validateDomainVersion(domVersion)
 
         # getSharedLock(connectionsResource...)
         # getExclusiveLock(sdUUID...)
@@ -2610,14 +2616,21 @@ class HSM(object):
         else:
             raise se.StorageDomainTypeError(storageType)
 
-        newSD = create(sdUUID, domainName, domClass, typeSpecificArg,
-                       storageType, domVersion, block_size, alignment)
+        newSD = create(
+            sdUUID,
+            domainName,
+            domClass,
+            typeSpecificArg,
+            storageType,
+            domVersion,
+            block_size=block_size,
+            max_hosts=max_hosts)
 
         findMethod = self._getSDTypeFindMethod(storageType)
         sdCache.knownSDs[sdUUID] = findMethod
         self.log.debug("knownSDs: {%s}", ", ".join("%s: %s.%s" %
                        (k, v.__module__, v.__name__)
-                       for k, v in sdCache.knownSDs.iteritems()))
+                       for k, v in six.iteritems(sdCache.knownSDs)))
 
         sdCache.manuallyAddDomain(newSD)
 
@@ -2680,7 +2693,7 @@ class HSM(object):
         except se.StoragePoolNotConnected:
             pass
         else:
-            if sdUUID in domDict.keys():
+            if sdUUID in domDict:
                 raise se.CannotFormatStorageDomainInConnectedPool(sdUUID)
 
         # For domains that attached to disconnected pool, format domain if
@@ -2789,8 +2802,7 @@ class HSM(object):
             remotePath = fileUtils.normalize_path(remotePath)
             local_path = fileUtils.transformPath(remotePath)
         if spUUID and spUUID != sc.BLANK_UUID:
-            domList = self.getPool(spUUID).getDomains()
-            domains = domList.keys()
+            domains = list(self.getPool(spUUID).getDomains())
         else:
             # getSharedLock(connectionsResource...)
             domains = sdCache.getUUIDs()
@@ -3057,21 +3069,17 @@ class HSM(object):
         """
         # Return string because xmlrpc's "int" is very limited
         dom = sdCache.produce(sdUUID=sdUUID)
-        apparentsize = str(dom.getVSize(imgUUID, volUUID))
-        truesize = str(dom.getVAllocSize(imgUUID, volUUID))
-        return dict(apparentsize=apparentsize, truesize=truesize)
+        size = dom.getVolumeSize(imgUUID, volUUID)
+        return dict(
+            apparentsize=str(size.apparentsize),
+            truesize=str(size.truesize))
 
     @public
     def setVolumeSize(self, sdUUID, spUUID, imgUUID, volUUID, capacity):
         capacity = int(capacity)
         vol = sdCache.produce(sdUUID).produceVolume(imgUUID, volUUID)
-        # Values lower than 1 are used to uncommit (marking as inconsisent
-        # during a transaction) the volume size.
-        if capacity > 0:
-            blocks = (capacity + BLOCK_SIZE - 1) / BLOCK_SIZE
-        else:
-            blocks = capacity
-        vol.setSize(blocks)
+        capacity = utils.round(capacity, sc.BLOCK_SIZE_4K)
+        vol.setCapacity(capacity)
 
     @public
     def getVolumeInfo(self, sdUUID, spUUID, imgUUID, volUUID, options=None):
@@ -3190,7 +3198,7 @@ class HSM(object):
         dom = sdCache.produce(sdUUID)
         allVols = dom.getAllVolumes()
         # Filter volumes related to this image
-        imgVolumes = sd.getVolsOfImage(allVols, imgUUID).keys()
+        imgVolumes = list(sd.getVolsOfImage(allVols, imgUUID))
 
         if leafUUID not in imgVolumes:
             raise se.VolumeDoesNotExist(leafUUID)
@@ -3280,9 +3288,9 @@ class HSM(object):
         dom = sdCache.produce(sdUUID=sdUUID)
         vols = dom.getAllVolumes()
         if imgUUID == sc.BLANK_UUID:
-            volUUIDs = vols.keys()
+            volUUIDs = list(vols)
         else:
-            volUUIDs = [k for k, v in vols.iteritems() if imgUUID in v.imgs]
+            volUUIDs = [k for k, v in six.iteritems(vols) if imgUUID in v.imgs]
         return dict(uuidlist=volUUIDs)
 
     @public
@@ -3324,7 +3332,7 @@ class HSM(object):
         vars.task.getSharedLock(STORAGE, spUUID)
         pool = self.getPool(spUUID)
         # Find out domain list from the pool metadata
-        activeDoms = sorted(pool.getDomains(activeOnly=True).keys())
+        activeDoms = sorted(pool.getDomains(activeOnly=True))
         imgDomains = []
         for sdUUID in activeDoms:
             dom = sdCache.produce(sdUUID=sdUUID)
@@ -3361,7 +3369,7 @@ class HSM(object):
             try:
                 if self._pool.spmMailer:
                     self._pool.spmMailer.stop()
-                    self._pool.spmMailer.tp.joinAll(waitForTasks=False)
+                    self._pool.spmMailer.tp.joinAll()
 
                 if self._pool.hsmMailer:
                     self._pool.hsmMailer.stop()
@@ -3412,31 +3420,6 @@ class HSM(object):
         misc.killall(lockCmd, signal.SIGKILL, group=True)
 
     @public
-    def fenceSpmStorage(self, spUUID, lastOwner, lastLver, options=None):
-        """
-        Fences the SPM via the storage. ?
-        Right now it just clears the owner and last ver fields.
-
-        :param spUUID: The UUID of the storage pool you want to modify.
-        :type spUUID: UUID
-        :param lastOwner: obsolete
-        :param lastLver: obsolete
-        :param options: ?
-
-        :returns: a dict containing the spms state?
-        :rtype: dict
-        """
-        vars.task.setDefaultException(
-            se.SpmFenceError("spUUID=%s, lastOwner=%s, lastLver=%s" %
-                             (spUUID, lastOwner, lastLver)))
-        pool = self.getPool(spUUID)
-        if isinstance(pool.getBackend(), StoragePoolDiskBackend):
-            pool.getBackend().invalidateMetadata()
-            vars.task.getExclusiveLock(STORAGE, spUUID)
-            pool.getBackend().forceFreeSpm()
-        return dict(spm_st=self._getSpmStatusInfo(pool))
-
-    @public
     def upgradeStoragePool(self, spUUID, targetDomVersion):
         targetDomVersion = int(targetDomVersion)
         # This lock has to be mutual with the pool metadata operations (like
@@ -3450,7 +3433,7 @@ class HSM(object):
         domInfo = {}
         repoStats = self._getRepoStats(domainMonitor)
 
-        for sdUUID, sdStatus in doms.iteritems():
+        for sdUUID, sdStatus in six.iteritems(doms):
             # Return statistics for active domains only
             domInfo[sdUUID] = {'status': sdStatus, 'alerts': [],
                                'isoprefix': ''}
@@ -3470,7 +3453,7 @@ class HSM(object):
             if not repoStats[sdUUID]['mdavalid']:
                 domInfo[sdUUID]['alerts'].append({
                     'code': se.SmallVgMetadata.code,
-                    'message': se.SmallVgMetadata.message,
+                    'message': se.SmallVgMetadata.msg,
                 })
                 self.log.warning("VG %s's metadata size too small %s",
                                  sdUUID, repoStats[sdUUID]['mdasize'])
@@ -3478,7 +3461,7 @@ class HSM(object):
             if not repoStats[sdUUID]['mdathreshold']:
                 domInfo[sdUUID]['alerts'].append({
                     'code': se.VgMetadataCriticallyFull.code,
-                    'message': se.VgMetadataCriticallyFull.message,
+                    'message': se.VgMetadataCriticallyFull.msg,
                 })
                 self.log.warning("VG %s's metadata size exceeded critical "
                                  "size: mdasize=%s mdafree=%s", sdUUID,
@@ -3748,4 +3731,5 @@ class HSM(object):
 
     def _check_pool_connected(self):
         if not self._pool.is_connected():
-            raise se.StoragePoolNotConnected
+            # Calling when pool is not connected is client error.
+            raise exception.expected(se.StoragePoolNotConnected())

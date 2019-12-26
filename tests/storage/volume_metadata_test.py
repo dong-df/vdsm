@@ -77,11 +77,12 @@ def make_md_dict(**kwargs):
 
 def make_lines(**kwargs):
     data = make_md_dict(**kwargs)
-
-    lines = ['EOF']
+    # Emulate "key=value" lines read from VolumeMD storage as bytes
+    lines = [b'EOF']
     for k, v in data.items():
         if v is not None:
-            lines.insert(0, "%s=%s" % (k, v))
+            line = ("%s=%s" % (k, v)).encode("utf-8")
+            lines.insert(0, line)
     return lines
 
 
@@ -98,7 +99,6 @@ class TestVolumeMetadata:
             IMAGE=params['image'],
             LEGALITY=params['legality'],
             PUUID=params['puuid'],
-            SIZE=str(params['capacity'] // sc.BLOCK_SIZE_512),
             CAP=str(params['capacity']),
             TYPE=params['type'],
             VOLTYPE=params['voltype'],
@@ -128,7 +128,7 @@ class TestVolumeMetadata:
             TYPE=%(type)s
             VOLTYPE=%(voltype)s
             EOF
-            """ % expected_params)
+            """ % expected_params).encode("utf-8")
         md = volume.VolumeMetadata(**params)
         assert expected == md.storage_format(4)
 
@@ -148,17 +148,16 @@ class TestVolumeMetadata:
             TYPE=%(type)s
             VOLTYPE=%(voltype)s
             EOF
-            """ % params)
+            """ % params).encode("utf-8")
         md = volume.VolumeMetadata(**params)
         assert expected == md.storage_format(5)
 
     def test_storage_format_overrides(self):
         params = make_init_params()
         md = volume.VolumeMetadata(**params)
-        capacity = md.size * sc.BLOCK_SIZE_512
-        data = md.storage_format(4, CAP=capacity)
-        assert "SIZE=%s\n" % md.size in data
-        assert "CAP=%s\n" % capacity in data
+        data = md.storage_format(4, CAP=md.capacity).decode("utf-8")
+        assert "SIZE=%s\n" % str(int(md.capacity) // sc.BLOCK_SIZE_512) in data
+        assert "CAP=%s\n" % md.capacity in data
 
     @pytest.mark.parametrize("param", ['capacity', 'ctime'])
     def test_int_params_str_raises(self, param):
@@ -220,8 +219,8 @@ class TestVolumeMetadata:
         data = make_init_params()
         md = volume.VolumeMetadata(**data)
         lines = md.storage_format(5).splitlines()
-        lines.remove("CAP=1073741824")
-        lines.insert(0, "SIZE=4096")
+        lines.remove(b"CAP=1073741824")
+        lines.insert(0, b"SIZE=4096")
 
         md = volume.VolumeMetadata.from_lines(lines)
         assert md.capacity == 2 * MB
@@ -230,7 +229,7 @@ class TestVolumeMetadata:
         data = make_init_params()
         md = volume.VolumeMetadata(**data)
         lines = md.storage_format(5).splitlines()
-        lines.remove("CAP=1073741824")
+        lines.remove(b"CAP=1073741824")
 
         with pytest.raises(se.MetaDataKeyNotFoundError):
             volume.VolumeMetadata.from_lines(lines)
@@ -240,7 +239,6 @@ class TestVolumeMetadata:
         md = volume.VolumeMetadata.from_lines(lines)
         assert sc.DEFAULT_GENERATION == md.generation
 
-    @pytest.mark.xfail(six.PY3, reason="bytes handled incorrectly")
     def test_cleared_metadata(self):
         lines = CLEARED_VOLUME_METADATA.rstrip(b"\0").splitlines()
         with pytest.raises(se.MetadataCleared):
@@ -391,37 +389,6 @@ class TestDictInterface:
         assert md[sc.DESCRIPTION] == params['description']
         md[sc.DESCRIPTION] = "New description"
         assert "New description" == md[sc.DESCRIPTION]
-
-    def test_size(self):
-        # SIZE in blocks is legacy option, make sure setting and getting SIZE
-        # works when we replace it with CAP in bytes.
-        params = make_init_params()
-        size_blk = params['capacity'] // sc.BLOCK_SIZE_512
-        md = volume.VolumeMetadata(**params)
-        new_size_blk = size_blk * 2
-        md[sc.SIZE] = new_size_blk
-        assert md[sc.SIZE] == str(new_size_blk)
-
-    def test_size_capacity(self):
-        params = make_init_params()
-        size_blk = params['capacity'] // sc.BLOCK_SIZE_512
-        md = volume.VolumeMetadata(**params)
-        new_size_blk = size_blk * 2
-        md[sc.SIZE] = new_size_blk
-        assert md.capacity == new_size_blk * sc.BLOCK_SIZE_512
-
-    def test_capacity_size(self):
-        params = make_init_params()
-        md = volume.VolumeMetadata(**params)
-        new_capacity = md.capacity * 2
-        md.capacity = new_capacity
-        assert md.size == new_capacity // sc.BLOCK_SIZE_512
-
-    def test_size_integer(self):
-        params = make_init_params()
-        md = volume.VolumeMetadata(**params)
-        with pytest.raises(AssertionError):
-            md.size = "fail"
 
     def test_get_nonexistent(self):
         params = make_init_params()

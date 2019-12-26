@@ -33,40 +33,31 @@ import errno
 import itertools
 import logging
 import os
-import random
 import re
-import string
 import struct
 import threading
 import uuid
 import weakref
 
-from functools import wraps, partial
+import six
 
-from six.moves import map
-from six.moves import queue
+from functools import wraps, partial
 
 from vdsm import constants
 from vdsm.common import commands
 from vdsm.common import concurrent
 from vdsm.common import logutils
 from vdsm.common import proc
+from vdsm.common.units import KiB, MiB, GiB, TiB
 
 from vdsm.storage import exception as se
-from vdsm.storage.constants import BLOCK_SIZE
 
 IOUSER = "vdsm"
 DIRECTFLAG = "direct"
 STR_UUID_SIZE = 36
 UUID_HYPHENS = [8, 13, 18, 23]
-MEGA = 1 << 20
-UNLIMITED_THREADS = -1
 
 log = logging.getLogger('storage.Misc')
-
-
-def namedtuple2dict(nt):
-    return dict(map(lambda f: (f, getattr(nt, f)), nt._fields))
 
 
 execCmdLogger = logging.getLogger('storage.Misc.excCmd')
@@ -98,7 +89,7 @@ def readblock(name, offset, size):
         raise se.MiscBlockReadException(name, offset, size)
 
     left = size
-    ret = ""
+    ret = bytearray()
     baseoffset = offset
 
     while left > 0:
@@ -140,31 +131,27 @@ def validateDDBytes(ddstderr, size):
 
 
 def _alignData(length, offset):
-    iounit = MEGA
+    iounit = MiB
     count = length
     iooffset = offset
 
     # Keep small IOps in single shot if possible
-    if (length < MEGA) and (offset % length == 0) and (length % 512 == 0):
+    if (length < MiB) and (offset % length == 0) and (length % 512 == 0):
         # IO can be direct + single shot
         count = 1
         iounit = length
-        iooffset = offset / iounit
+        iooffset = offset // iounit
         return (iounit, count, iooffset)
 
     # Compute largest chunk possible up to 1M for IO
     while iounit > 1:
         if (length >= iounit) and (offset % iounit == 0):
-            count = length / iounit
-            iooffset = offset / iounit
+            count = length // iounit
+            iooffset = offset // iounit
             break
         iounit = iounit >> 1
 
     return (iounit, count, iooffset)
-
-
-def randomStr(strLen):
-    return "".join(random.sample(string.letters, strLen))
 
 
 def parseBool(var):
@@ -235,20 +222,18 @@ def validateN(number, name):
     return n
 
 
-def validateSize(size, name):
+def validateSize(capacity, name):
     """
-    Validate number of bytes as string and convert to number of blocks,
-    rounding up to next blocks.
+    Validate number of bytes as string.
 
     Raises InvalidParameterException if value is not a string or if it could
     not be converted to integer.
     """
-    if not isinstance(size, basestring):
+    if not isinstance(capacity, six.string_types):
         log.error("Number of blocks as int is not supported, use size in "
                   "bytes as string")
-        raise se.InvalidParameterException("size", size)
-    size = validateN(size, name)
-    return (size + BLOCK_SIZE - 1) / BLOCK_SIZE
+        raise se.InvalidParameterException(name, capacity)
+    return validateN(capacity, name)
 
 
 def parseHumanReadableSize(size):
@@ -262,19 +247,19 @@ def parseHumanReadableSize(size):
 
     if size.endswith("T"):
         if size[:-1].isdigit():
-            return int(size[:-1]) << 40
+            return int(size[:-1]) * TiB
 
     if size.endswith("G"):
         if size[:-1].isdigit():
-            return int(size[:-1]) << 30
+            return int(size[:-1]) * GiB
 
     if size.endswith("M"):
         if size[:-1].isdigit():
-            return int(size[:-1]) << 20
+            return int(size[:-1]) * MiB
 
     if size.endswith("K"):
         if size[:-1].isdigit():
-            return int(size[:-1]) << 10
+            return int(size[:-1]) * KiB
 
     # Failing all the above we'd better just return 0
     return 0
@@ -486,63 +471,11 @@ def killall(name, signum, group=False):
         raise exception
 
 
-def itmap(func, iterable, maxthreads=UNLIMITED_THREADS):
-    """
-    Make an iterator that computes the function using
-    arguments from the iterable. It works similar to tmap
-    by running each operation in a different thread, this
-    causes the results not to return in any particular
-    order so it's good if you don't care about the order
-    of the results.
-    maxthreads stands for maximum threads that we can initiate simultaneosly.
-               If we reached to max threads the function waits for thread to
-               finish before initiate the next one.
-    """
-    if maxthreads < 1 and maxthreads != UNLIMITED_THREADS:
-        raise ValueError("Wrong input to function itmap: %s", maxthreads)
-
-    respQueue = queue.Queue()
-
-    def wrapper(value):
-        try:
-            respQueue.put(func(value))
-        except Exception as e:
-            respQueue.put(e)
-
-    threadsCreated = 0
-    threadsCount = 0
-    for arg in iterable:
-        if maxthreads != UNLIMITED_THREADS:
-            if maxthreads == 0:
-                # This not supposed to happened. If it does, it's a bug.
-                # maxthreads should get to 0 only after threadsCount is
-                # greater than 1
-                if threadsCount < 1:
-                    raise RuntimeError("No thread initiated")
-                else:
-                    yield respQueue.get()
-                    # if yield returns one thread stopped, so we can run
-                    # another thread in queue
-                    maxthreads += 1
-                    threadsCount -= 1
-
-        name = "itmap/%d" % threadsCreated
-        t = concurrent.thread(wrapper, args=(arg,), name=name)
-        t.start()
-        threadsCreated += 1
-        threadsCount += 1
-        maxthreads -= 1
-
-    # waiting for rest threads to end
-    for i in range(threadsCount):
-        yield respQueue.get()
-
-
 def isAscii(s):
     try:
-        s.decode('ascii')
+        s.encode('ascii')
         return True
-    except (UnicodeDecodeError, UnicodeEncodeError):
+    except UnicodeEncodeError:
         return False
 
 

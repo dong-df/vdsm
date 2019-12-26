@@ -1,5 +1,5 @@
 #
-# Copyright 2017 Red Hat, Inc.
+# Copyright 2017-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,9 +26,9 @@ import logging
 
 from vdsm.common import xmlutils
 from vdsm.virt.vmdevices import common
-from vdsm.virt.vmdevices import core
 from vdsm.virt.vmdevices import drivename
 from vdsm.virt.vmdevices import hwclass
+from vdsm.virt.vmdevices import lease
 from vdsm.virt.vmdevices import network
 from vdsm.virt.vmdevices import storage
 from vdsm.virt.vmdevices import storagexml
@@ -791,7 +791,9 @@ class SaveDeviceMetadataTests(XMLTestCase):
 
     def test_device_no_metadata(self):
         dev_map = common.empty_dev_map()
-        dev_map[hwclass.SOUND].append(core.Sound(self.log))
+        dev_map[hwclass.LEASE].append(lease.Device(
+            self.log, lease_id='l', sd_id='s', path='p', offset='0')
+        )
         common.save_device_metadata(self.md_desc, dev_map, self.log)
         self.assertXMLEqual(self.md_desc.to_xml(), self.EMPTY_XML)
 

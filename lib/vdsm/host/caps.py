@@ -24,20 +24,6 @@ from __future__ import division
 import os
 import logging
 
-import libvirt
-
-from vdsm.common import cache
-from vdsm.common import cpuarch
-from vdsm.common import dsaversion
-from vdsm.common import hooks
-from vdsm.common import hostdev
-from vdsm.common import supervdsm
-from vdsm.config import config
-from vdsm.host import rngsources
-from vdsm.storage import constants as sc
-from vdsm.storage import exception as se
-from vdsm.storage import hba
-from vdsm.storage import managedvolume
 from vdsm import cpuinfo
 from vdsm import host
 from vdsm import hugepages
@@ -45,6 +31,22 @@ from vdsm import machinetype
 from vdsm import numa
 from vdsm import osinfo
 from vdsm import utils
+from vdsm.common import cache
+from vdsm.common import commands
+from vdsm.common import cpuarch
+from vdsm.common import dsaversion
+from vdsm.common import hooks
+from vdsm.common import hostdev
+from vdsm.common import libvirtconnection
+from vdsm.common import supervdsm
+from vdsm.common import xmlutils
+from vdsm.config import config
+from vdsm.host import rngsources
+from vdsm.storage import backends
+from vdsm.storage import constants as sc
+from vdsm.storage import exception as se
+from vdsm.storage import hba
+from vdsm.storage import managedvolume
 
 try:
     import ovirt_hosted_engine_ha.client.client as haClient
@@ -88,10 +90,9 @@ def get():
     caps['onlineCpus'] = ','.join(cpu_topology.online_cpus)
     caps['cpuSpeed'] = cpuinfo.frequency()
     caps['cpuModel'] = cpuinfo.model()
-    caps['cpuFlags'] = ','.join(cpuinfo.flags() +
-                                machinetype.compatible_cpu_models())
+    caps['cpuFlags'] = ','.join(_getFlagsAndFeatures())
 
-    caps.update(_getVersionInfo())
+    caps.update(dsaversion.version_info)
 
     net_caps = supervdsm.getProxy().network_caps()
     caps.update(net_caps)
@@ -143,6 +144,9 @@ def get():
     caps['kernelFeatures'] = osinfo.kernel_features()
     caps['vncEncrypted'] = _isVncEncrypted()
     caps['backupEnabled'] = False
+    caps['fipsEnabled'] = _getFipsEnabled()
+    caps['tscFrequency'] = _getTscFrequency()
+    caps['tscScaling'] = _getTscScaling()
 
     try:
         caps["connector_info"] = managedvolume.connector_info()
@@ -154,45 +158,9 @@ def get():
     # Which domain versions are supported by this host.
     caps["domain_versions"] = sc.DOMAIN_VERSIONS
 
+    caps["supported_block_size"] = backends.supported_block_size()
+
     return caps
-
-
-def _dropVersion(vstring, logMessage):
-    logging.error(logMessage)
-
-    from distutils import version
-    # Drop cluster supported version to be strictly less than given vstring.
-    info = dsaversion.version_info.copy()
-    maxVer = version.StrictVersion(vstring)
-    info['clusterLevels'] = [ver for ver in info['clusterLevels']
-                             if version.StrictVersion(ver) < maxVer]
-    return info
-
-
-@cache.memoized
-def _getVersionInfo():
-    if not hasattr(libvirt, 'VIR_MIGRATE_ABORT_ON_ERROR'):
-        return _dropVersion('3.4',
-                            'VIR_MIGRATE_ABORT_ON_ERROR not found in libvirt,'
-                            ' support for clusterLevel >= 3.4 is disabled.'
-                            ' For Fedora 19 users, please consider upgrading'
-                            ' libvirt from the virt-preview repository')
-
-    if not hasattr(libvirt, 'VIR_MIGRATE_AUTO_CONVERGE'):
-        return _dropVersion('3.6',
-                            'VIR_MIGRATE_AUTO_CONVERGE not found in libvirt,'
-                            ' support for clusterLevel >= 3.6 is disabled.'
-                            ' For Fedora 20 users, please consider upgrading'
-                            ' libvirt from the virt-preview repository')
-
-    if not hasattr(libvirt, 'VIR_MIGRATE_COMPRESSED'):
-        return _dropVersion('3.6',
-                            'VIR_MIGRATE_COMPRESSED not found in libvirt,'
-                            ' support for clusterLevel >= 3.6 is disabled.'
-                            ' For Fedora 20 users, please consider upgrading'
-                            ' libvirt from the virt-preview repository')
-
-    return dsaversion.version_info
 
 
 def _isHostedEngineDeployed():
@@ -222,3 +190,63 @@ def _isVncEncrypted():
         logging.error("Supervdsm was not able to read VNC TLS config. "
                       "Check supervdsmd log for details.")
     return False
+
+
+@cache.memoized
+def _getTscFrequency():
+    """
+    Read TSC Frequency from libvirt. This is only available in
+    libvirt >= 5.5.0 (and 4.5.0-21 for RHEL7)
+    """
+    conn = libvirtconnection.get()
+    caps = xmlutils.fromstring(conn.getCapabilities())
+    counter = caps.findall("./host/cpu/counter[@name='tsc']")
+    if len(counter) > 0:
+        # Libvirt reports frequency in Hz, cut off last six digits to get MHz
+        return counter[0].get('frequency')[:-6]
+    logging.debug('No TSC counter returned by Libvirt')
+    return ""
+
+
+def _getFipsEnabled():
+    """
+    Read FIPS status using sysctl
+    """
+    SYSCTL_FIPS_COMMAND = ["/usr/sbin/sysctl", "crypto.fips_enabled"],
+
+    try:
+        output = commands.run(*SYSCTL_FIPS_COMMAND)
+        enabled = output.split(b'=')[1].strip()
+        return enabled == b'1'
+    except Exception as e:
+        logging.error("Could not read FIPS status with sysctl: %s", e)
+        return False
+
+
+def _getTscScaling():
+    """
+    Read TSC Scaling from libvirt. This is only available in
+    libvirt >= 5.5.0 (and 4.5.0-21 for RHEL7)
+    """
+    conn = libvirtconnection.get()
+    caps = xmlutils.fromstring(conn.getCapabilities())
+    counter = caps.findall("./host/cpu/counter[@name='tsc']")
+    if len(counter) > 0:
+        return counter[0].get('scaling') == 'yes'
+    logging.debug('No TSC counter returned by Libvirt')
+    return False
+
+
+def _getFlagsAndFeatures():
+    """
+    Read CPU flags from cpuinfo and CPU features from domcapabilities,
+    and combine them into a single list.
+    """
+    # We need to use both flags (cpuinfo.flags()) and domcapabilites
+    # (machinetype.cpu_features) because they return different sets
+    # of flags (domcapabilities also return the content of
+    # arch_capabilities). The sets overlap, so we convert
+    # list -> set -> list to remove duplicates.
+    flags_and_features = list(set(cpuinfo.flags() +
+                                  machinetype.cpu_features()))
+    return flags_and_features + machinetype.compatible_cpu_models()

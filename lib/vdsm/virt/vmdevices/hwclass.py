@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2017 Red Hat, Inc.
+# Copyright 2014-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,20 +24,8 @@ from __future__ import division
 
 DISK = 'disk'
 NIC = 'interface'
-VIDEO = 'video'
 GRAPHICS = 'graphics'
-SOUND = 'sound'
-CONTROLLER = 'controller'
-GENERAL = 'general'
-BALLOON = 'balloon'
-REDIR = 'redir'
-RNG = 'rng'
-WATCHDOG = 'watchdog'
-CONSOLE = 'console'
-SMARTCARD = 'smartcard'
-TPM = 'tpm'
 HOSTDEV = 'hostdev'
-MEMORY = 'memory'
 LEASE = 'lease'
 
 
@@ -50,4 +38,4 @@ TO_REFRESH = (
     NIC,  # needed by many network-related hooks (vmfex, ovn)
 )
 
-HOTPLUGGABLE = (DISK, NIC, HOSTDEV, MEMORY, LEASE,)
+HOTPLUGGABLE = (DISK, NIC, HOSTDEV, LEASE,)

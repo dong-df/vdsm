@@ -24,6 +24,8 @@ import logging
 import threading
 import time
 
+import six
+
 from vdsm import utils
 from vdsm.common import concurrent
 from vdsm.config import config
@@ -151,7 +153,7 @@ class DomainMonitor(object):
 
     @property
     def domains(self):
-        return self._monitors.keys()
+        return list(self._monitors)
 
     @property
     def poolDomains(self):
@@ -203,7 +205,7 @@ class DomainMonitor(object):
 
     def getHostStatus(self, domains):
         status = {}
-        for sdUUID, hostId in domains.iteritems():
+        for sdUUID, hostId in list(six.iteritems(domains)):
             try:
                 monitor = self._monitors[sdUUID]
             except KeyError:
@@ -221,7 +223,7 @@ class DomainMonitor(object):
         id. To stop monitors and release the host id, use stopMonitoring().
         """
         log.info("Shutting down domain monitors")
-        self._stopMonitors(self._monitors.values(), shutdown=True)
+        self._stopMonitors(list(self._monitors.values()), shutdown=True)
         self._checker.stop()
 
     def _stopMonitors(self, monitors, shutdown=False):

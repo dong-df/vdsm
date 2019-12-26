@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2018 Red Hat, Inc.
+# Copyright 2008-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,7 +17,7 @@
 #
 # Refer to the README and COPYING files for full details of the license
 #
-TOX_MIN_VERSION = 2.9.1
+TOX_MIN_VERSION = 3.14
 
 # We don't want the standard gnu file setup (README, INSTALL, etc.)
 AUTOMAKE_OPTIONS = foreign
@@ -64,6 +64,14 @@ CLEANFILES = \
 	$(DIST_ARCHIVES) \
 	$(NULL)
 
+PYLINT_TARGETS = \
+	static/usr/bin/vdsm-tool \
+	static/usr/share/vdsm/sitecustomize.py \
+	lib/vdsm \
+	lib/vdsmclient \
+	lib/yajsonrpc \
+	$(NULL)
+
 .PHONY: gitignore
 gitignore:
 	@echo "Checking that .in files are ignored..."
@@ -77,14 +85,7 @@ gitignore:
 .PHONY: pylint
 pylint: tox
 	tox -e pylint \
-		static/usr/share/vdsm/sitecustomize.py \
-		lib/vdsm \
-		lib/vdsmclient \
-		lib/yajsonrpc \
-		$(NULL)
-
-pylint-py3k: tox
-	tox -e pylint-py3k `build-aux/pylint-py3k-whitelist`
+		$(PYLINT_TARGETS)
 
 execcmd:
 	! git --no-pager grep execCmd `git ls-files | grep -v -F -f execcmd-blacklist.txt`
@@ -95,13 +96,12 @@ pylint-diff: tox
 	modules=`git diff-tree --no-commit-id --name-only -r HEAD | egrep '\.py$$'`; \
 	if [ -n "$$modules" ]; then tox -e pylint $$modules; fi
 
-.PHONY: flake8
 flake8: tox
 	tox -e flake8
 
-.PHONY: imports
-imports: tox
-	tox -e imports
+.PHONY: black
+black: tox
+	tox -e black
 
 .PHONY: tox
 tox:
@@ -112,7 +112,7 @@ tox:
 		exit 1; \
 	fi; \
 	version=`echo $$out | cut -d' ' -f1`; \
-	if $(VDSM_TARGET_PY_VERSION) build-aux/vercmp $$version $(TOX_MIN_VERSION); then \
+	if build-aux/vercmp $$version $(TOX_MIN_VERSION); then \
 		echo "Error: tox is too old, please install tox \
 		$(TOX_MIN_VERSION) or later"; \
 		exit 1; \
@@ -133,21 +133,15 @@ check-unit:
 	$(MAKE) -C tests/ check NOSE_EVAL_ATTR="type=='unit'"
 
 .PHONY: lint
-# Note: dependencies ordered by time needed to run them
-lint: gitignore execcmd imports flake8 pylint-py3k pylint
-
-.PHONY: tests-target
-tests-target: tests-$(VDSM_TARGET_PY_SHORT_VERSION)
-
-.PHONY: tests-all
-tests-all: $(VDSM_SUPPORTED_PY_SHORT_VERSIONS:%=tests-%)
+lint: gitignore execcmd black flake8 pylint
 
 .PHONY: tests
-tests: tests-all
+tests: tox
+	tox -e "tests,storage,lib,network,virt,gluster"
 
-# To run tests for specific interpreter version use i.e. 'make tests-py36'
-tests-%: tox
-	tox -e "{tests,storage,lib,network,virt}-$(@:tests-%=%)"
+.PHONY: storage
+storage:
+	python3 tests/storage/userstorage.py setup
 
 all-local: \
 	vdsm.spec
@@ -160,10 +154,21 @@ srpm: dist
 
 rpm: dist
 	rpmbuild -ta $(if $(BUILDID),--define="extra_release .$(BUILDID)") \
+		--define="qemu_user $(QEMUUSER)" \
+		--define="qemu_group $(QEMUGROUP)" \
+		--define="with_ovirt_imageio $(OVIRT_IMAGEIO)" \
+		--define="with_ovirt_vmconsole $(OVIRT_VMCONSOLE)" \
+		--define="with_gluster_mgmt $(GLUSTER_MGMT)" \
+		--define="with_hooks $(HOOKS)" \
+		--define="with_vhostmd $(VHOSTMD)" \
+		--define="with_openvswitch $(OPENVSWITCH)" \
+		--define="target_py py3" \
+		--define="vdsm_version $(PACKAGE_VERSION)" \
+		--define="vdsm_release $(PACKAGE_RELEASE)" \
 		$(DIST_ARCHIVES)
 
-dist-hook: gen-VERSION gen-ChangeLog fix-python-shebangs
-.PHONY: gen-VERSION gen-ChangeLog fix-python-shebangs
+dist-hook: gen-VERSION gen-ChangeLog
+.PHONY: gen-VERSION gen-ChangeLog
 
 # Generate the ChangeLog file and insert it into the directory
 # we're about to use to create a tarball.
@@ -182,8 +187,3 @@ gen-VERSION:
 	  rm -f $(distdir)/VERSION;				\
 	  mv $(distdir)/ve-t $(distdir)/VERSION;		\
 	fi
-
-fix-python-shebangs:
-	cd $(distdir); \
-	sed -i 's+#!/usr/bin/python[23]\?+#!/usr/bin/$(VDSM_TARGET_PY_MAJOR_VERSION)+' \
-		`$(abs_top_srcdir)/build-aux/list-all-python-files`;

@@ -21,12 +21,11 @@
 # Autoconf initialization
 AC_INIT([vdsm],
         [m4_esyscmd([build-aux/pkg-version --version])],
-        [vdsm-devel@lists.fedorahosted.org])
+        [devel@ovirt.org])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CANONICAL_HOST
 
 m4_include([m4/ax_python_module.m4])
-m4_include([m4/vdsm_python_helpers.m4])
 
 # Package release
 AC_ARG_ENABLE(
@@ -62,32 +61,7 @@ AM_INIT_AUTOMAKE([-Wno-portability])
 # Checking for build tools
 AC_PROG_LN_S
 
-TARGET_PYTHON_VERSION="python2.7"
-CHECKED_PYTHON_VERSIONS="python2.7 python3"
-
-AS_IF([test -n "${with_target_python}"],
-    AS_IF([test "${with_target_python}" = "yes" -o "${with_target_python}" = "no"],
-        [AC_MSG_ERROR(['--with-target-python' option needs a value i.e. '--with-target-python=python3'])],
-        [TARGET_PYTHON_VERSION="${with_target_python}"]
-    )
-)
-
-AS_IF([test -n "${with_only_python}"],
-    AS_IF([test "${with_only_python}" = "yes" -o "${with_only_python}" = "no"],
-        [AC_MSG_ERROR(['--with-only-python' option needs a value i.e. '--with-only-python=python3'])], [
-            TARGET_PYTHON_VERSION="${with_only_python}"
-            CHECKED_PYTHON_VERSIONS="${with_only_python}"
-        ]
-    )
-)
-
-VDSM_CHECK_PY_VERSIONS([${TARGET_PYTHON_VERSION}], [${CHECKED_PYTHON_VERSIONS}])
-
-AS_IF([test z"${enable_python3}" = "zno"],
-      VDSM_DISABLE_PY3_VERSIONS)
-
-AS_IF([test z"${enable_python2}" = "zno"],
-      VDSM_DISABLE_PY2_VERSIONS)
+AM_PATH_PYTHON([3])
 
 AC_ARG_ENABLE(
     [hooks],
@@ -115,34 +89,6 @@ AC_ARG_ENABLE(
 AS_IF([test "${enable_vhostmd}" = "yes"],
       AC_SUBST([VHOSTMD], ['1']),
       AC_SUBST([VHOSTMD], ['0']))
-
-AC_ARG_WITH(
-    [target-python],
-    [AS_HELP_STRING([--with-target-python=pythonX.Y],
-                    [use 'pythonX.Y' interpreter to build RPMs])]
-)
-
-AC_ARG_WITH(
-    [only-python],
-    [AS_HELP_STRING([--with-only-python=pythonX.Y],
-                    [use 'pythonX.Y' as the target and the only supported interpreter version])]
-)
-
-AC_ARG_ENABLE(
-    [python2],
-    [AS_HELP_STRING(
-        [--disable-python2],
-        [disable support for version 2 Python interpreters]
-    )]
-)
-
-AC_ARG_ENABLE(
-    [python3],
-    [AS_HELP_STRING(
-        [--disable-python3],
-        [disable support for version 3 Python interpreters]
-    )]
-)
 
 AC_ARG_ENABLE(
     [gluster-mgmt],
@@ -342,29 +288,10 @@ AC_SUBST([vdsmtestsdir], ['${datarootdir}/vdsm/tests'])
 # VDSM service
 AC_SUBST([SERVICE_STOP_TIMEOUT], ['10'])
 
-# SMBIOS names
-AC_ARG_WITH(
-    [smbios-manufacturer],
-    [AS_HELP_STRING([--with-smbios-manufacturer=NAME],
-                    [SMBIOS manufacturer name @<:@default=oVirt@:>@])],
-    [SMBIOS_MANUFACTURER="${withval}"],
-    [SMBIOS_MANUFACTURER="oVirt"])
-AC_SUBST([SMBIOS_MANUFACTURER])
-
-AC_ARG_WITH(
-    [smbios-osname],
-    [AS_HELP_STRING([--with-smbios-osname=NAME],
-                    [SMBIOS OS name @<:@default=oVirt Node@:>@])],
-    [SMBIOS_OSNAME="${withval}"],
-    [SMBIOS_OSNAME="oVirt Node"])
-AC_SUBST([SMBIOS_OSNAME])
-
 AC_SUBST([VMCON_USER],ovirt-vmconsole)
 AC_SUBST([VMCON_GROUP],ovirt-vmconsole)
 
 configure_flags="--with-data-center=$vdsmrepo\
- --with-smbios-manufacturer=$SMBIOS_MANUFACTURER\
- '--with-smbios-osname=$SMBIOS_OSNAME'\
  --with-polkitdir=$polkitdir"
 if test "$enable_timestamp" == "yes"; then
     configure_flags+=" --enable-timestamp"
@@ -374,18 +301,6 @@ if test "$HOOKS" == "1"; then
 fi
 if test "$GLUSTER_MGMT" == "0"; then
     configure_flags+=" --disable-gluster-mgmt"
-fi
-if test z"$enable_python2" = "zno"; then
-    configure_flags+=" --disable-python2"
-fi
-if test z"$enable_python3" = "zno"; then
-    configure_flags+=" --disable-python3"
-fi
-if test -n "$with_target_python"; then
-    configure_flags+=" --with-target-python=$with_target_python"
-fi
-if test -n "$with_only_python"; then
-    configure_flags+=" --with-only-python=$with_only_python"
 fi
 if test "$OVIRT_IMAGEIO" == "0"; then
     configure_flags+=" --disable-ovirt-imageio"
@@ -403,17 +318,11 @@ fi
 
 AC_SUBST([CONFIGURE_FLAGS], ["$configure_flags"])
 
-for _py_major_version in ${VDSM_SUPPORTED_PY_MAJOR_VERSIONS}; do
-    AX_PYTHON_MODULE([libvirt], [fatal], ${_py_major_version})
-    AX_PYTHON_MODULE([netaddr], [fatal], ${_py_major_version})
-    AX_PYTHON_MODULE([six], [fatal], ${_py_major_version})
-done
+AX_PYTHON_MODULE([six], [fatal], python3)
 
-# Checking for pythonX-devel, we need it only
-# for the version of the interpreter we're targeting
-AC_PATH_PROG([PYTHON_CONFIG], ["${VDSM_TARGET_PY_MAJOR_VERSION}-config"])
+AC_PATH_PROG([PYTHON_CONFIG], ["python3-config"])
 if test "x$PYTHON_CONFIG" = "x"; then
-  AC_MSG_ERROR([${VDSM_TARGET_PY_MAJOR_VERSION}-devel not found, please install it.])
+  AC_MSG_ERROR([python3-devel not found, please install it.])
 fi
 
 # External programs (sorted, please keep in order)
@@ -422,7 +331,6 @@ AC_PATH_PROG([CHCON_PATH], [chcon], [/bin/chcon])
 AC_PATH_PROG([CHMOD_PATH], [chmod], [/bin/chmod])
 AC_PATH_PROG([CHOWN_PATH], [chown], [/bin/chown])
 AC_PATH_PROG([DD_PATH], [dd], [/bin/dd])
-AC_PATH_PROG([DMIDECODE_PATH], [dmidecode], [/usr/sbin/dmidecode])
 AC_PATH_PROG([DMSETUP_PATH], [dmsetup], [/sbin/dmsetup])
 AC_PATH_PROG([FSCK_PATH], [fsck], [/sbin/fsck])
 AC_PATH_PROG([FENCE_AGENT_PATH], [fence_ilo], [/usr/sbin/fence_ilo])
@@ -472,7 +380,7 @@ AC_OUTPUT([
 	init/Makefile
 	init/systemd/Makefile
 	lib/Makefile
-	lib/sos/Makefile
+        lib/dnf-plugins/Makefile
 	lib/vdsm/Makefile
 	lib/vdsm/api/Makefile
 	lib/vdsm/common/Makefile
@@ -517,23 +425,6 @@ AC_OUTPUT([
 	lib/yajsonrpc/Makefile
 	static/Makefile
 	tests/Makefile
-	tests/common/Makefile
-	tests/cpuinfo/Makefile
-	tests/devices/Makefile
-	tests/devices/data/Makefile
-	tests/devices/parsing/Makefile
-	tests/functional/Makefile
-	tests/integration/Makefile
-	tests/network/Makefile
-	tests/network/functional/Makefile
-	tests/network/integration/Makefile
-	tests/network/integration/ovs/Makefile
-	tests/network/unit/Makefile
-	tests/network/unit/ovs/Makefile
-	tests/network/static/Makefile
-	tests/storage/Makefile
-	tests/virt/Makefile
-	tests/virt/data/Makefile
 	vdsm_hooks/Makefile
 	vdsm_hooks/allocate_net/Makefile
 	vdsm_hooks/boot_hostdev/Makefile
@@ -548,20 +439,15 @@ AC_OUTPUT([
 	vdsm_hooks/faqemu/Makefile
 	vdsm_hooks/fcoe/Makefile
 	vdsm_hooks/fileinject/Makefile
-	vdsm_hooks/floppy/Makefile
 	vdsm_hooks/httpsisoboot/Makefile
 	vdsm_hooks/localdisk/Makefile
 	vdsm_hooks/macbind/Makefile
 	vdsm_hooks/nestedvt/Makefile
-	vdsm_hooks/numa/Makefile
 	vdsm_hooks/openstacknet/Makefile
-	vdsm_hooks/pincpu/Makefile
-	vdsm_hooks/promisc/Makefile
 	vdsm_hooks/qemucmdline/Makefile
 	vdsm_hooks/scratchpad/Makefile
 	vdsm_hooks/smbios/Makefile
 	vdsm_hooks/spiceoptions/Makefile
 	vdsm_hooks/vhostmd/Makefile
-	vdsm_hooks/vmdisk/Makefile
 	vdsm_hooks/vmfex_dev/Makefile
 ])

@@ -416,15 +416,7 @@ class FakeVolumeManifest(object):
         pass
 
     @recorded
-    def getSize(self):
-        pass
-
-    @recorded
     def optimal_size(self):
-        pass
-
-    @recorded
-    def setSize(self, size):
         pass
 
     @recorded
@@ -468,7 +460,7 @@ class FakeVolumeManifest(object):
         pass
 
     @recorded
-    def getVolumeSize(self, bs=0):
+    def getVolumeSize(self):
         pass
 
     @recorded
@@ -488,7 +480,7 @@ class FakeVolumeManifest(object):
         pass
 
     @recorded
-    def getVolumeParams(self, bs=0):
+    def getVolumeParams(self):
         pass
 
     @recorded
@@ -577,7 +569,8 @@ class FakeBlockVolumeManifest(FakeVolumeManifest):
 
     @classmethod
     @recorded
-    def calculate_volume_alloc_size(cls, preallocate, capacity, initial_size):
+    def calculate_volume_alloc_size(cls, preallocate, vol_format, capacity,
+                                    initial_size):
         pass
 
 
@@ -750,10 +743,6 @@ class TestBlockDomain(DomainTestMixin, VdsmTestCase):
         self.domain = FakeBlockStorageDomain()
         self.checker = RedirectionChecker(self.domain, '_manifest')
 
-    def test_block_properties(self):
-        self.assertEqual(512, self.domain.logBlkSize)
-        self.assertEqual(512, self.domain.phyBlkSize)
-
     def test_acquirevolumemetadataslot(self):
         with self.domain.acquireVolumeMetadataSlot(0):
             result = [('acquireVolumeMetadataSlot', (0,), {})]
@@ -820,8 +809,6 @@ class VolumeTestMixin(object):
         ['setLegality', 1],
         ['setDomain', 1],
         ['setShared', 0],
-        ['getSize', 0],
-        ['setSize', 1],
         ['updateInvalidatedSize', 0],
         ['getType', 0],
         ['setType', 1],
@@ -832,12 +819,12 @@ class VolumeTestMixin(object):
         ['isFake', 0],
         ['isInternal', 0],
         ['isSparse', 0],
-        ['getVolumeSize', 1],
+        ['getVolumeSize', 0],
         ['getVolumeTrueSize', 0],
         ['metadata2info', 1],
         ['getInfo', 0],
         ['getVmVolumeInfo', 0],
-        ['getVolumeParams', 1],
+        ['getVolumeParams', 0],
         ['validateDelete', 0],
         ['refreshVolume', 0],
         ['_share', 1],
@@ -883,7 +870,7 @@ class TestBlockVolume(VolumeTestMixin, VdsmTestCase):
         self.checker.check_method_call(fn, nargs)
 
     @permutations([
-        ['calculate_volume_alloc_size', 3],
+        ['calculate_volume_alloc_size', 4],
         ['max_size', 2],
     ])
     def test_block_classmethod(self, fn, nargs):

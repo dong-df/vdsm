@@ -57,7 +57,8 @@ format in a future sanlock version that will manage the internal index
 itself.
 
 The volume is composed of "slots" where each slot is 1MiB for 512 bytes
-block size, and 8MiB for 4K blocks.
+block size. With 4k block size, the size of the slot depends on the
+alignment (1MiB, 2MiB, 4MiB, 8MiB).
 
 1. Lockspace slot
 2. Index slot
@@ -75,10 +76,9 @@ The index slot
 --------------
 
 The index keeps the mapping between lease id and lease offset. The index
-is composed of blocks, 512 bytes or 4K bytes depending on the
-underlying storage.
+is composed of 64 bytes records.
 
-The first block of the index is the metadata block, using this format:
+The first 512 bytes of the index is the metadata area, using this format:
 
 - magic number (0x12152016)
 - padding byte
@@ -92,8 +92,7 @@ The first block of the index is the metadata block, using this format:
 - padding
 - newline
 
-The next blocks are record blocks containing 8 records for block size
-of 512 bytes, or 64 records for block size of 4K.
+The records areas follows the metadata area, starting at offset 512.
 
 Each record contain these fields:
 
@@ -145,44 +144,49 @@ from vdsm.common import commands
 from vdsm.common import constants
 from vdsm.common import errors
 from vdsm.common.osutils import uninterruptible
+from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fsutils
 from vdsm.storage.compat import sanlock
 
-# TODO: Support 4K block size.  This should be encapsulated in the Index class
-# instead of being a module constant.  We can can get the block size using
-# sanlock.get_alignment(), ensuring that both vdsm and sanlock are using same
-# size.
-from vdsm.storage.constants import BLOCK_SIZE
+# The first 3 slots are reserved for the lockspace, the index, and the master
+# lease.
+RESERVED_SLOTS = 3
 
-# Size required for Sanlock lease.
-SLOT_SIZE = 2048 * BLOCK_SIZE
+# The first 512 bytes are used for index matadata. We keep this value also when
+# working on 4k storage since this avoid conversion of older leases volumes.
+METADATA_SIZE = 512
 
-# Volume layout - offset from start of the volume.
-LOCKSPACE_BASE = 0
-INDEX_BASE = SLOT_SIZE
-PRIVATE_RESOURCE_BASE = 2 * SLOT_SIZE
-USER_RESOURCE_BASE = 3 * SLOT_SIZE
-
-# The first blocks are used for index matadata
-METADATA_SIZE = BLOCK_SIZE
-
-# The offset of the first lease record from INDEX_BASE
+# The offset of the first lease record from start of index area.
 RECORD_BASE = METADATA_SIZE
-
-# The number of lease records supported. We can use about 16000 records, but I
-# don't expect that we will need more than 2000 vm leases per data center.  To
-# be on the safe size, lets double that number.  Note that we need 1GiB lease
-# space for 1024 leases.
-MAX_RECORDS = 4000
 
 # Size allocated for each lease record. The minimal size is 36 bytes using uuid
 # string. To simplify record number calculation, we use the next power of 2.
 # We use the extra space for metadata about each lease record.
 RECORD_SIZE = 64
 
-# Each lookup will read this size from storage.
-INDEX_SIZE = METADATA_SIZE + (MAX_RECORDS * RECORD_SIZE)
+# When loading data into VolumeIndex, we read this size from storage.
+# Older versions formatted index of 256512 bytes for keeping 4000 leases, based
+# on this calculation:
+#
+#   4000 * 64 + 512 -> 256512
+#
+# This cannot work with 4k storage since the size is not aligned to 4096. Since
+# older version formatted exactly 4000 records, but use only 1024 records (due
+# to the size of the xleases volume), we round this number down the previous
+# multiple of 4096:
+#
+#  256512 // 4096 -> 62
+#
+# So we can use now only 3960 leases instead of 4000, but since the xleases
+# volume is only 1GiB this is not an issue.
+INDEX_SIZE = 62 * 4096
+
+# The number of lease records supported. We can use about 16000 records, but I
+# don't expect that we will need more than 2000 vm leases per data center.  To
+# be on the safe size, lets double that number.  Note that we need 1GiB lease
+# space for 1024 leases using the default alignment (1MiB).
+MAX_RECORDS = (INDEX_SIZE - METADATA_SIZE) // RECORD_SIZE
 
 # Current index format
 INDEX_VERSION = 1
@@ -504,10 +508,14 @@ class LeasesVolume(object):
     written immediately to storage.
     """
 
-    def __init__(self, file):
+    def __init__(
+            self, file, alignment=sc.ALIGNMENT_1M,
+            block_size=sc.BLOCK_SIZE_512):
         log.debug("Loading index from %r", file.name)
         self._file = file
-        self._index = VolumeIndex()
+        self._alignment = alignment
+        self._block_size = block_size
+        self._index = VolumeIndex(alignment, block_size)
         try:
             self._index.load(file)
             self._md = self._index.read_metadata()
@@ -553,7 +561,7 @@ class LeasesVolume(object):
         if record.updating:
             raise LeaseUpdating(lease_id)
 
-        offset = lease_offset(recnum)
+        offset = lease_offset(recnum, self._alignment)
         return LeaseInfo(self.lockspace, lease_id, self._file.name, offset)
 
     def add(self, lease_id):
@@ -582,12 +590,16 @@ class LeasesVolume(object):
         if recnum == -1:
             raise NoSpace(lease_id)
 
-        offset = lease_offset(recnum)
+        offset = lease_offset(recnum, self._alignment)
         record = Record(lease_id, offset, updating=True)
         self._write_record(recnum, record)
 
-        sanlock.write_resource(self.lockspace, lease_id,
-                               [(self._file.name, offset)])
+        sanlock.write_resource(
+            self.lockspace.encode("utf-8"),
+            lease_id.encode("utf-8"),
+            [(self._file.name, offset)],
+            align=self._alignment,
+            sector=self._block_size)
 
         record = Record(lease_id, offset)
         self._write_record(recnum, record)
@@ -609,14 +621,19 @@ class LeasesVolume(object):
         if recnum == -1:
             raise se.NoSuchLease(lease_id)
 
-        offset = lease_offset(recnum)
+        offset = lease_offset(recnum, self._alignment)
         record = Record(lease_id, offset, updating=True)
         self._write_record(recnum, record)
 
         # There is no way to remove a resource, so we write an invalid resource
         # with empty resource and lockspace values.
         # TODO: Use SANLK_WRITE_CLEAR, expected in rhel 7.4.
-        sanlock.write_resource("", "", [(self._file.name, offset)])
+        sanlock.write_resource(
+            b"",
+            b"",
+            [(self._file.name, offset)],
+            align=self._alignment,
+            sector=self._block_size)
 
         self._write_record(recnum, EMPTY_RECORD)
 
@@ -635,7 +652,7 @@ class LeasesVolume(object):
             # - used - non empty resource, may be updating
             if record.resource:
                 leases[record.resource] = {
-                    "offset": lease_offset(recnum),
+                    "offset": lease_offset(recnum, self._alignment),
                     "updating": record.updating,
                 }
         return leases
@@ -658,7 +675,8 @@ class LeasesVolume(object):
         self._index.write_record(recnum, record)
 
 
-def format_index(lockspace, file):
+def format_index(lockspace, file, alignment=sc.ALIGNMENT_1M,
+                 block_size=sc.BLOCK_SIZE_512):
     """
     Format xleases volume index, deleting all existing records.
 
@@ -671,7 +689,7 @@ def format_index(lockspace, file):
     """
     log.info("Formatting index for lockspace %r (version=%d)",
              lockspace, INDEX_VERSION)
-    index = VolumeIndex()
+    index = VolumeIndex(alignment, block_size)
     with utils.closing(index):
         with index.updating(lockspace, file):
             # Write empty records
@@ -681,7 +699,9 @@ def format_index(lockspace, file):
             index.dump(file)
 
 
-def rebuild_index(lockspace, file):
+def rebuild_index(
+        lockspace, file, alignment=sc.ALIGNMENT_1M,
+        block_size=sc.BLOCK_SIZE_512):
     """
     Rebuild xleases volume index from underlying storage.
 
@@ -698,18 +718,22 @@ def rebuild_index(lockspace, file):
     """
     log.info("Rebuilding index for lockspace %r (version=%d)",
              lockspace, INDEX_VERSION)
-    index = VolumeIndex()
+    index = VolumeIndex(alignment, block_size)
     with utils.closing(index):
         with index.updating(lockspace, file):
             # Read resources and write records
-            max_offset = file.size() - SLOT_SIZE
+            max_offset = file.size() - alignment
             for recnum in range(MAX_RECORDS):
-                offset = lease_offset(recnum)
+                offset = lease_offset(recnum, alignment)
                 if offset > max_offset:
                     index.write_record(recnum, EMPTY_RECORD)
                     continue
                 try:
-                    res = read_resource(file.name, offset)
+                    res = read_resource(
+                        file.name,
+                        offset,
+                        alignment=alignment,
+                        block_size=block_size)
                 except NoSuchResource:
                     record = EMPTY_RECORD
                 else:
@@ -722,7 +746,8 @@ def rebuild_index(lockspace, file):
             index.dump(file)
 
 
-def read_resource(path, offset):
+def read_resource(
+        path, offset, alignment=sc.ALIGNMENT_1M, block_size=sc.BLOCK_SIZE_512):
     """
     Helper for reading sanlock resoruces, supporting both non-existing and
     deleted resources.
@@ -731,29 +756,48 @@ def read_resource(path, offset):
     Raises: NoSuchResource if there is no resource at this offset
     """
     try:
-        res = sanlock.read_resource(path, offset)
+        res = sanlock.read_resource(
+            path, offset, align=alignment, sector=block_size)
     except sanlock.SanlockException as e:
         if e.errno != SANLK_LEADER_MAGIC:
             raise
         raise NoSuchResource(path, offset)
-    if res["resource"] == "":
+    if res["resource"] == b"":
         # lease deleted with a version of sanlock not supporting
         # resource clearning.
         raise NoSuchResource(path, offset)
-    return ResourceInfo(res["lockspace"], res["resource"], res["version"])
+    return ResourceInfo(
+        res["lockspace"].decode("utf-8"),
+        res["resource"].decode("utf-8"),
+        res["version"])
 
 
-def lease_offset(recnum):
-    return USER_RESOURCE_BASE + (recnum * SLOT_SIZE)
+def lease_offset(recnum, alignment):
+    """
+    Return the offset of the lease in the underlying volume.
+    """
+    # offset            area
+    # ===============================
+    # 0                 lockspace
+    # 1 * alignment     index
+    # 2 * alignment     master lease
+    # 3 * alignment     user leases
+    return (RESERVED_SLOTS + recnum) * alignment
 
 
 class VolumeIndex(object):
     """
     Index maintaining volume metadata and the mapping from lease id to lease
     offset.
+
+    Arguments:
+        offset (int): offset of the index in the underlying volume
+        block_size (int): storage logical block size
     """
 
-    def __init__(self):
+    def __init__(self, offset, block_size):
+        self._offset = offset
+        self._block_size = block_size
         self._buf = mmap.mmap(-1, INDEX_SIZE, mmap.MAP_SHARED)
 
     def find_record(self, lease_id):
@@ -812,7 +856,7 @@ class VolumeIndex(object):
         storage.
         """
         self._buf.seek(0)
-        data = self._buf.read(BLOCK_SIZE)
+        data = self._buf.read(METADATA_SIZE)
         return IndexMetadata.fromebytes(data)
 
     def write_metadata(self, metadata):
@@ -830,7 +874,7 @@ class VolumeIndex(object):
         """
         Read index from file, replacing current contents of the index.
         """
-        nread = file.pread(INDEX_BASE, self._buf)
+        nread = file.pread(self._offset, self._buf)
         if nread < len(self._buf):
             raise TruncatedIndex(len(self._buf), nread)
 
@@ -840,12 +884,13 @@ class VolumeIndex(object):
         storage. This is not atomic operation; if the operation fail, some
         blocks may not be written.
         """
-        file.pwrite(INDEX_BASE, self._buf)
+        file.pwrite(self._offset, self._buf)
 
     def copy_record_block(self, recnum):
         offset = self._record_offset(recnum)
-        block_start = offset - (offset % BLOCK_SIZE)
-        return ChangeBlock(self._buf, block_start)
+        block_start = offset - (offset % self._block_size)
+        return ChangeBlock(
+            self._offset, self._buf, block_start, self._block_size)
 
     @contextmanager
     def updating(self, lockspace, file):
@@ -864,9 +909,13 @@ class VolumeIndex(object):
         # will leave the index mark as "updating".
         yield
 
-        # Clear updating flag
+        # Clear updating flag.
         metadata = IndexMetadata(INDEX_VERSION, lockspace)
-        block = ChangeBlock(metadata.bytes(), 0)
+        self.write_metadata(metadata)
+
+        # And write the first block (which contains the metadata area) to
+        # storage.
+        block = ChangeBlock(self._offset, self._buf, 0, self._block_size)
         with utils.closing(block):
             block.dump(file)
 
@@ -889,18 +938,22 @@ class ChangeBlock(object):
     successful, modify the original buffer.
     """
 
-    def __init__(self, buf, offset):
+    def __init__(self, index_offset, index_buf, offset, size):
         """
         Initialize a ChangeBlock from a buffer, copying the block starting at
         offset.
 
         Arguments:
-            buf (buffer): the buffer holding the block contents
+            index_offset (int): offset of index in underlying volume
+            index_buf (buffer): the index buffer
             offset (int): offset in of this block in index_buf
+            size (int): size of this block
         """
+        self._index_offset = index_offset
         self._offset = offset
-        self._buf = mmap.mmap(-1, BLOCK_SIZE, mmap.MAP_SHARED)
-        self._buf[:] = buf[offset:offset + BLOCK_SIZE]
+        self._size = size
+        self._buf = mmap.mmap(-1, size, mmap.MAP_SHARED)
+        self._buf[:] = index_buf[offset:offset + size]
 
     def write_record(self, recnum, record):
         """
@@ -919,14 +972,14 @@ class ChangeBlock(object):
         This is atomic operation, the block is either fully written to storage
         or not.
         """
-        file.pwrite(INDEX_BASE + self._offset, self._buf)
+        file.pwrite(self._index_offset + self._offset, self._buf)
 
     def close(self):
         self._buf.close()
 
     def _record_offset(self, recnum):
         offset = RECORD_BASE + recnum * RECORD_SIZE - self._offset
-        last_offset = BLOCK_SIZE - RECORD_SIZE
+        last_offset = self._size - RECORD_SIZE
         if not 0 <= offset <= last_offset:
             raise ValueError("recnum %s out of range for this block" % recnum)
         return offset
@@ -989,7 +1042,8 @@ class DirectFile(object):
         pos = 0
         while pos < len(buf):
             if six.PY2:
-                wbuf = buffer(buf, pos)
+                # pylint: disable=undefined-variable
+                wbuf = buffer(buf, pos)  # noqa: F821
             else:
                 wbuf = memoryview(buf)[pos:]
             pos += uninterruptible(self._file.write, wbuf)

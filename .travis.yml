@@ -9,25 +9,17 @@ services:
 git:
   depth: 1
 
-# Notes: we run the linters only on Fedora 28 to save time. This may miss some
+# Notes: we run the linters only on Fedora 29 to save time. This may miss some
 # issues on CentOS but the chance is very low.
-# TODO: add Fedora 29 python 3.7 build.
 env:
   matrix:
-    - DOCKER_IMAGE=ovirtorg/vdsm-test-centos
-      MAKE_TARGET=tests-py27
-    - DOCKER_IMAGE=ovirtorg/vdsm-test-fedora-28
-      MAKE_TARGET=tests-py27
-    - DOCKER_IMAGE=ovirtorg/vdsm-test-fedora-28
-      MAKE_TARGET=tests-py36
-    - DOCKER_IMAGE=ovirtorg/vdsm-test-fedora-28
-      MAKE_TARGET=lint
-    - DOCKER_IMAGE=ovirtorg/vdsm-test-fedora-29
-      MAKE_TARGET=tests-py27
+    - DIST=centos-8   TARGETS="storage tests"
+    - DIST=fedora-30  TARGETS="lint"
+    - DIST=fedora-30  TARGETS="storage tests"
 
 before_install:
   - docker --version
-  - docker pull $DOCKER_IMAGE
+  - docker pull ovirtorg/vdsm-test-$DIST
 
 before_script:
   # autogen.sh needs a tag, but the last tag may be 100 commits in the past,
@@ -42,12 +34,11 @@ script:
     docker run \
     --env TRAVIS_CI=1 \
     --env PYLINT_JOBS=1 \
-    --env NETWORK_PY27_COVERAGE=38 \
-    --env NETWORK_PY36_COVERAGE=38 \
+    --env NETWORK_COVERAGE=38 \
     --privileged \
     --rm \
     -it \
     --volume `pwd`:/vdsm:Z \
     --volume /run/udev:/run/udev:Z \
-    $DOCKER_IMAGE \
-    bash -c "cd /vdsm && ./autogen.sh --system && make && make $MAKE_TARGET"
+    ovirtorg/vdsm-test-$DIST \
+    bash -c "cd /vdsm && ./autogen.sh --system && make all $TARGETS"

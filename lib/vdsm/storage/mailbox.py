@@ -19,7 +19,8 @@
 #
 
 from __future__ import absolute_import
-import array
+from __future__ import division
+
 import os
 import errno
 import time
@@ -31,6 +32,7 @@ import uuid
 
 from six.moves import queue
 
+from vdsm.common.units import KiB
 from vdsm.config import config
 from vdsm.storage import misc
 from vdsm.storage import task
@@ -45,7 +47,7 @@ __date__ = "$Mar 9, 2009 5:25:07 PM$"
 
 
 CHECKSUM_BYTES = 4
-MAILBOX_SIZE = 4096
+MAILBOX_SIZE = 4 * KiB
 PACKED_UUID_SIZE = 16
 VOLUME_MAX_SIZE = 0xFFFFFFFF  # 64 bit unsigned max size
 SIZE_CHARS = 16
@@ -53,7 +55,6 @@ MESSAGE_VERSION = b"1"
 MESSAGE_SIZE = 64
 CLEAN_MESSAGE = b"\1" * MESSAGE_SIZE
 EXTEND_CODE = b"xtnd"
-BLOCK_SIZE = 512
 REPLY_OK = 1
 EMPTYMAILBOX = MAILBOX_SIZE * b"\0"
 SLOTS_PER_MAILBOX = int(MAILBOX_SIZE // MESSAGE_SIZE)
@@ -62,17 +63,18 @@ SLOTS_PER_MAILBOX = int(MAILBOX_SIZE // MESSAGE_SIZE)
 MESSAGES_PER_MAILBOX = SLOTS_PER_MAILBOX - 1
 
 
-def checksum(string, numBytes):
-    bits = 8 * numBytes
-    tmpArray = array.array('B')
-    tmpArray.fromstring(string)
-    csum = sum(tmpArray)
-    return csum - (csum >> bits << bits)
+def checksum(data):
+    csum = sum(bytearray(data))
+    # Trim sum to be CHECKSUM_BYTES bytes long
+    return csum & (2**(CHECKSUM_BYTES * 8) - 1)
 
 
-_zeroCheck = checksum(EMPTYMAILBOX, CHECKSUM_BYTES)
-# Assumes CHECKSUM_BYTES equals 4!!!
-pZeroChecksum = struct.pack('<l', _zeroCheck)
+def packed_checksum(data):
+    # Assumes CHECKSUM_BYTES equals 4!!!
+    return struct.pack('<l', checksum(data))
+
+
+pZeroChecksum = packed_checksum(EMPTYMAILBOX)
 
 
 def runTask(args):
@@ -215,7 +217,7 @@ class HSM_Mailbox:
     def stop(self):
         if self._mailman:
             self._mailman.immStop()
-            self._mailman.tp.joinAll(waitForTasks=False)
+            self._mailman.tp.joinAll()
         else:
             self.log.warning("HSM_MailboxMonitor - No mail monitor object "
                              "available to stop")
@@ -292,12 +294,11 @@ class HSM_MailMonitor(object):
             if self._used_slots_array[i] == 0:
                 continue
 
-            # Skip empty return messages (messages with version 0)
             start = i * MESSAGE_SIZE
 
             # First byte of message is message version.
-            # Check return message version, if 0 then message is empty
-            if newMsgs[start] in ['\0', '0']:
+            # A null byte indicates an empty response message to be skipped.
+            if newMsgs[start:start + 1] == b"\0":
                 continue
 
             for j in range(start, start + MESSAGE_SIZE):
@@ -323,8 +324,8 @@ class HSM_MailMonitor(object):
                 self._used_slots_array[i] = 0
                 self._msgCounter -= 1
                 self._outgoingMail = self._outgoingMail[0:start] + \
-                    MESSAGE_SIZE * "\0" + self._outgoingMail[start +
-                                                             MESSAGE_SIZE:]
+                    MESSAGE_SIZE * b"\0" + self._outgoingMail[start +
+                                                              MESSAGE_SIZE:]
                 continue
 
             msg = self._activeMessages[i]
@@ -379,20 +380,18 @@ class HSM_MailMonitor(object):
     def _sendMail(self):
         self.log.info("HSM_MailMonitor sending mail to SPM - " +
                       str(self._outCmd))
-        chk = checksum(
-            self._outgoingMail[0:MAILBOX_SIZE - CHECKSUM_BYTES],
-            CHECKSUM_BYTES)
-        pChk = struct.pack('<l', chk)  # Assumes CHECKSUM_BYTES equals 4!!!
+        pChk = packed_checksum(
+            self._outgoingMail[0:MAILBOX_SIZE - CHECKSUM_BYTES])
         self._outgoingMail = \
             self._outgoingMail[0:MAILBOX_SIZE - CHECKSUM_BYTES] + pChk
         _mboxExecCmd(self._outCmd, data=self._outgoingMail)
 
     def _handleMessage(self, message):
         # TODO: add support for multiple mailboxes
-        freeSlot = False
+        freeSlot = None
         for i in range(0, MESSAGES_PER_MAILBOX):
             if self._used_slots_array[i] == 0:
-                if not freeSlot:
+                if freeSlot is None:
                     freeSlot = i
                 continue
             duplicate = True
@@ -404,7 +403,7 @@ class HSM_MailMonitor(object):
                 self.log.debug("HSM_MailMonitor - ignoring duplicate message "
                                "%s" % (repr(message)))
                 return
-        if not freeSlot:
+        if freeSlot is None:
             raise RuntimeError("HSM_MailMonitor - Active messages list full, "
                                "cannot add new message")
 
@@ -516,7 +515,7 @@ class SPM_MailMonitor:
 
     def __init__(self, poolID, maxHostID, inbox, outbox, monitorInterval=2):
         """
-        Note: inbox paramerter here should point to the HSM's outbox
+        Note: inbox parameter here should point to the HSM's outbox
         mailbox file, and vice versa.
         """
         self._messageTypes = {}
@@ -595,8 +594,7 @@ class SPM_MailMonitor:
         assert len(mailbox) == MAILBOX_SIZE
         data = mailbox[:-CHECKSUM_BYTES]
         csum = mailbox[-CHECKSUM_BYTES:]
-        n = checksum(data, CHECKSUM_BYTES)
-        expected = struct.pack('<l', n)  # Assumes CHECKSUM_BYTES equals 4!!!
+        expected = packed_checksum(data)
         if csum != expected:
             self.log.error(
                 "mailbox %s checksum failed, not clearing mailbox, clearing "
@@ -624,9 +622,9 @@ class SPM_MailMonitor:
                 msgId = host * SLOTS_PER_MAILBOX + i
                 msgStart = msgId * MESSAGE_SIZE
 
-                # First byte of message is message version.  Check message
-                # version, if 0 then message is empty and can be skipped
-                if newMail[msgStart] in ['\0', '0']:
+                # First byte of message is message version.
+                # A null byte indicates an empty message to be skipped.
+                if newMail[msgStart:msgStart + 1] == b"\0":
                     continue
 
                 # Most mailboxes are probably empty so it costs less to check
@@ -763,7 +761,7 @@ class SPM_MailMonitor:
                 time.sleep(self._monitorInterval)
         finally:
             self._stopped = True
-            self.tp.joinAll(waitForTasks=False)
+            self.tp.joinAll()
             self.log.info("SPM_MailMonitor - Incoming mail monitoring thread "
                           "stopped")
 
@@ -771,7 +769,7 @@ class SPM_MailMonitor:
 def wait_timeout(monitor_interval):
     """
     Designed to return 3 seconds wait timeout for monitor interval of 2
-    seconds, keeping the behaivor in runtime the same as it was in the last 8
+    seconds, keeping the behavior in runtime the same as it was in the last 8
     years, while allowing shorter times for testing.
     """
-    return monitor_interval * 3 / 2
+    return monitor_interval * 1.5

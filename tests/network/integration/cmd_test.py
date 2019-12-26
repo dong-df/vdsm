@@ -1,5 +1,5 @@
 #
-# Copyright 2017-2018 Red Hat, Inc.
+# Copyright 2017-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,13 +23,12 @@ from __future__ import division
 
 import unittest
 
-from network.nettestlib import requires_systemdrun
+from .netintegtestlib import requires_systemdrun
 
 from vdsm.network import cmd
 
 
 class CmdTest(unittest.TestCase):
-
     def test_exec_sync_with_no_output(self):
         rc, out, err = cmd.exec_sync(('true',))
         self.assertEqual(out, '')
@@ -49,7 +48,8 @@ class CmdTest(unittest.TestCase):
 
     @requires_systemdrun
     def test_exec_systemd_new_unit(self):
-        rc, out, err = cmd.exec_systemd_new_unit(('echo', 'hello world'),
-                                                 slice_name='test-group')
+        rc, out, err = cmd.exec_systemd_new_unit(
+            ('echo', 'hello world'), slice_name='test-group'
+        )
         self.assertEqual(rc, 0, err)
         self.assertEqual(out, 'hello world\n')

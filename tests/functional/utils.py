@@ -22,17 +22,18 @@ from __future__ import division
 from contextlib import contextmanager
 from functools import wraps
 import inspect
+import six
 import socket
 import time
 import threading
 
 from vdsm.config import config
-from vdsm.common import supervdsm
 from vdsm.common.function import retry
 from vdsm import jsonrpcvdscli
 from vdsm.network import ipwrapper
-from vdsm.network.netinfo.cache import CachingNetInfo
 from vdsm.network.netconfpersistence import RunningConfig
+from vdsm.network.netinfo.cache import CachingNetInfo
+from vdsm.network.restore_net_config import restore
 
 
 SUCCESS = 0
@@ -144,7 +145,7 @@ class _VdsProxy(object):
 
     @netinfo_altering
     def restoreNetConfig(self):
-        supervdsm.getProxy().restoreNetworks()
+        restore(force=True)
 
     @netinfo_altering
     def setupNetworks(self, networks, bonds, options):
@@ -157,7 +158,7 @@ class _VdsProxy(object):
         return _parse_result(result)
 
     def _vlanInRunningConfig(self, devName, vlanId):
-        for net, attrs in self.config.networks.iteritems():
+        for attrs in six.itervalues(self.config.networks):
             if (int(vlanId) == attrs.get('vlan') and
                     (attrs.get('bonding') == devName or
                      attrs.get('nic') == devName)):
@@ -244,6 +245,6 @@ def _parse_result(result, return_value=None):
     msg = status['message']
 
     if code == SUCCESS and return_value:
-        return code, msg, result['result']
+        return code, msg, result.get('result', {})
     else:
         return code, msg

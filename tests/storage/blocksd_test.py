@@ -25,10 +25,11 @@ from __future__ import division
 import os
 import time
 import uuid
+import string
 
 import pytest
 
-from vdsm import constants
+from vdsm.common.units import MiB, GiB
 from vdsm.storage import blockSD
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -37,7 +38,8 @@ from vdsm.storage import sd
 from vdsm.storage.sdc import sdCache
 
 from . import qemuio
-from . marks import requires_root, xfail_python3
+from . marks import requires_root
+from storage.storagefakelib import fake_spm
 from storage.storagefakelib import fake_vg
 
 TESTDIR = os.path.dirname(__file__)
@@ -45,7 +47,7 @@ TESTDIR = os.path.dirname(__file__)
 
 class TestMetadataValidity:
 
-    MIN_MD_SIZE = blockSD.VG_METADATASIZE * constants.MEGAB // 2
+    MIN_MD_SIZE = blockSD.VG_METADATASIZE * MiB // 2
     MIN_MD_FREE = MIN_MD_SIZE * blockSD.VG_MDA_MIN_THRESHOLD
 
     def test_valid_ok(self):
@@ -101,7 +103,7 @@ class TestGetAllVolumes:
         monkeypatch.setattr(lvm, 'getLV', fakeGetLV)
         sdName = "f9e55e18-67c4-4377-8e39-5833ca422bef"
         allVols = blockSD.getAllVolumes(sdName)
-        assert len(allVols) == 1
+        assert len(allVols) == 2
 
 
 class TestDecodeValidity:
@@ -146,23 +148,100 @@ def test_metadata_offset(monkeypatch):
     assert 1867776 == sd_manifest.metadata_offset(100, version=5)
 
 
-@pytest.mark.parametrize("version", [3, 4])
-@pytest.mark.parametrize("block_size", [sc.BLOCK_SIZE_512, sc.BLOCK_SIZE_4K])
-@pytest.mark.parametrize(
-    "alignment", [sc.ALIGNMENT_1M, sc.ALIGNMENT_2M, sc.ALIGNMENT_4M,
-                  sc.ALIGNMENT_8M])
-def test_incorrect_version_and_block_rejected(version, block_size, alignment):
-    # block size 512b and alignment of 1M is the only allowed combination for
-    # storage domain 3 and 4
-    if block_size != sc.BLOCK_SIZE_512 and alignment != sc.ALIGNMENT_1M:
-        with pytest.raises(se.InvalidParameterException):
-            blockSD.BlockStorageDomain.create(
-                sc.BLANK_UUID, "test", sd.DATA_DOMAIN,
-                sc.BLANK_UUID, sd.ISCSI_DOMAIN, version, block_size, alignment)
+@pytest.mark.parametrize("version,block_size", [
+    # Before version 5 only 512 bytes is supported.
+    (3, sc.BLOCK_SIZE_4K),
+    (3, sc.BLOCK_SIZE_AUTO),
+    (3, 42),
+    (4, sc.BLOCK_SIZE_4K),
+    (4, sc.BLOCK_SIZE_AUTO),
+    (4, 42),
+    # Version 5 will allow 4k soon.
+    (5, sc.BLOCK_SIZE_4K),
+    (5, sc.BLOCK_SIZE_AUTO),
+    (5, 42),
+])
+def test_unsupported_block_size_rejected(version, block_size):
+    # Note: assumes that validation is done before trying to reach storage.
+    with pytest.raises(se.InvalidParameterException):
+        blockSD.BlockStorageDomain.create(
+            sdUUID=str(uuid.uuid4()),
+            domainName="test",
+            domClass=sd.DATA_DOMAIN,
+            vgUUID=None,
+            storageType=sd.ISCSI_DOMAIN,
+            version=version,
+            block_size=block_size)
+
+
+def test_create_domain_unsupported_version():
+    with pytest.raises(se.UnsupportedDomainVersion):
+        blockSD.BlockStorageDomain.create(
+            str(uuid.uuid4()),
+            "test",
+            sd.DATA_DOMAIN,
+            None,  # vg-uuid
+            sd.ISCSI_DOMAIN,
+            0)
 
 
 @requires_root
-@xfail_python3
+@pytest.mark.root
+def test_attach_domain_unsupported_version(
+        monkeypatch, tmp_storage, tmp_repo, fake_task, fake_sanlock):
+    sd_uuid = str(uuid.uuid4())
+
+    dev = tmp_storage.create_device(20 * GiB)
+    lvm.createVG(sd_uuid, [dev], blockSD.STORAGE_UNREADY_DOMAIN_TAG, 128)
+    vg = lvm.getVG(sd_uuid)
+
+    dom = blockSD.BlockStorageDomain.create(
+        sdUUID=sd_uuid,
+        domainName="domain",
+        domClass=sd.DATA_DOMAIN,
+        vgUUID=vg.uuid,
+        version=3,
+        storageType=sd.ISCSI_DOMAIN)
+
+    sdCache.knownSDs[sd_uuid] = blockSD.findDomain
+
+    # Remove domain metadata
+    dom.setMetadata({})
+
+    # Set domain metadata to version 0
+    metadata = """\
+ALIGNMENT=1048576
+BLOCK_SIZE=512
+CLASS=Data
+DESCRIPTION=storage domain
+IOOPTIMEOUTSEC=10
+LEASERETRIES=3
+LEASETIMESEC=60
+LOCKPOLICY=
+LOCKRENEWALINTERVALSEC=5
+POOL_UUID=
+REMOTE_PATH=server:/path
+ROLE=Regular
+SDUUID={}
+TYPE=LOCALFS
+VERSION=0
+""".format(sd_uuid)
+    with open("/dev/{}/metadata".format(vg.name), "wb") as f:
+        f.write(metadata.encode("utf-8"))
+
+    spm = fake_spm(
+        tmp_repo.pool_id,
+        0,
+        {sd_uuid: sd.DOM_UNATTACHED_STATUS})
+
+    # Since we removed support for V0 we can no longer read
+    # the replaced metadata from storage and end up with missing
+    # version key when trying to get version for attached domain
+    with pytest.raises(se.MetaDataKeyNotFoundError):
+        spm.attachSD(sd_uuid)
+
+
+@requires_root
 @pytest.mark.root
 @pytest.mark.parametrize("domain_version", [3, 4, 5])
 def test_create_domain_metadata(tmp_storage, tmp_repo, fake_sanlock,
@@ -170,8 +249,8 @@ def test_create_domain_metadata(tmp_storage, tmp_repo, fake_sanlock,
     sd_uuid = str(uuid.uuid4())
     domain_name = "loop-domain"
 
-    dev1 = tmp_storage.create_device(10 * 1024**3)
-    dev2 = tmp_storage.create_device(10 * 1024**3)
+    dev1 = tmp_storage.create_device(10 * GiB)
+    dev2 = tmp_storage.create_device(10 * GiB)
     lvm.createVG(sd_uuid, [dev1, dev2], blockSD.STORAGE_UNREADY_DOMAIN_TAG,
                  128)
     vg = lvm.getVG(sd_uuid)
@@ -184,9 +263,7 @@ def test_create_domain_metadata(tmp_storage, tmp_repo, fake_sanlock,
         domClass=sd.DATA_DOMAIN,
         vgUUID=vg.uuid,
         version=domain_version,
-        storageType=sd.ISCSI_DOMAIN,
-        block_size=sc.BLOCK_SIZE_512,
-        alignment=sc.ALIGNMENT_1M)
+        storageType=sd.ISCSI_DOMAIN)
 
     sdCache.knownSDs[sd_uuid] = blockSD.findDomain
     sdCache.manuallyAddDomain(dom)
@@ -237,6 +314,10 @@ def test_create_domain_metadata(tmp_storage, tmp_repo, fake_sanlock,
         expected[sd.DMDK_ALIGNMENT] = sc.ALIGNMENT_1M
         expected[sd.DMDK_BLOCK_SIZE] = sc.BLOCK_SIZE_512
 
+    # Tests also alignment and block size properties here.
+    assert dom.alignment == sc.ALIGNMENT_1M
+    assert dom.block_size == sc.BLOCK_SIZE_512
+
     actual = dom.getMetadata()
 
     assert expected == actual
@@ -245,22 +326,86 @@ def test_create_domain_metadata(tmp_storage, tmp_repo, fake_sanlock,
     assert dev1 == lvm.getVgMetadataPv(dom.sdUUID)
 
     lv = lvm.getLV(dom.sdUUID, sd.METADATA)
-    assert int(lv.size) == blockSD.METADATA_LV_SIZE_MB * constants.MEGAB
+    assert int(lv.size) == blockSD.METADATA_LV_SIZE_MB * MiB
+
+    # Test the domain lease.
+    lease = dom.getClusterLease()
+    assert lease.name == "SDM"
+    assert lease.path == "/dev/{}/leases".format(dom.sdUUID)
+    assert lease.offset == dom.alignment
+
+    resource = fake_sanlock.read_resource(
+        lease.path,
+        lease.offset,
+        align=dom.alignment,
+        sector=dom.block_size)
+
+    assert resource == {
+        "acquired": False,
+        "align": dom.alignment,
+        "lockspace": dom.sdUUID.encode("utf-8"),
+        "resource": lease.name.encode("utf-8"),
+        "sector": dom.block_size,
+        "version": 0,
+    }
+
+    # Test special volumes sizes.
+
+    for name in (sd.IDS, sd.INBOX, sd.OUTBOX, sd.METADATA):
+        lv = lvm.getLV(dom.sdUUID, name)
+        # This is the minimal LV size on block storage.
+        assert int(lv.size) == 128 * MiB
+
+    lv = lvm.getLV(dom.sdUUID, blockSD.MASTERLV)
+    assert int(lv.size) == GiB
+
+    lv = lvm.getLV(dom.sdUUID, sd.LEASES)
+    assert int(lv.size) == sd.LEASES_SLOTS * dom.alignment
+
+    if domain_version > 3:
+        lv = lvm.getLV(dom.sdUUID, sd.XLEASES)
+        assert int(lv.size) == sd.XLEASES_SLOTS * dom.alignment
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
+def test_create_instance_block_size_mismatch(
+        tmp_storage, tmp_repo, fake_sanlock):
+    sd_uuid = str(uuid.uuid4())
+
+    dev = tmp_storage.create_device(10 * GiB)
+    lvm.createVG(sd_uuid, [dev], blockSD.STORAGE_UNREADY_DOMAIN_TAG, 128)
+    vg = lvm.getVG(sd_uuid)
+
+    dom = blockSD.BlockStorageDomain.create(
+        sdUUID=sd_uuid,
+        domainName="test",
+        domClass=sd.DATA_DOMAIN,
+        vgUUID=vg.uuid,
+        version=5,
+        storageType=sd.ISCSI_DOMAIN)
+
+    # Change metadata to report the wrong block size for current storage.
+    dom.setMetaParam(sd.DMDK_BLOCK_SIZE, sc.BLOCK_SIZE_4K)
+
+    # Creating a new instance should fail now.
+    with pytest.raises(se.StorageDomainBlockSizeMismatch):
+        blockSD.BlockStorageDomain(sd_uuid)
+
+
+@requires_root
+@pytest.mark.root
+@pytest.mark.parametrize("domain_version", [3, 4, 5])
 def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
-                           fake_rescan, tmp_db, fake_task, fake_sanlock):
+                           fake_rescan, tmp_db, fake_task, fake_sanlock,
+                           domain_version):
     # as creation of block storage domain and volume is quite time consuming,
     # we test several volume operations in one test to speed up the test suite
 
     sd_uuid = str(uuid.uuid4())
     domain_name = "domain"
-    domain_version = 4
 
-    dev = tmp_storage.create_device(20 * 1024 ** 3)
+    dev = tmp_storage.create_device(20 * GiB)
     lvm.createVG(sd_uuid, [dev], blockSD.STORAGE_UNREADY_DOMAIN_TAG, 128)
     vg = lvm.getVG(sd_uuid)
 
@@ -270,17 +415,14 @@ def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
         domClass=sd.DATA_DOMAIN,
         vgUUID=vg.uuid,
         version=domain_version,
-        storageType=sd.ISCSI_DOMAIN,
-        block_size=sc.BLOCK_SIZE_512,
-        alignment=sc.ALIGNMENT_1M)
+        storageType=sd.ISCSI_DOMAIN)
 
     sdCache.knownSDs[sd_uuid] = blockSD.findDomain
     sdCache.manuallyAddDomain(dom)
 
     img_uuid = str(uuid.uuid4())
     vol_uuid = str(uuid.uuid4())
-    vol_capacity = 10 * 1024**3
-    vol_size = vol_capacity // sc.BLOCK_SIZE_512
+    vol_capacity = 10 * GiB
     vol_desc = "Test volume"
 
     # Create domain directory structure.
@@ -292,7 +434,7 @@ def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
         mc.setattr(time, "time", lambda: 1550522547)
         dom.createVolume(
             imgUUID=img_uuid,
-            size=vol_size,
+            capacity=vol_capacity,
             volFormat=sc.COW_FORMAT,
             preallocate=sc.SPARSE_VOL,
             diskType=sc.DATA_DISKTYPE,
@@ -303,15 +445,34 @@ def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
 
     # test create volume
     vol = dom.produceVolume(img_uuid, vol_uuid)
-    actual = vol.getInfo()
 
-    expected_lease = {
-        "offset": ((blockSD.RESERVED_LEASES + 4) * sc.BLOCK_SIZE_512 *
-                   sd.LEASE_BLOCKS),
-        "owners": [],
-        "path": "/dev/{}/leases".format(sd_uuid),
-        "version": None,
+    # Get the metadata slot, used for volume metadata and volume lease offset.
+    _, slot = vol.getMetadataId()
+
+    lease = dom.getVolumeLease(img_uuid, vol_uuid)
+
+    assert lease.name == vol.volUUID
+    assert lease.path == "/dev/{}/leases".format(sd_uuid)
+    assert lease.offset == (blockSD.RESERVED_LEASES + slot) * dom.alignment
+
+    # Test that we created a sanlock resource for this volume.
+    resource = fake_sanlock.read_resource(
+        lease.path,
+        lease.offset,
+        align=dom.alignment,
+        sector=dom.block_size)
+
+    assert resource == {
+        "acquired": False,
+        "align": dom.alignment,
+        "lockspace": vol.sdUUID.encode("utf-8"),
+        "resource": vol.volUUID.encode("utf-8"),
+        "sector": dom.block_size,
+        "version": 0,
     }
+
+    # Test volume info.
+    actual = vol.getInfo()
 
     assert int(actual["capacity"]) == vol_capacity
     assert int(actual["ctime"]) == 1550522547
@@ -319,7 +480,12 @@ def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
     assert actual["disktype"] == "DATA"
     assert actual["domain"] == sd_uuid
     assert actual["format"] == "COW"
-    assert actual["lease"] == expected_lease
+    assert actual["lease"] == {
+        "offset": lease.offset,
+        "owners": [],
+        "path": lease.path,
+        "version": None,
+    }
     assert actual["parent"] == sc.BLANK_UUID
     assert actual["status"] == "OK"
     assert actual["type"] == "SPARSE"
@@ -328,16 +494,23 @@ def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
 
     vol_path = vol.getVolumePath()
 
-    # Keep the slot before deleting the volume.
-    _, slot = vol.getMetadataId()
-
     # test volume prepare
     assert os.path.islink(vol_path)
     assert not os.path.exists(vol_path)
 
+    lv_size = int(lvm.getLV(sd_uuid, vol_uuid).size)
+
+    # Check volume size of unprepared volume - uses lvm.
+    size = dom.getVolumeSize(img_uuid, vol_uuid)
+    assert size.apparentsize == size.truesize == lv_size
+
     vol.prepare()
 
     assert os.path.exists(vol_path)
+
+    # Check volume size of prepared volume - uses seek.
+    size = dom.getVolumeSize(img_uuid, vol_uuid)
+    assert size.apparentsize == size.truesize == lv_size
 
     # verify we can really write and read to an image
     qemuio.write_pattern(vol_path, "qcow2")
@@ -357,19 +530,15 @@ def test_volume_life_cycle(monkeypatch, tmp_storage, tmp_repo, fake_access,
     with pytest.raises(se.LogicalVolumeDoesNotExistError):
         lvm.getLV(sd_uuid, vol_uuid)
 
-    # verify also metadata from metadata lv is deleted
-    data = dom.manifest.read_metadata_block(slot)
-    assert data == b"\0" * sc.METADATA_SIZE
-
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
+@pytest.mark.parametrize("domain_version", [4, 5])
 def test_volume_metadata(tmp_storage, tmp_repo, fake_access, fake_rescan,
-                         tmp_db, fake_task, fake_sanlock):
+                         tmp_db, fake_task, fake_sanlock, domain_version):
     sd_uuid = str(uuid.uuid4())
 
-    dev = tmp_storage.create_device(20 * 1024 ** 3)
+    dev = tmp_storage.create_device(20 * GiB)
     lvm.createVG(sd_uuid, [dev], blockSD.STORAGE_UNREADY_DOMAIN_TAG, 128)
     vg = lvm.getVG(sd_uuid)
 
@@ -378,10 +547,8 @@ def test_volume_metadata(tmp_storage, tmp_repo, fake_access, fake_rescan,
         domainName="domain",
         domClass=sd.DATA_DOMAIN,
         vgUUID=vg.uuid,
-        version=4,
-        storageType=sd.ISCSI_DOMAIN,
-        block_size=sc.BLOCK_SIZE_512,
-        alignment=sc.ALIGNMENT_1M)
+        version=domain_version,
+        storageType=sd.ISCSI_DOMAIN)
 
     sdCache.knownSDs[sd_uuid] = blockSD.findDomain
     sdCache.manuallyAddDomain(dom)
@@ -397,7 +564,7 @@ def test_volume_metadata(tmp_storage, tmp_repo, fake_access, fake_rescan,
         diskType="DATA",
         imgUUID=img_uuid,
         preallocate=sc.SPARSE_VOL,
-        size=10 * 1024**3,
+        capacity=10 * GiB,
         srcImgUUID=sc.BLANK_UUID,
         srcVolUUID=sc.BLANK_UUID,
         volFormat=sc.COW_FORMAT,
@@ -408,32 +575,42 @@ def test_volume_metadata(tmp_storage, tmp_repo, fake_access, fake_rescan,
     # Test metadata offset
     _, slot = vol.getMetadataId()
     offset = dom.manifest.metadata_offset(slot)
-    assert offset == slot * blockSD.METADATA_SLOT_SIZE_V4
+    if domain_version < 5:
+        assert offset == slot * blockSD.METADATA_SLOT_SIZE_V4
+    else:
+        assert offset == (blockSD.METADATA_BASE_V5 + slot *
+                          blockSD.METADATA_SLOT_SIZE_V5)
 
     meta_path = dom.manifest.metadata_volume_path()
+
+    # Check capacity
+    assert 10 * GiB == vol.getCapacity()
+    vol.setCapacity(0)
+    with pytest.raises(se.MetaDataValidationError):
+        vol.getCapacity()
+    vol.setCapacity(10 * GiB)
 
     # Change metadata.
     md = vol.getMetadata()
     md.description = "new description"
     vol.setMetadata(md)
-    with open(meta_path) as f:
+    with open(meta_path, "rb") as f:
         f.seek(offset)
         data = f.read(sc.METADATA_SIZE)
-    data = data.rstrip("\0")
-    assert data == md.storage_format(4)
+    data = data.rstrip(b"\0")
+    assert data == md.storage_format(domain_version)
 
     # Add additioanl metadata.
     md = vol.getMetadata()
     vol.setMetadata(md, CAP=md.capacity)
-    with open(meta_path) as f:
+    with open(meta_path, "rb") as f:
         f.seek(offset)
         data = f.read(sc.METADATA_SIZE)
-    data = data.rstrip("\0")
-    assert data == md.storage_format(4, CAP=md.capacity)
+    data = data.rstrip(b"\0")
+    assert data == md.storage_format(domain_version, CAP=md.capacity)
 
 
 @requires_root
-@xfail_python3
 @pytest.mark.root
 @pytest.mark.parametrize("domain_version", [4, 5])
 def test_create_snapshot_size(
@@ -446,7 +623,7 @@ def test_create_snapshot_size(
     # let's test this flow also in this test.
     sd_uuid = str(uuid.uuid4())
 
-    dev = tmp_storage.create_device(20 * 1024 ** 3)
+    dev = tmp_storage.create_device(20 * GiB)
     lvm.createVG(sd_uuid, [dev], blockSD.STORAGE_UNREADY_DOMAIN_TAG, 128)
     vg = lvm.getVG(sd_uuid)
 
@@ -456,9 +633,7 @@ def test_create_snapshot_size(
         domClass=sd.DATA_DOMAIN,
         vgUUID=vg.uuid,
         version=domain_version,
-        storageType=sd.ISCSI_DOMAIN,
-        block_size=sc.BLOCK_SIZE_512,
-        alignment=sc.ALIGNMENT_1M)
+        storageType=sd.ISCSI_DOMAIN)
 
     sdCache.knownSDs[sd_uuid] = blockSD.findDomain
     sdCache.manuallyAddDomain(dom)
@@ -468,7 +643,7 @@ def test_create_snapshot_size(
 
     img_uuid = str(uuid.uuid4())
     parent_vol_uuid = str(uuid.uuid4())
-    parent_vol_capacity = constants.GIB
+    parent_vol_capacity = GiB
     vol_uuid = str(uuid.uuid4())
     vol_capacity = 2 * parent_vol_capacity
 
@@ -476,46 +651,44 @@ def test_create_snapshot_size(
 
     dom.createVolume(
         imgUUID=img_uuid,
-        size=parent_vol_capacity // sc.BLOCK_SIZE_512,
+        capacity=parent_vol_capacity,
         volFormat=sc.RAW_FORMAT,
         preallocate=sc.PREALLOCATED_VOL,
         diskType='DATA',
         volUUID=parent_vol_uuid,
         desc="Test parent volume",
         srcImgUUID=sc.BLANK_UUID,
-        srcVolUUID=sc.BLANK_UUID,
-        initialSize=None)
+        srcVolUUID=sc.BLANK_UUID)
 
     parent_vol = dom.produceVolume(img_uuid, parent_vol_uuid)
 
     # Verify that snapshot cannot be smaller than parent.
+    # As we round capacity to 4k block size, we reduce it here by one 4k block.
 
     with pytest.raises(se.InvalidParameterException):
         dom.createVolume(
             imgUUID=img_uuid,
-            size=parent_vol.getSize() - 1,
+            capacity=parent_vol.getCapacity() - sc.BLOCK_SIZE_4K,
             volFormat=sc.COW_FORMAT,
             preallocate=sc.SPARSE_VOL,
             diskType='DATA',
             volUUID=vol_uuid,
             desc="Extended volume",
             srcImgUUID=parent_vol.imgUUID,
-            srcVolUUID=parent_vol.volUUID,
-            initialSize=None)
+            srcVolUUID=parent_vol.volUUID)
 
     # Verify that snapshot can be bigger than parent.
 
     dom.createVolume(
         imgUUID=img_uuid,
-        size=vol_capacity // sc.BLOCK_SIZE_512,
+        capacity=vol_capacity,
         volFormat=sc.COW_FORMAT,
         preallocate=sc.SPARSE_VOL,
         diskType='DATA',
         volUUID=vol_uuid,
         desc="Extended volume",
         srcImgUUID=parent_vol.imgUUID,
-        srcVolUUID=parent_vol.volUUID,
-        initialSize=None)
+        srcVolUUID=parent_vol.volUUID)
 
     vol = dom.produceVolume(img_uuid, vol_uuid)
 
@@ -537,3 +710,60 @@ def test_create_snapshot_size(
 
     actual = vol.getInfo()
     assert int(actual["capacity"]) == vol_capacity
+
+    # Corrupt the metadata capacity manually again.
+    # And reuse this test also for testing Volume.syncMetadata().
+    # As syncMetadata() work only for RAW volumes, test it on parent volume.
+    parent_md = parent_vol.getMetadata()
+    parent_md.capacity = parent_vol_capacity // 2
+    parent_vol.setMetadata(md)
+
+    parent_vol.syncMetadata()
+
+    actual = parent_vol.getInfo()
+    assert int(actual["capacity"]) == parent_vol_capacity
+
+
+LVM_TAG_CHARS = string.ascii_letters + "0123456789_+.-/=!:#"
+
+LVM_TAGS = [
+    LVM_TAG_CHARS,
+    u"&",
+    u"\u05d9",
+    LVM_TAG_CHARS + "$@|",
+]
+
+ENCODED_LVM_TAGS = [
+    LVM_TAG_CHARS,
+    u"&38&",
+    u"&1497&",
+    LVM_TAG_CHARS + "&36&&64&&124&",
+]
+
+TEST_IDS = [
+    "lvm_tag_chars",
+    "ampersand",
+    "unicode_char",
+    "lvm_tag_chars_with_symbols",
+]
+
+
+@pytest.mark.parametrize("lvm_tag", LVM_TAGS, ids=TEST_IDS)
+def test_lvmtag_roundtrip(lvm_tag):
+    assert blockSD.lvmTagDecode(blockSD.lvmTagEncode(lvm_tag)) == lvm_tag
+
+
+@pytest.mark.parametrize(
+    "encoded_tag,lvm_tag",
+    list(zip(ENCODED_LVM_TAGS, LVM_TAGS)),
+    ids=TEST_IDS)
+def test_lvmtag_decode(encoded_tag, lvm_tag):
+    assert blockSD.lvmTagDecode(encoded_tag) == lvm_tag
+
+
+@pytest.mark.parametrize(
+    "lvm_tag,encoded_tag",
+    list(zip(LVM_TAGS, ENCODED_LVM_TAGS)),
+    ids=TEST_IDS)
+def test_lvmtag_encode(lvm_tag, encoded_tag):
+    assert blockSD.lvmTagEncode(lvm_tag) == encoded_tag

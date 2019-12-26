@@ -23,8 +23,10 @@ from __future__ import division
 
 import errno
 import threading
+
 from testlib import maybefail
 
+from vdsm.storage import constants as sc
 from vdsm.storage.compat import sanlock
 
 
@@ -49,16 +51,66 @@ class FakeSanlock(object):
     # Copied from sanlock src/sanlock_rv.h
     SANLK_LEADER_MAGIC = -223
 
+    # Tuples with supported alignment and sector size.
+    # Copied from python/sanlock.c
+    ALIGN_SIZE = (sc.ALIGNMENT_1M,
+                  sc.ALIGNMENT_2M,
+                  sc.ALIGNMENT_4M,
+                  sc.ALIGNMENT_8M)
+    SECTOR_SIZE = (sc.BLOCK_SIZE_512, sc.BLOCK_SIZE_4K)
+
     class SanlockException(Exception):
         @property
         def errno(self):
             return self.args[0]
 
-    def __init__(self):
+    def __init__(self, sector_size=sc.BLOCK_SIZE_512):
         self.spaces = {}
         self.resources = {}
         self.errors = {}
         self.hosts = {}
+        # As fake sanlock keeps everything only in memory, this mimics
+        # sector size of underlying storage.
+        self.sector_size = sector_size
+
+    def check_align_and_sector(
+            self, align, sector, resource=None, check_sector=True):
+        """
+        Check that alignment and sector size contain valid values.
+        This means that the values are in ALIGN_SIZE/SECTOR_SIZE tuple
+        and if the resource dict is provided, that these values match
+        the values in the dict. This dict can represent either lockspace
+        or resource. In any case, it has to contain "align" and "sector"
+        keys. We also check, that sector size is same as sector size of
+        underlying storage. This check can be skipped if check_sector is set to
+        False. This is a workaround which mimics real sanlock behavior: sanlock
+        write_resource() doesn't fail even if it's called with different sector
+        size than underlying sector size.
+        """
+        # Check that alignment and sector size are among values supported by
+        # sanlock
+
+        if align not in self.ALIGN_SIZE:
+            raise ValueError("Invalid align value: %d" % align)
+
+        if sector not in self.SECTOR_SIZE:
+            raise ValueError("Invalid sector value: %d" % sector)
+
+        # Check that sector size is same underlying storage sector size
+        if check_sector and self.sector_size != sector:
+            raise self.SanlockException(
+                errno.EINVAL, "Invalid sector size", "Invalid argument")
+
+        # Check that alignment and sector size is same as alignment and sector
+        # size of previously written resource
+        if resource:
+            if align != resource["align"]:
+                raise self.SanlockException(
+                    errno.EINVAL, "Invalid alignment", "Invalid argument")
+
+            if sector != resource["sector"]:
+                raise self.SanlockException(
+                    errno.EINVAL, "Invalid sector size", "Invalid argument")
 
     def check_lockspace_initialized(self, lockspace):
         # TODO: check that sanlock was initialized may need to be added also
@@ -76,15 +128,15 @@ class FakeSanlock(object):
 
     @maybefail
     def add_lockspace(self, lockspace, host_id, path, offset=0, iotimeout=0,
-                      **kwargs):
+                      wait=True):
         """
-        Add a lockspace, acquiring a host_id in it. If async is True the
+        Add a lockspace, acquiring a host_id in it. If wait is False the
         function will return immediatly and the status can be checked
         using inq_lockspace.  The iotimeout option configures the io
         timeout for the specific lockspace, overriding the default value
         (see the sanlock daemon parameter -o).
         """
-
+        self._validate_bytes(lockspace)
         self.check_lockspace_initialized(lockspace)
         ls = self.spaces[lockspace]
         self.check_lockspace_location(ls, path, offset)
@@ -92,8 +144,6 @@ class FakeSanlock(object):
         if "host_id" in ls:
             raise self.SanlockException(
                 errno.EEXIST, "Sanlock lockspace add failure", "File exists")
-
-        wait = not kwargs.get('async', False)
 
         generation = 0
         host = self.hosts.get(host_id)
@@ -125,15 +175,15 @@ class FakeSanlock(object):
 
     @maybefail
     def rem_lockspace(self, lockspace, host_id, path, offset=0,
-                      unused=False, **kwargs):
+                      unused=False, wait=True):
         """
-        Remove a lockspace, releasing the acquired host_id. If async is
-        True the function will return immediately and the status can be
+        Remove a lockspace, releasing the acquired host_id. If wait is
+        False the function will return immediately and the status can be
         checked using inq_lockspace. If unused is True the command will
         fail (EBUSY) if there is at least one acquired resource in the
         lockspace (instead of automatically release it).
         """
-        wait = not kwargs.get('async', False)
+        self._validate_bytes(lockspace)
         ls = self.spaces[lockspace]
 
         # Mark the locksapce as not ready, so callers of inq_lockspace will
@@ -174,6 +224,7 @@ class FakeSanlock(object):
         function will block until the host_id is either acquired or
         released.
         """
+        self._validate_bytes(lockspace)
         try:
             ls = self.spaces[lockspace]
         except KeyError:
@@ -188,24 +239,40 @@ class FakeSanlock(object):
 
     @maybefail
     def write_resource(self, lockspace, resource, disks, max_hosts=0,
-                       num_hosts=0):
+                       num_hosts=0, align=ALIGN_SIZE[0],
+                       sector=SECTOR_SIZE[0]):
+        # Validate lockspace and resource names are given as bytes.
+        self._validate_bytes(lockspace)
+        self._validate_bytes(resource)
         # We never use more then one disk, not sure why sanlock supports more
         # then one. Fail if called with multiple disks.
         assert len(disks) == 1
+
+        # Here we skip check underlying sector size is same as one we use in
+        # this call, as real sanlock always succeeds.
+        self.check_align_and_sector(align, sector, check_sector=False)
 
         path, offset = disks[0]
         self.resources[(path, offset)] = {"lockspace": lockspace,
                                           "resource": resource,
                                           "version": 0,
-                                          "acquired": False}
+                                          "acquired": False,
+                                          "align": align,
+                                          "sector": sector,
+                                          }
 
     @maybefail
-    def read_resource(self, path, offset=0):
+    def read_resource(
+            self, path, offset=0, align=ALIGN_SIZE[0], sector=SECTOR_SIZE[0]):
         key = (path, offset)
         if key not in self.resources:
             raise self.SanlockException(self.SANLK_LEADER_MAGIC,
                                         "Sanlock resource read failure",
                                         "Sanlock excpetion")
+
+        self.check_align_and_sector(
+            align, sector, resource=self.resources[key])
+
         return self.resources[key]
 
     def register(self):
@@ -224,6 +291,9 @@ class FakeSanlock(object):
         version of the lease that must be acquired or fail.  The disks
         must be in the format: [(path, offset), ... ].
         """
+        # Validate lockspace and resource names are given as bytes.
+        self._validate_bytes(lockspace)
+        self._validate_bytes(resource)
         # Do we have a lockspace?
         try:
             ls = self.spaces[lockspace]
@@ -255,6 +325,9 @@ class FakeSanlock(object):
         Release a resource lease for the current process.  The disks
         must be in the format: [(path, offset), ... ].
         """
+        # Validate lockspace and resource names are given as bytes.
+        self._validate_bytes(lockspace)
+        self._validate_bytes(resource)
         # Do we have a lockspace?
         try:
             self.spaces[lockspace]
@@ -273,7 +346,12 @@ class FakeSanlock(object):
         res["host_id"] = 0
         res["generation"] = 0
 
-    def read_resource_owners(self, lockspace, resource, disks):
+    def read_resource_owners(
+            self, lockspace, resource, disks, align=ALIGN_SIZE[0],
+            sector=SECTOR_SIZE[0]):
+        # Validate lockspace and resource name are given as bytes.
+        self._validate_bytes(lockspace)
+        self._validate_bytes(resource)
         try:
             self.spaces[lockspace]
         except KeyError:
@@ -290,6 +368,8 @@ class FakeSanlock(object):
         key = disks[0]
         res = self.resources[key]
 
+        self.check_align_and_sector(align, sector, resource=res)
+
         # The lease is not owned, return empty list
         if res.get("host_id", 0) == 0:
             return []
@@ -302,6 +382,7 @@ class FakeSanlock(object):
         }]
 
     def get_hosts(self, lockspace, host_id=0):
+        self._validate_bytes(lockspace)
         try:
             self.spaces[lockspace]
         except KeyError:
@@ -311,17 +392,27 @@ class FakeSanlock(object):
         return [self.hosts[host_id]]
 
     def write_lockspace(self, lockspace, path, offset=0, max_hosts=0,
-                        iotimeout=0):
+                        iotimeout=0, align=ALIGN_SIZE[0],
+                        sector=SECTOR_SIZE[0]):
         """
         Initialize a device to be used as sanlock lock space.
         In our case, we just create empty dictionary for a lockspace.
         """
+        self._validate_bytes(lockspace)
+        self.check_align_and_sector(align, sector)
+
         ls = {
             "path": path,
             "offset": offset,
             "max_hosts": max_hosts,
             "iotimeout": 0,
+            "align": align,
+            "sector": sector,
         }
 
         # Real sanlock just overwrites lockspace if it was already initialized.
         self.spaces[lockspace] = ls
+
+    def _validate_bytes(self, arg):
+        if not isinstance(arg, bytes):
+            raise TypeError("Argument type is not bytes: %r" % arg)

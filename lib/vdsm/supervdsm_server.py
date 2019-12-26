@@ -1,4 +1,4 @@
-# Copyright 2011-2017 Red Hat, Inc.
+# Copyright 2011-2019 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,6 +33,7 @@ import syslog
 
 from contextlib import closing
 from functools import wraps
+from multiprocessing import connection
 from multiprocessing import Pipe
 from multiprocessing import Process
 
@@ -40,7 +41,6 @@ import six
 
 from vdsm.common import concurrent
 from vdsm.common import constants
-from vdsm.common import fileutils
 from vdsm.common import lockfile
 from vdsm.common import sigutils
 from vdsm.common import time
@@ -57,11 +57,6 @@ from vdsm.storage import constants as sc
 from vdsm.storage import fuser
 from vdsm.storage import hba
 from vdsm.storage import mount
-from vdsm.storage.devicemapper import (
-    _removeMapping,
-    _getPathsStatus,
-    _multipath_status
-)
 from vdsm.storage.fileUtils import chown, resolveGid, resolveUid
 from vdsm.storage.fileUtils import validateAccess as _validateAccess
 from vdsm.storage.iscsi import getDevIscsiInfo as _getdeviSCSIinfo
@@ -70,10 +65,9 @@ from vdsm.common.supervdsm import _SuperVdsmManager
 
 from vdsm.network.initializer import init_privileged_network_components
 
-from vdsm.storage.multipath import getScsiSerial as _getScsiSerial
-from vdsm.storage import multipath
 from vdsm.config import config
 
+_AUTHKEY = b""
 RUN_AS_TIMEOUT = config.getint("irs", "process_pool_timeout")
 
 _running = True
@@ -133,10 +127,6 @@ class _SuperVdsm(object):
     log = logging.getLogger("SuperVdsm.ServerCallback")
 
     @logDecorator
-    def getScsiSerial(self, *args, **kwargs):
-        return _getScsiSerial(*args, **kwargs)
-
-    @logDecorator
     def mount(self, fs_spec, fs_file, mntOpts=None, vfstype=None,
               cgroup=None):
         mount._mount(fs_spec, fs_file, mntOpts=mntOpts, vfstype=vfstype,
@@ -147,28 +137,12 @@ class _SuperVdsm(object):
         mount._umount(fs_file, force=force, lazy=lazy, freeloop=freeloop)
 
     @logDecorator
-    def resizeMap(self, devName):
-        return multipath._resize_map(devName)
-
-    @logDecorator
-    def removeDeviceMapping(self, devName):
-        return _removeMapping(devName)
-
-    @logDecorator
     def getdeviSCSIinfo(self, *args, **kwargs):
         return _getdeviSCSIinfo(*args, **kwargs)
 
     @logDecorator
     def readSessionInfo(self, sessionID):
         return _readSessionInfo(sessionID)
-
-    @logDecorator
-    def getPathsStatus(self):
-        return _getPathsStatus()
-
-    @logDecorator
-    def multipath_status(self):
-        return _multipath_status()
 
     def _runAs(self, user, groups, func, args=(), kwargs={}):
         def child(pipe):
@@ -320,12 +294,12 @@ def main(args):
             signal.signal(signal.SIGINT, terminate)
 
             log.debug("Creating remote object manager")
-            manager = _SuperVdsmManager(address=address, authkey=b'')
+            manager = _SuperVdsmManager(address=address, authkey=_AUTHKEY)
             manager.register('instance', callable=_SuperVdsm)
 
             server = manager.get_server()
-            servThread = concurrent.thread(server.serve_forever)
-            servThread.start()
+            server_thread = concurrent.thread(server.serve_forever)
+            server_thread.start()
 
             chown(address, args.user, args.group)
 
@@ -339,8 +313,16 @@ def main(args):
 
             log.debug("Terminated normally")
         finally:
-            if os.path.exists(address):
-                fileutils.rm_file(address)
+            try:
+                with connection.Client(address, authkey=_AUTHKEY) as conn:
+                    server.shutdown(conn)
+                server_thread.join()
+            except:
+                # We ignore any errors here to avoid a situation where systemd
+                # restarts supervdsmd just at the end of shutdown stage. We're
+                # prepared to handle any mess (like existing outdated socket
+                # file) in the startup stage.
+                pass
 
     except Exception as e:
         syslog.syslog("Supervdsm failed to start: %s" % e)

@@ -99,7 +99,7 @@ def readMemInfo():
 
 def _parseCmdLine(pid):
     with open("/proc/%d/cmdline" % pid, "rb") as f:
-        return tuple(f.read().split("\0")[:-1])
+        return tuple(f.read().split(b"\0")[:-1])
 
 
 def getCmdArgs(pid):
@@ -124,10 +124,6 @@ def convertToStr(val):
         return '%d' % (val)
     else:
         return val
-
-
-def stripNewLines(lines):
-    return [l[:-1] if l.endswith('\n') else l for l in lines]
 
 
 class Canceled(BaseException):

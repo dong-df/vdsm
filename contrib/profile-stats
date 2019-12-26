@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 #
 # Copyright 2014 Red Hat, Inc.
 #
@@ -53,6 +53,8 @@ for that:
     profile-stats -c vdsmd.prof > profile-for-bugzilla.prof
 
 """
+
+from __future__ import absolute_import
 
 import optparse
 import pstats

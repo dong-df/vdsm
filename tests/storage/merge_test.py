@@ -23,9 +23,9 @@ from __future__ import division
 
 from contextlib import contextmanager
 from collections import namedtuple
-from functools import partial
 
 import pytest
+
 from _pytest.monkeypatch import MonkeyPatch
 
 from storage.storagefakelib import (
@@ -44,10 +44,10 @@ from . import qemuio
 from testlib import make_uuid
 
 from vdsm.common import cmdutils
+from vdsm.common.units import KiB, MiB, GiB
 from vdsm.storage import blockVolume
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
-from vdsm.storage import fileVolume
 from vdsm.storage import guarded
 from vdsm.storage import image
 from vdsm.storage import merge
@@ -55,25 +55,6 @@ from vdsm.storage import operation
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import volume
-
-MB = 1024 ** 2
-GB = 1024 ** 3
-
-
-# XXX: Ideally we wouldn't fake these methods but the originals are defined in
-# the Volume class and use SPM rollbacks so we cannot use them.
-def fake_blockVolume_extendSize(env, vol_instance, new_size_blk):
-    new_size = new_size_blk * sc.BLOCK_SIZE
-    new_size_mb = (new_size + MB - 1) // MB
-    env.lvm.extendLV(env.sd_manifest.sdUUID, vol_instance.volUUID, new_size_mb)
-    vol_instance.setSize(new_size_blk)
-
-
-def fake_fileVolume_extendSize(env, vol_instance, new_size_blk):
-    new_size = new_size_blk * sc.BLOCK_SIZE
-    vol_path = vol_instance.getVolumePath()
-    env.sd_manifest.oop.truncateFile(vol_path, new_size)
-    vol_instance.setSize(new_size_blk)
 
 
 Volume = namedtuple("Volume", "format,virtual,physical")
@@ -92,10 +73,10 @@ def make_env(env_type, base, top):
         prealloc = sc.SPARSE_VOL
 
     with fake_env(env_type) as env:
-        env.make_volume(base.virtual * GB, img_id, base_id,
+        env.make_volume(base.virtual * GiB, img_id, base_id,
                         vol_format=sc.name2type(base.format),
                         prealloc=prealloc)
-        env.make_volume(top.virtual * GB, img_id, top_id,
+        env.make_volume(top.virtual * GiB, img_id, top_id,
                         parent_vol_id=base_id,
                         vol_format=sc.COW_FORMAT)
         env.subchain = merge.SubchainInfo(
@@ -105,9 +86,9 @@ def make_env(env_type, base, top):
         if env_type == 'block':
             # Simulate allocation by adjusting the LV sizes
             env.lvm.extendLV(env.sd_manifest.sdUUID, base_id,
-                             base.physical * GB // MB)
+                             base.physical * GiB // MiB)
             env.lvm.extendLV(env.sd_manifest.sdUUID, top_id,
-                             top.physical * GB // MB)
+                             top.physical * GiB // MiB)
 
         with MonkeyPatch().context() as mp:
             mp.setattr(guarded, 'context', fake_guarded_context())
@@ -118,12 +99,6 @@ def make_env(env_type, base, top):
                 image.Image, 'getChain',
                 lambda self, sdUUID, imgUUID:
                     [env.subchain.base_vol, env.subchain.top_vol])
-            mp.setattr(
-                blockVolume.BlockVolume, 'extendSize',
-                partial(fake_blockVolume_extendSize, env))
-            mp.setattr(
-                fileVolume.FileVolume, 'extendSize',
-                partial(fake_fileVolume_extendSize, env))
             yield env
 
 
@@ -139,7 +114,7 @@ class TestSubchainInfo:
     @contextmanager
     def make_env(self, sd_type='file', format='raw', chain_len=2,
                  shared=False):
-        size = 1048576
+        size = MiB
         base_fmt = sc.name2type(format)
         with fake_env(sd_type) as env:
             with MonkeyPatch().context() as mp:
@@ -243,11 +218,11 @@ class TestPrepareMerge:
             assert self.expected_locks(env.subchain) == guarded.context.locks
             base_vol = env.subchain.base_vol
             assert sc.LEGAL_VOL == base_vol.getLegality()
-            new_base_size = base_vol.getSize() * sc.BLOCK_SIZE
+            new_base_size = base_vol.getCapacity()
             new_base_alloc = env.sd_manifest.getVSize(base_vol.imgUUID,
                                                       base_vol.volUUID)
-            assert expected.virtual * GB == new_base_size
-            assert expected.physical * GB == new_base_alloc
+            assert expected.virtual * GiB == new_base_size
+            assert expected.physical * GiB == new_base_alloc
 
     @pytest.mark.xfail(reason="cannot create a domain object in the tests")
     @pytest.mark.parametrize("base, top, expected", [
@@ -260,11 +235,11 @@ class TestPrepareMerge:
             assert self.expected_locks(env.subchain) == guarded.context.locks
             base_vol = env.subchain.base_vol
             assert sc.LEGAL_VOL == base_vol.getLegality()
-            new_base_size = base_vol.getSize() * sc.BLOCK_SIZE
+            new_base_size = base_vol.getCapacity()
             new_base_alloc = env.sd_manifest.getVSize(base_vol.imgUUID,
                                                       base_vol.volUUID)
-            assert expected.virtual * GB == new_base_size
-            assert expected.physical * GB == new_base_alloc
+            assert expected.virtual * GiB == new_base_size
+            assert expected.physical * GiB == new_base_alloc
 
     @pytest.mark.parametrize("base, top, expected", [
         (Volume('cow', 1, 0), Volume('cow', 1, 0), Expected(1, 0)),
@@ -275,8 +250,8 @@ class TestPrepareMerge:
             merge.prepare(env.subchain)
             base_vol = env.subchain.base_vol
             assert sc.LEGAL_VOL == base_vol.getLegality()
-            new_base_size = base_vol.getSize() * sc.BLOCK_SIZE
-            assert expected.virtual * GB == new_base_size
+            new_base_size = base_vol.getCapacity()
+            assert expected.virtual * GiB == new_base_size
 
     @pytest.mark.xfail(reason="cannot create a domain object in the tests")
     @pytest.mark.parametrize("base, top, expected", [
@@ -287,8 +262,8 @@ class TestPrepareMerge:
             merge.prepare(env.subchain)
             base_vol = env.subchain.base_vol
             assert sc.LEGAL_VOL == base_vol.getLegality()
-            new_base_size = base_vol.getSize() * sc.BLOCK_SIZE
-            assert expected.virtual * GB == new_base_size
+            new_base_size = base_vol.getCapacity()
+            assert expected.virtual * GiB == new_base_size
 
     def expected_locks(self, subchain):
         img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, subchain.sd_id)
@@ -320,7 +295,7 @@ class TestFinalizeMerge:
     # TODO: use one make_env for all tests?
     @contextmanager
     def make_env(self, sd_type='block', format='raw', chain_len=2):
-        size = 1048576
+        size = MiB
         base_fmt = sc.name2type(format)
         with fake_env(sd_type) as env:
             with MonkeyPatch().context() as mp:
@@ -350,10 +325,10 @@ class TestFinalizeMerge:
     #    prepared
 
     @pytest.mark.parametrize("sd_type, chain_len, base_index, top_index", [
-        ('file', 2, 0, 1),
-        ('block', 2, 0, 1),
-        ('file', 4, 1, 2),
-        ('block', 4, 1, 2),
+        pytest.param('file', 2, 0, 1),
+        pytest.param('block', 2, 0, 1),
+        pytest.param('file', 4, 1, 2),
+        pytest.param('block', 4, 1, 2),
     ])
     def test_finalize(self, sd_type, chain_len, base_index, top_index):
         with self.make_env(sd_type=sd_type, chain_len=chain_len) as env:
@@ -468,9 +443,8 @@ class TestFinalizeMerge:
             fake_base_vol = fake_sd.produceVolume(subchain.img_id,
                                                   subchain.base_id)
 
-            optimal_size = base_vol.optimal_size() // sc.BLOCK_SIZE
             assert fake_base_vol.__calls__ == [
-                ('reduce', (optimal_size,), {}),
+                ('reduce', (base_vol.optimal_size(),), {}),
             ]
 
     def test_reduce_not_chunked(self):
@@ -526,7 +500,7 @@ class TestFinalizeMerge:
             # to verify that the chain is valid after qemu-rebase.
             offset = 0
             pattern = 0xf0
-            length = 1024
+            length = KiB
             qemuio.write_pattern(
                 base_vol.volumePath,
                 sc.fmt2str(base_vol.getFormat()),

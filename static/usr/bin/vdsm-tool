@@ -1,4 +1,4 @@
-#!/usr/bin/python2
+#!/usr/bin/python3
 # Copyright 2011-2018 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
@@ -21,7 +21,7 @@ from __future__ import absolute_import
 from __future__ import print_function
 
 import getopt
-import imp
+import importlib
 import logging
 import os
 import sys
@@ -29,17 +29,8 @@ import syslog
 import textwrap
 import traceback
 
-########################################################################
-# Hack for vdsm-4.16.x installation
-# To avoid import vdsm-tool verbs from old location (/usr/lib64) on
-# upgrade we need to explicit import vdsm.tool from /usr/lib. Otherwise
-# all tool's verbs are loaded from the old vdsm code during upgrade.
-lib_dir = os.path.join(os.path.dirname(os.__file__).
-                       replace('lib64', 'lib'), 'site-packages')
-vdsm = imp.load_module('vdsm', *imp.find_module('vdsm', [lib_dir]))
-vdsm.tool = imp.load_module('vdsm.tool',
-                            *imp.find_module('tool', vdsm.__path__))
-########################################################################
+import vdsm.tool
+
 
 tool_modules = []
 tool_command = {}
@@ -86,10 +77,8 @@ def load_modules():
         if mod_name.startswith("_"):
             continue
 
-        mod_fobj, mod_absp, mod_desc = imp.find_module(mod_name, [mod_path])
         try:
-            module = imp.load_module(package_name + '.' + mod_name, mod_fobj,
-                                     mod_absp, mod_desc)
+            module = importlib.import_module(package_name + '.' + mod_name)
         except Exception:
             # py module was failed to load. report to syslog and continue
             syslog.syslog("module %s could not load to vdsm-tool: %s" %
@@ -218,11 +207,11 @@ def main():
 
     try:
         return tool_command[cmd]["command"](*args)
-    except vdsm.tool.UsageError as e:
-        print('Error: ', e, '\n', file=sys.stderr)
-        return 1
     except vdsm.tool.ExtraArgsError as e:
         print_command_usage(tool_command[cmd]["command"], sys.stderr)
+        return 1
+    except vdsm.tool.UsageError as e:
+        print('Error: ', e, '\n', file=sys.stderr)
         return 1
     except Exception:
         traceback.print_exc(file=sys.stderr)
