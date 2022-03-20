@@ -18,14 +18,9 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
+from vdsm.virt.utils import LibguestfsCommand
 
-from vdsm.common import commands
-from vdsm.common.cmdutils import CommandPath
-
-# Fedora, EL6
-_VIRTSPARSIFY = CommandPath("virt-sparsify",
-                            "/usr/bin/virt-sparsify",)
+_VIRTSPARSIFY = LibguestfsCommand("/usr/bin/virt-sparsify")
 
 
 def sparsify_inplace(vol_path):
@@ -35,6 +30,4 @@ def sparsify_inplace(vol_path):
 
     :param vol_path: path to the volume
     """
-    cmd = [_VIRTSPARSIFY.cmd, '--machine-readable', '--in-place', vol_path]
-
-    commands.run(cmd)
+    _VIRTSPARSIFY.run(['--machine-readable', '--in-place', vol_path])

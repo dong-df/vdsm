@@ -1,4 +1,4 @@
-# Copyright 2013-2018 Red Hat, Inc.
+# Copyright 2013-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,28 +22,22 @@ from __future__ import division
 
 from fnmatch import fnmatch
 from glob import iglob
+from ipaddress import ip_address
+from ipaddress import ip_network
+
 import errno
-import itertools
 import os
-
-import six
-
-from netaddr.core import AddrFormatError
-from netaddr import IPAddress
-from netaddr import IPNetwork
 
 from vdsm.common.cmdutils import CommandPath
 from vdsm.common.compat import subprocess
 from vdsm.common.config import config
 from vdsm.network import cmd
 from vdsm.network import ethtool
-from vdsm.network.link import dpdk
 from vdsm.network.netlink import libnl
 from vdsm.network.netlink import link
 
 _IP_BINARY = CommandPath('ip', '/sbin/ip')
 
-NET_SYSFS = '/sys/class/net'
 DUMMY_BRIDGE = ';vdsmdummy;'
 _ROUTE_FLAGS = frozenset(
     (
@@ -67,7 +61,7 @@ _ROUTE_FLAGS = frozenset(
 def _isValid(ip, verifier):
     try:
         verifier(ip)
-    except (AddrFormatError, ValueError):
+    except ValueError:
         return False
 
     return True
@@ -90,7 +84,6 @@ class LinkType(object):
     BRIDGE = 'bridge'
     LOOPBACK = 'loopback'
     MACVLAN = 'macvlan'
-    DPDK = 'dpdk'
     DUMMY = 'dummy'
     TUN = 'tun'
     OVS = 'openvswitch'
@@ -199,9 +192,6 @@ class Link(object):
     def isDUMMY(self):
         return self.type == LinkType.DUMMY
 
-    def isDPDK(self):
-        return self.type == LinkType.DPDK
-
     def isNIC(self):
         return self.type == LinkType.NIC
 
@@ -227,7 +217,7 @@ class Link(object):
         return False
 
     def isNICLike(self):
-        return self.isNIC() or self.isVF() or self.isFakeNIC() or self.isDPDK()
+        return self.isNIC() or self.isVF() or self.isFakeNIC()
 
     def isHidden(self):
         """Returns True iff vdsm config hides the device."""
@@ -271,8 +261,6 @@ class Link(object):
 
     @property
     def oper_up(self):
-        if dpdk.is_dpdk(self.name):
-            return dpdk.is_oper_up(self.name)
         return bool(
             link.get_link(self.name)['flags'] & libnl.IfaceStatus.IFF_RUNNING
         )
@@ -301,11 +289,7 @@ def _bondExists(bondName):
 
 def getLinks():
     """Return an iterator of Link objects, each per a link in the system."""
-    dpdk_links = (
-        dpdk.link_info(dev_name, dev_info['pci_addr'])
-        for dev_name, dev_info in six.viewitems(dpdk.get_dpdk_devices())
-    )
-    for data in itertools.chain(link.iter_links(), dpdk_links):
+    for data in link.iter_links():
         try:
             yield Link.fromDict(data)
         except IOError:  # If a link goes missing we just don't report it
@@ -314,21 +298,19 @@ def getLinks():
 
 def getLink(dev):
     """Returns the Link object for the specified dev."""
-    if dpdk.is_dpdk(dev):
-        return dpdk.link_info(dev)
     return Link.fromDict(link.get_link(dev))
 
 
 @equals
 class Route(object):
     def __init__(self, network, via=None, src=None, device=None, table=None):
-        if network != 'local' and not _isValid(network, IPNetwork):
+        if network != 'local' and not _isValid(network, ip_network):
             raise ValueError('network %s is not properly defined' % network)
 
-        if via and not _isValid(via, IPAddress):
+        if via and not _isValid(via, ip_address):
             raise ValueError('via %s is not a proper IP address' % via)
 
-        if src and not _isValid(src, IPAddress):
+        if src and not _isValid(src, ip_address):
             raise ValueError('src %s is not a proper IP address' % src)
 
         self.network = network
@@ -355,8 +337,9 @@ class Route(object):
             route = route[1:]
 
         network = route[0]
-
-        data = dict(route[i : i + 2] for i in range(1, len(route), 2))
+        data = dict(
+            route[i : i + 2] for i in range(1, len(route), 2)  # noqa: E203
+        )
         data['network'] = '0.0.0.0/0' if network == 'default' else network
         data.update(flags)
         return data
@@ -364,13 +347,13 @@ class Route(object):
     @classmethod
     def fromText(cls, text):
         """
-            Creates a Route object from a textual representation.
+        Creates a Route object from a textual representation.
 
-            Examples:
-            'default via 192.168.99.254 dev eth0':
-            '0.0.0.0/0 via 192.168.99.254 dev eth0 table foo':
-            '200.100.50.0/16 via 11.11.11.11 dev eth2 table foo':
-            'local 127.0.0.1 dev lo scope host src 127.0.0.1':
+        Examples:
+        'default via 192.168.99.254 dev eth0':
+        '0.0.0.0/0 via 192.168.99.254 dev eth0 table foo':
+        '200.100.50.0/16 via 11.11.11.11 dev eth2 table foo':
+        'local 127.0.0.1 dev lo scope host src 127.0.0.1':
         """
         try:
             data = cls.parse(text)
@@ -424,7 +407,7 @@ class Rule(object):
     ):
         if source:
             if not (
-                _isValid(source, IPAddress) or _isValid(source, IPNetwork)
+                _isValid(source, ip_address) or _isValid(source, ip_network)
             ):
                 raise ValueError(
                     'Source %s invalid: Not an ip address '
@@ -433,8 +416,8 @@ class Rule(object):
 
         if destination:
             if not (
-                _isValid(destination, IPAddress)
-                or _isValid(destination, IPNetwork)
+                _isValid(destination, ip_address)
+                or _isValid(destination, ip_network)
             ):
                 raise ValueError(
                     'Destination %s invalid: Not an ip address '
@@ -462,7 +445,8 @@ class Rule(object):
             )
 
         values = dict(
-            parameters[i : i + 2] for i in range(0, len(parameters), 2)
+            parameters[i : i + 2]  # noqa: E203
+            for i in range(0, len(parameters), 2)
         )
         values['detached'] = isDetached
         values['prio'] = prio
@@ -471,15 +455,15 @@ class Rule(object):
     @classmethod
     def fromText(cls, text):
         """
-            Creates a Rule object from a textual representation. Since it is
-            used for source routing, the source network specified in "from" and
-            the table "lookup" that shall be used for the routing must be
-            specified.
+        Creates a Rule object from a textual representation. Since it is
+        used for source routing, the source network specified in "from" and
+        the table "lookup" that shall be used for the routing must be
+        specified.
 
-            Examples:
-            32766:    from all lookup main
-            32767:    from 10.0.0.0/8 to 20.0.0.0/8 lookup table_100
-            32768:    from all to 8.8.8.8 lookup table_200
+        Examples:
+        32766:    from all lookup main
+        32767:    from 10.0.0.0/8 to 20.0.0.0/8 lookup table_100
+        32768:    from all to 8.8.8.8 lookup table_200
         """
         data = cls.parse(text)
         try:
@@ -613,20 +597,6 @@ def routeGet(ipAddress):
     return _exec_cmd(command)
 
 
-def _getValidEntries(constructor, iterable):
-    for entry in iterable:
-        try:
-            yield constructor(entry)
-        except ValueError:
-            pass
-
-
-def routeExists(route):
-    return route in _getValidEntries(
-        constructor=Route.fromText, iterable=routeShowTable('all')
-    )
-
-
 def ruleList():
     command = [_IP_BINARY.cmd, 'rule']
     return _exec_cmd(command)
@@ -642,12 +612,6 @@ def ruleDel(rule):
     command = [_IP_BINARY.cmd, 'rule', 'del']
     command += rule
     _exec_cmd(command)
-
-
-def ruleExists(rule):
-    return rule in _getValidEntries(
-        constructor=Rule.fromText, iterable=ruleList()
-    )
 
 
 def addrAdd(dev, ipaddr, netmask, family=4):

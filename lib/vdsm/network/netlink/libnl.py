@@ -1,4 +1,4 @@
-# Copyright 2017 Red Hat, Inc.
+# Copyright 2017-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,11 +33,24 @@ native Python manner.
 from __future__ import absolute_import
 from __future__ import division
 
-from ctypes import CDLL, CFUNCTYPE, sizeof, get_errno, byref
-from ctypes import c_char, c_char_p, c_int, c_void_p, c_size_t, py_object
+from ctypes import CDLL
+from ctypes import CFUNCTYPE
+from ctypes import POINTER
+from ctypes import Structure
+from ctypes import byref
+from ctypes import c_char
+from ctypes import c_char_p
+from ctypes import c_int
+from ctypes import c_size_t
+from ctypes import c_uint32
+from ctypes import c_ushort
+from ctypes import c_void_p
+from ctypes import get_errno
+from ctypes import py_object
+from ctypes import sizeof
 
 from vdsm.common.cache import memoized
-from vdsm.network import py2to3
+from vdsm.network.common import conversion_util
 
 LIBNL = CDLL('libnl-3.so.200', use_errno=True)
 LIBNL_ROUTE = CDLL('libnl-route-3.so.200', use_errno=True)
@@ -110,6 +123,20 @@ EVENTS = {
     79: 'set_dcb',  # RTM_SETDCB
 }
 
+# libnl/include/linux-private/linux/if_link.h
+IFLA_EVENT = 44
+
+# libnl/include/linux-private/linux/if_link.h
+IFLA_EVENT_MAP = {
+    0: 'IFLA_EVENT_NONE',
+    1: 'FLA_EVENT_REBOOT',
+    2: 'IFLA_EVENT_FEATURES',
+    3: 'IFLA_EVENT_BONDING_FAILOVER',
+    4: 'IFLA_EVENT_NOTIFY_PEERS',
+    5: 'IFLA_EVENT_IGMP_RESEND',
+    6: 'IFLA_EVENT_BONDING_OPTIONS',
+}
+
 
 # libnl/include/linux-private/linux/rtnetlink.h
 class RtKnownTables(object):
@@ -165,6 +192,17 @@ class RtnlObjectType(object):
     LINK = BASE + '/link'  # libnl/lib/route/link.c
 
 
+# linux/genetlink.h
+class GeNlMsgHdr(Structure):
+    _fields_ = [
+        ('nlmsg_len', c_uint32),
+        ('nlmsg_type', c_ushort),
+        ('nlmsg_flags', c_ushort),
+        ('nlmsg_seq', c_uint32),
+        ('nlmsg_pid', c_uint32),
+    ]
+
+
 def nl_geterror(error_code):
     """Return error message for an error code.
 
@@ -174,7 +212,7 @@ def nl_geterror(error_code):
     """
     _nl_geterror = _libnl('nl_geterror', c_char_p, c_int)
     error_message = _nl_geterror(error_code)
-    return py2to3.to_str(error_message)
+    return conversion_util.to_str(error_message)
 
 
 def nl_addr2str(addr):
@@ -189,7 +227,7 @@ def nl_addr2str(addr):
     )
     buf = (c_char * HWADDRSIZE)()
     address = _nl_addr2str(addr, buf, sizeof(buf))
-    return py2to3.to_str(address)
+    return conversion_util.to_str(address)
 
 
 def nl_af2str(family):
@@ -202,7 +240,7 @@ def nl_af2str(family):
     _nl_af2str = _libnl('nl_af2str', c_char_p, c_int, c_char_p, c_size_t)
     buf = (c_char * CHARBUFFSIZE)()
     address_family = _nl_af2str(family, buf, sizeof(buf))
-    return py2to3.to_str(address_family)
+    return conversion_util.to_str(address_family)
 
 
 def rtnl_scope2str(scope):
@@ -217,7 +255,7 @@ def rtnl_scope2str(scope):
     )
     buf = (c_char * CHARBUFFSIZE)()
     address_scope = _rtnl_scope2str(scope, buf, sizeof(buf))
-    return py2to3.to_str(address_scope)
+    return conversion_util.to_str(address_scope)
 
 
 def nl_socket_alloc():
@@ -357,6 +395,19 @@ def prepare_cfunction_for_nl_socket_modify_cb(function):
     return c_function
 
 
+def prepare_cfunction_for_nl_socket_modify_cb_py(function):
+    """Prepare callback function for nl_socket_modify_cb.
+
+    @arg                  Python function accepting two objects (message and
+                          extra argument) as arguments and returns integer
+                          with libnl callback action.
+
+    @return C function prepared for nl_socket_modify_cb.
+    """
+    c_function = CFUNCTYPE(c_int, c_void_p, py_object)(function)
+    return c_function
+
+
 def nl_socket_disable_seq_check(socket):
     """Disable sequence number checking.
 
@@ -415,7 +466,7 @@ def nl_object_get_type(obj):
     """
     _nl_object_get_type = _libnl('nl_object_get_type', c_char_p, c_void_p)
     object_type = _nl_object_get_type(obj)
-    return py2to3.to_str(object_type) if object_type else None
+    return conversion_util.to_str(object_type) if object_type else None
 
 
 def nl_object_get_msgtype(obj):
@@ -430,6 +481,48 @@ def nl_object_get_msgtype(obj):
     if message_type == 0:
         raise IOError(get_errno(), 'Failed to obtain message name.')
     return message_type
+
+
+def nlmsg_hdr(nl_msg):
+    """Returns the actual netlink message casted to the type of the netlink
+       message header.
+
+    @arg nl_msg          netlink message
+    @return The actual netlink message casted to the type of the netlink
+            message header.
+
+    """
+    _nlmsg_hdr = _libnl('nlmsg_hdr', POINTER(GeNlMsgHdr), c_void_p)
+    return _nlmsg_hdr(nl_msg)
+
+
+def size_of_genlmsghdr():
+    return sizeof(GeNlMsgHdr)
+
+
+def nla_get_u32(nla):
+    """Return payload of 32 bit integer attribute.
+
+    @arg nla             32 bit integer attribute.
+
+    @return Payload as 32 bit integer.
+    """
+    _nla_get_u32 = _libnl('nla_get_u32', c_uint32, c_void_p)
+    return _nla_get_u32(nla)
+
+
+def nlmsg_find_attr(hdr, hdrlen, attrtype):
+    """find a specific attribute in a netlink message
+
+    @arg nlh             netlink message header
+    @arg hdrlen          length of familiy specific header
+    @arg attrtype        type of attribute to look for
+    @:return The first attribute which matches the specified type.
+    """
+    _nlmsg_find_attr = _libnl(
+        'nlmsg_find_attr', c_void_p, c_void_p, c_int, c_int
+    )
+    return _nlmsg_find_attr(hdr, hdrlen, attrtype)
 
 
 def nl_msg_parse(message, function, argument):
@@ -575,7 +668,7 @@ def rtnl_addr_flags2str(flags_bitfield):
     )
     buf = (c_char * (CHARBUFFSIZE * 2))()
     flags_str = _rtnl_addr_flags2str(flags_bitfield, buf, sizeof(buf))
-    return py2to3.to_str(flags_str)
+    return conversion_util.to_str(flags_str)
 
 
 def rtnl_link_alloc_cache(socket, family):
@@ -641,7 +734,7 @@ def rtnl_link_get_type(link):
         'rtnl_link_get_type', c_char_p, c_void_p
     )
     link_type = _rtnl_link_get_type(link)
-    return py2to3.to_str(link_type) if link_type else None
+    return conversion_util.to_str(link_type) if link_type else None
 
 
 def rtnl_link_get_kernel(socket, ifindex, ifname):
@@ -661,7 +754,7 @@ def rtnl_link_get_kernel(socket, ifindex, ifname):
         'rtnl_link_get_kernel', c_int, c_void_p, c_int, c_char_p, c_void_p
     )
     link = c_void_p()
-    b_ifname = py2to3.to_binary(ifname) if ifname else None
+    b_ifname = conversion_util.to_binary(ifname) if ifname else None
     err = _rtnl_link_get_kernel(socket, ifindex, b_ifname, byref(link))
     if err:
         raise IOError(-err, nl_geterror(err))
@@ -765,7 +858,7 @@ def rtnl_link_get_name(link):
         'rtnl_link_get_name', c_char_p, c_void_p
     )
     name = _rtnl_link_get_name(link)
-    return py2to3.to_str(name) if name else None
+    return conversion_util.to_str(name) if name else None
 
 
 def rtnl_link_get_operstate(link):
@@ -794,27 +887,7 @@ def rtnl_link_get_qdisc(link):
         'rtnl_link_get_qdisc', c_char_p, c_void_p
     )
     qdisc = _rtnl_link_get_qdisc(link)
-    return py2to3.to_str(qdisc) if qdisc else None
-
-
-def rtnl_link_get_by_name(cache, name):
-    """Lookup link in cache by link name
-
-    @arg cache           Link cache
-    @arg name            Name of link
-
-    Searches through the provided cache looking for a link with matching
-    link name
-
-    @attention The reference counter of the returned link object will be
-            incremented. Use rtnl_link_put() to release the reference.
-
-    @return Link object or None if no match was found.
-    """
-    _rtnl_link_get_by_name = _libnl_route(
-        'rtnl_link_get_by_name', c_void_p, c_void_p, c_char_p
-    )
-    return _rtnl_link_get_by_name(cache, name)
+    return conversion_util.to_str(qdisc) if qdisc else None
 
 
 def rtnl_link_i2name(cache, ifindex):
@@ -832,7 +905,7 @@ def rtnl_link_i2name(cache, ifindex):
     )
     buf = (c_char * CHARBUFFSIZE)()
     name = _rtnl_link_i2name(cache, ifindex, buf, sizeof(buf))
-    return py2to3.to_str(name) if name else None
+    return conversion_util.to_str(name) if name else None
 
 
 def rtnl_link_operstate2str(operstate_code):
@@ -847,7 +920,7 @@ def rtnl_link_operstate2str(operstate_code):
     )
     buf = (c_char * CHARBUFFSIZE)()
     operstate = _rtnl_link_operstate2str(operstate_code, buf, sizeof(buf))
-    return py2to3.to_str(operstate)
+    return conversion_util.to_str(operstate)
 
 
 def rtnl_link_put(link):
@@ -938,18 +1011,6 @@ def rtnl_route_get_src(route):
         'rtnl_route_get_src', c_void_p, c_void_p
     )
     return _rtnl_route_get_src(route)
-
-
-def rtnl_route_get_iif(route):
-    """Return input interface index.
-
-    @arg route           Route object
-
-    @return Input interface index (can be converted to a readable string via
-            rtnl_link_get_name or rtnl_link_i2name).
-    """
-    _rtnl_route_get_iif = _libnl_route('rtnl_route_get_iif', c_int, c_void_p)
-    return _rtnl_route_get_iif(route)
 
 
 def rtnl_route_get_table(route):

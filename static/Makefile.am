@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2017 Red Hat, Inc.
+# Copyright 2016-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -31,8 +31,8 @@ dist_bin_SCRIPTS = \
 	./usr/bin/vdsm-client \
 	./usr/bin/vdsm-tool
 
-dist_vdsm_PYTHON = \
-	./usr/share/vdsm/sitecustomize.py \
+dist_vdsmexec_PYTHON = \
+	./libexec/vdsm/sitecustomize.py \
 	$(NULL)
 
 vdsm_DATA = \
@@ -51,11 +51,6 @@ vdsm_autounattend_DATA = \
 	./usr/share/vdsm/autounattend/Win2012.xml \
 	./usr/share/vdsm/autounattend/Win2012R2.xml \
 	./usr/share/vdsm/autounattend/Win2016.xml \
-	$(NULL)
-
-dist_vdsm_SCRIPTS = \
-	./usr/sbin/supervdsmd \
-	./usr/sbin/vdsmd \
 	$(NULL)
 
 vdsmconf_DATA = \
@@ -127,24 +122,15 @@ dist_cronhourly_SCRIPTS = \
 
 dist_vdsmexec_SCRIPTS = \
 	./libexec/vdsm/get-conf-item \
+	./libexec/vdsm/supervdsmd \
 	./libexec/vdsm/vdsm-gencerts.sh \
+	./libexec/vdsm/vdsmd \
 	$(NULL)
 
 networkmanagerdir = $(sysconfdir)/NetworkManager/conf.d
 
 networkmanager_DATA = \
 	./etc/NetworkManager/conf.d/vdsm.conf \
-	$(NULL)
-
-dracutdir = $(exec_prefix)/lib/dracut/dracut.conf.d
-
-dracut_DATA = \
-	./usr/lib/dracut/dracut.conf.d/99-vdsm_protect_ifcfg.conf \
-	$(NULL)
-
-dhclientmondir = $(sysconfdir)/dhcp/dhclient.d
-dist_dhclientmon_SCRIPTS = \
-	./etc/dhcp/dhclient.d/dhclientmon.sh \
 	$(NULL)
 
 libvirthookdir = $(sysconfdir)/libvirt/hooks
@@ -158,12 +144,17 @@ systemdunit_DATA = \
 	./usr/lib/systemd/system/mom-vdsm.service \
 	./usr/lib/systemd/system/supervdsmd.service \
 	./usr/lib/systemd/system/vdsm-network.service \
-	./usr/lib/systemd/system/vdsm-network-init.service \
 	./usr/lib/systemd/system/vdsmd.service \
 	$(NULL)
 
 dist_systemdunit_DATA = \
 	./usr/lib/systemd/system/dev-hugepages1G.mount \
+	$(NULL)
+
+imageiodir = $(sysconfdir)/ovirt-imageio/conf.d
+
+imageio_DATA = \
+	./etc/ovirt-imageio/conf.d/60-vdsm.conf \
 	$(NULL)
 
 CLEANFILES = \
@@ -175,12 +166,12 @@ CLEANFILES = \
 	$(NULL)
 
 EXTRA_DIST = \
+	$(imageio_DATA) \
 	$(libvirtpassword_DATA) \
 	$(limits_DATA) \
 	$(modprobe_DATA) \
 	$(modulesload_DATA) \
 	$(networkmanager_DATA) \
-	$(dracut_DATA) \
 	$(sysctl_DATA) \
 	$(vdsmconfrotate_DATA) \
 	$(vdsm_DATA) \
@@ -193,7 +184,6 @@ EXTRA_DIST = \
 	./usr/lib/systemd/system/mom-vdsm.service.in \
 	./usr/lib/systemd/system/supervdsmd.service.in \
 	./usr/lib/systemd/system/vdsm-network.service.in \
-	./usr/lib/systemd/system/vdsm-network-init.service.in \
 	./usr/lib/systemd/system/vdsmd.service.in \
 	./usr/share/man/man1/vdsm-tool.1.in \
 	./usr/share/man/man8/vdsmd.8.in \
@@ -212,10 +202,9 @@ install-data-local: install-libvirtpasswordDATA
 	$(MKDIR_P) $(DESTDIR)$(vdsmtsdir)/libvirt-migrate
 	$(MKDIR_P) $(DESTDIR)$(vdsmtsdir)/libvirt-spice
 	$(MKDIR_P) $(DESTDIR)$(vdsmlogdir)
+	$(MKDIR_P) --mode=0750 $(DESTDIR)$(vdsmlogdir)/commands
 	$(MKDIR_P) $(DESTDIR)$(vdsmlogdir)/import
 	$(MKDIR_P) $(DESTDIR)$(vdsmrundir)
-	$(MKDIR_P) $(DESTDIR)$(vdsmrundir)/dhclientmon
-	$(MKDIR_P) $(DESTDIR)$(vdsmrundir)/trackedInterfaces
 	$(MKDIR_P) $(DESTDIR)$(vdsmrundir)/payload
 	$(MKDIR_P) $(DESTDIR)$(vdsmlibdir)/netconfback
 	$(MKDIR_P) $(DESTDIR)$(vdsmlibdir)/persistence

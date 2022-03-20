@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2019 Red Hat, Inc.
+# Copyright 2008-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -81,7 +81,6 @@ def update_device_info(vm, devices):
     """
     network.Interface.update_device_info(vm, devices[hwclass.NIC])
     storage.Drive.update_device_info(vm, devices[hwclass.DISK])
-    hostdevice.HostDevice.update_device_info(vm, devices[hwclass.HOSTDEV])
     lease.Device.update_device_info(vm, devices[hwclass.LEASE])
 
 
@@ -93,6 +92,13 @@ _DEVICE_MAPPING = {
 }
 
 
+_LEGACY_DEVICE_CLASSES = [
+    hwclass.DISK,
+    hwclass.NIC,
+    hwclass.LEASE,
+]
+
+
 def identify_from_xml_elem(dev_elem):
     dev_name = core.dev_class_from_dev_elem(dev_elem)
     if dev_name not in _DEVICE_MAPPING:
@@ -101,7 +107,7 @@ def identify_from_xml_elem(dev_elem):
 
 
 def empty_dev_map():
-    return {dev: [] for dev in _DEVICE_MAPPING}
+    return {dev: [] for dev in _LEGACY_DEVICE_CLASSES}
 
 
 # metadata used by the devices. Unless otherwise specified, type and meaning
@@ -298,7 +304,8 @@ def _device_elements(dom_desc, log):
         except core.SkipDevice:
             pass
         else:
-            yield dev_type, dev_class, dev_elem
+            if dev_type in _LEGACY_DEVICE_CLASSES:
+                yield dev_type, dev_class, dev_elem
 
 
 def _get_metadata_from_elem_xml(vmid, md_desc, dev_class, dev_elem):
@@ -313,8 +320,12 @@ def _get_metadata_from_elem_xml(vmid, md_desc, dev_class, dev_elem):
 def update_guest_disk_mapping(md_desc, disk_devices, guest_disk_mapping, log):
     for serial, value in guest_disk_mapping:
         for d in disk_devices:
+            guid = getattr(d, "GUID", None)
+            disk_serial = getattr(d, "serial", None)
             image_id = storage.image_id(d.path)
-            if image_id and image_id[:20] in serial:
+            if image_id and image_id[:20] in serial or \
+                    guid and guid[:20] in serial or \
+                    disk_serial and disk_serial[:20] in serial:
                 d.guestName = value['name']
                 log.debug("Guest name of drive %s: %s",
                           image_id, d.guestName)
@@ -325,6 +336,6 @@ def update_guest_disk_mapping(md_desc, disk_devices, guest_disk_mapping, log):
         else:
             if serial[20:]:
                 # Silently skip devices that don't appear to have a serial
-                # number, such as CD-ROMs or direct LUN devices.
+                # number, such as CD-ROMs devices.
                 log.warning("Unidentified guest drive %s: %s",
                             serial, value['name'])

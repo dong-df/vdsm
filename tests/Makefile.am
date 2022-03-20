@@ -31,9 +31,7 @@ common_modules = \
 	common/network_test.py \
 	common/osutils_test.py \
 	common/proc_test.py \
-	common/properties_test.py \
 	common/pthread_test.py \
-	common/time_test.py \
 	common/validate_test.py \
 	$(NULL)
 
@@ -79,7 +77,6 @@ test_modules = \
 	monkeypatch_test.py \
 	mom_test.py \
 	mompolicy_test.py \
-	osinfo_test.py \
 	osutils_test.py \
 	passwords_test.py \
 	permutation_test.py \
@@ -96,15 +93,12 @@ test_modules = \
 	tool_confmeta_test.py \
 	tool_test.py \
 	throttledlog_test.py \
-	unicode_test.py \
 	validate_test.py \
 	vdsmapi_test.py \
 	vdsmdumpchains_test.py \
 	verify.py \
 	vmapi_test.py \
-	vmfakelib_test.py \
 	vmTestsData.py \
-	zombiereaper_test.py \
 	$(NULL)
 
 CLEANFILES = \

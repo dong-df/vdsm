@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2019 Red Hat, Inc.
+# Copyright 2015-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,12 +26,9 @@ import logging
 
 import six
 
-from vdsm.network import dns
 from vdsm.network import nmstate
-from vdsm.network.ip import dhclient
 from vdsm.network.ip.address import ipv6_supported
 from vdsm.network.ipwrapper import getLinks
-from vdsm.network.link import dpdk
 from vdsm.network.link import iface as link_iface
 from vdsm.network.netconfpersistence import RunningConfig
 
@@ -70,30 +67,37 @@ def _get(vdsmnets=None):
 
     flat_devs_info = _get_flat_devs_info(devices_info)
     devices = _get_dev_names(nets_info, flat_devs_info)
-    extra_info = {}
-    if nmstate.is_nmstate_backend():
-        extra_info.update(_get_devices_info_from_nmstate(devices))
-    else:
-        extra_info.update(dhclient.dhcp_info(devices))
+    extra_info = _create_default_extra_info(devices)
+
+    current_state = nmstate.get_current_state()
+    extra_info.update(
+        _get_devices_info_from_nmstate(
+            current_state.filtered_interfaces(devices)
+        )
+    )
 
     _update_caps_info(nets_info, flat_devs_info, extra_info)
 
     networking_report = {'networks': nets_info}
     networking_report.update(devices_info)
-    if nmstate.is_nmstate_backend():
-        networking_report['nameservers'] = nmstate.show_nameservers()
-    else:
-        networking_report['nameservers'] = dns.get_host_nameservers()
+    networking_report['nameservers'] = current_state.dns_state
     networking_report['supportsIPv6'] = ipv6_supported()
 
     return networking_report
 
 
 def add_qos_info_to_devices(nets_info, devices_info):
-    """ Update Qos data from networks on corresponding nic/bond """
+    """Update Qos data from networks on corresponding nic/bond"""
 
     qos_list = _get_qos_info_from_net(nets_info)
     qos_list and _add_qos_info_to_southbound(qos_list, devices_info)
+
+
+def _create_default_extra_info(devices):
+    return {
+        devname: {'dhcpv4': False, 'dhcpv6': False, 'ipv6autoconf': False}
+        for devname in devices
+    }
 
 
 def _get_qos_info_from_net(nets_info):
@@ -124,9 +128,11 @@ def _add_qos_info_to_southbound(qos_list, devices_info):
             devices = devices_info['bondings']
         else:
             logging.warning(
-                'Qos exists on network {},'
-                'but no corresponding nic/bond device ({})'
-                'was found'.format(net_name, southbound)
+                'Qos exists on network %s,'
+                'but no corresponding nic/bond device (%s)'
+                'was found',
+                net_name,
+                southbound,
             )
             continue
 
@@ -150,20 +156,14 @@ def _sort_devices_qos_by_vlan(devices_info, iface_type):
             iface_attrs['qos'].sort(key=lambda k: (k['vlan']))
 
 
-def _get_devices_info_from_nmstate(devices):
+def _get_devices_info_from_nmstate(interfaces_state):
     return {
         ifname: {
-            dhclient.DHCP4: nmstate.is_dhcp_enabled(
-                ifstate, nmstate.Interface.IPV4
-            ),
-            dhclient.DHCP6: nmstate.is_dhcp_enabled(
-                ifstate, nmstate.Interface.IPV6
-            ),
+            'dhcpv4': nmstate.is_dhcp_enabled(ifstate, nmstate.Interface.IPV4),
+            'dhcpv6': nmstate.is_dhcp_enabled(ifstate, nmstate.Interface.IPV6),
             'ipv6autoconf': nmstate.is_autoconf_enabled(ifstate),
         }
-        for ifname, ifstate in six.viewitems(
-            nmstate.show_interfaces(filter=devices)
-        )
+        for ifname, ifstate in interfaces_state.items()
     }
 
 
@@ -199,6 +199,7 @@ def _networks_report(vdsmnets, routes, ipaddrs, devices_info):
     for network_info in six.itervalues(nets_info):
         network_info.update(LEGACY_SWITCH)
         _update_net_southbound_info(network_info, devices_info)
+        _update_net_vlanid_info(network_info, devices_info['vlans'])
 
     report_network_qos(nets_info, devices_info)
 
@@ -211,11 +212,17 @@ def _update_net_southbound_info(network_info, devices_info):
         for dev_type in ('bondings', 'nics', 'vlans'):
             sb_set = ports & set(devices_info[dev_type])
             if len(sb_set) == 1:
-                network_info['southbound'], = sb_set
+                (network_info['southbound'],) = sb_set
                 return
         network_info['southbound'] = None
     else:
         network_info['southbound'] = network_info['iface']
+
+
+def _update_net_vlanid_info(network_info, vlans_info):
+    sb = network_info['southbound']
+    if sb in vlans_info:
+        network_info['vlanid'] = vlans_info[sb]['vlanid']
 
 
 def _devices_report(ipaddrs, routes):
@@ -225,10 +232,7 @@ def _devices_report(ipaddrs, routes):
         if dev.isBRIDGE():
             devinfo = devs_report['bridges'][dev.name] = bridges.info(dev)
         elif dev.isNICLike():
-            if dev.isDPDK():
-                devinfo = devs_report['nics'][dev.name] = dpdk.info(dev)
-            else:
-                devinfo = devs_report['nics'][dev.name] = nics.info(dev)
+            devinfo = devs_report['nics'][dev.name] = nics.info(dev)
             devinfo.update(bonding.get_bond_slave_agg_info(dev.name))
         elif dev.isBOND():
             devinfo = devs_report['bondings'][dev.name] = bonding.info(dev)
@@ -303,21 +307,6 @@ def get_net_iface_from_config(net, netattrs):
         iface = '{}.{}'.format(iface, netattrs['vlan'])
 
     return iface
-
-
-def libvirt_vdsm_nets(nets):
-    routes = get_routes()
-    ipaddrs = getIpAddrs()
-
-    d = {}
-    for net, netAttr in six.iteritems(nets):
-        try:
-            # Pass the iface if the net is _not_ bridged, the bridge otherwise
-            devname = netAttr.get('iface', net)
-            d[net] = _getNetInfo(devname, netAttr['bridged'], routes, ipaddrs)
-        except KeyError:
-            continue  # Do not report missing libvirt networks.
-    return d
 
 
 def _devinfo(link, routes, ipaddrs):
@@ -395,98 +384,23 @@ class NetInfo(object):
         self.bridges = _netinfo['bridges']
         self.nameservers = _netinfo['nameservers']
 
-    def del_network(self, network):
-        del self.networks[network]
-
-    def del_bonding(self, bonding):
-        del self.bondings[bonding]
-
-    def del_vlan(self, vlan):
-        del self.vlans[vlan]
-
-    def del_bridge(self, bridge):
-        self.bridges.pop(bridge, None)
-
-    def getVlansForIface(self, iface):
-        for vlandict in six.itervalues(self.vlans):
-            if iface == vlandict['iface']:
-                yield vlandict['vlanid']
-
-    def getNetworkForIface(self, iface):
-        """ Return the network attached to nic/bond """
-        for network, netdict in six.iteritems(self.networks):
-            if (
-                'ports' in netdict
-                and iface in netdict['ports']
-                or 'iface' in netdict
-                and iface == netdict['iface']
-            ):
-                return network
-
-    def getBridgedNetworkForIface(self, iface):
-        """ Return all bridged networks attached to nic/bond """
-        for bridge, netdict in six.iteritems(self.networks):
-            if netdict['bridged'] and iface in netdict['ports']:
-                return bridge
-
-    def getNicsForBonding(self, bond):
-        bondAttrs = self.bondings[bond]
-        return bondAttrs['slaves']
-
-    def getBondingForNic(self, nic):
-        bondings = [
-            b
-            for (b, attrs) in six.iteritems(self.bondings)
-            if nic in attrs['slaves']
-        ]
-        if bondings:
-            assert (
-                len(bondings) == 1
-            ), "Unexpected configuration: More than one bonding per nic"
-            return bondings[0]
-        return None
-
     def getNicsVlanAndBondingForNetwork(self, network):
         vlan = None
-        vlanid = None
         bonding = None
         lnics = []
 
-        if self.networks[network]['switch'] == 'legacy':
-            # TODO: CachingNetInfo should not use external resources in its
-            # methods. Drop this branch when legacy netinfo report
-            # 'southbound' and 'vlanid' as a part of network entries.
-            if self.networks[network]['bridged']:
-                ports = self.networks[network]['ports']
-            else:
-                ports = []
-                interface = self.networks[network]['iface']
-                ports.append(interface)
-
-            for port in ports:
-                if port in self.vlans:
-                    nic = self.vlans[port]['iface']
-                    vlanid = self.vlans[port]['vlanid']
-                    vlan = port  # vlan devices can have an arbitrary name
-                    port = nic
-                if port in self.bondings:
-                    bonding = port
-                    lnics += self.bondings[bonding]['slaves']
-                elif port in self.nics:
-                    lnics.append(port)
+        net_sb = self.networks[network]['southbound']
+        vlanid = self.networks[network].get('vlanid')
+        if vlanid is not None:
+            vlan = net_sb
+            sb = self.vlans[net_sb]['iface']
         else:
-            sb = self.networks[network]['southbound']
-            if sb in self.bondings:
-                bonding = sb
-                lnics = self.bondings[bonding]['slaves']
-            elif sb in self.nics:
-                lnics = [sb]
-            vlanid = self.networks[network].get('vlanid')
-            vlan = (
-                '%s.%s' % (bonding or lnics[0], vlanid)
-                if vlanid is not None
-                else None
-            )
+            sb = net_sb
+        if sb in self.bondings:
+            bonding = sb
+            lnics = self.bondings[bonding]['slaves']
+        elif sb in self.nics:
+            lnics = [sb]
 
         return lnics, vlan, vlanid, bonding
 
@@ -512,16 +426,3 @@ class CachingNetInfo(NetInfo):
         if _netinfo is None:
             _netinfo = get()
         super(CachingNetInfo, self).__init__(_netinfo)
-
-    def updateDevices(self):
-        """
-        Updates the object device information while keeping the cached network
-        information.
-        """
-        _netinfo = get(vdsmnets=self.networks)
-        self.networks = _netinfo['networks']
-        self.vlans = _netinfo['vlans']
-        self.nics = _netinfo['nics']
-        self.bondings = _netinfo['bondings']
-        self.bridges = _netinfo['bridges']
-        self.nameservers = _netinfo['nameservers']

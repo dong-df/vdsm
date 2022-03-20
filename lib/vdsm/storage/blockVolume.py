@@ -46,7 +46,7 @@ QCOW_OVERHEAD_FACTOR = 1.1
 # Minimal padding to be added to internal volume optimal size.
 MIN_PADDING = MiB
 
-log = logging.getLogger('storage.Volume')
+log = logging.getLogger('storage.volume')
 
 
 class BlockVolumeManifest(volume.VolumeManifest):
@@ -54,8 +54,8 @@ class BlockVolumeManifest(volume.VolumeManifest):
     # How this volume is presented to a vm.
     DISK_TYPE = "block"
 
-    # On block storage volume are composed of lvm extents, 128m by default.
-    align_size = sc.VG_EXTENT_SIZE_MB * MiB
+    # On block storage volume are composed of lvm extents, 128 MiB by default.
+    align_size = sc.VG_EXTENT_SIZE
 
     def __init__(self, repoPath, sdUUID, imgUUID, volUUID):
         volume.VolumeManifest.__init__(self, repoPath, sdUUID, imgUUID,
@@ -473,23 +473,26 @@ class BlockVolume(volume.Volume):
             if sc.TAG_VOL_UNINIT in tags:
                 try:
                     lvm.removeLVs(sdUUID, (volUUID,))
-                except se.CannotRemoveLogicalVolume as e:
-                    cls.log.warning("Remove logical volume failed %s/%s %s",
-                                    sdUUID, volUUID, str(e))
-
+                except se.LogicalVolumeRemoveError as e:
+                    cls.log.warning("Cannot remove logical volume: %s", e)
                 if os.path.lexists(volPath):
                     cls.log.info("Unlinking half baked volume: %s", volPath)
                     os.unlink(volPath)
 
     @classmethod
-    def createVolumeMetadataRollback(cls, taskObj, sdUUID, slot):
-        cls.log.info("Metadata rollback for sdUUID=%s slot=%s", sdUUID, slot)
+    def createVolumeMetadataRollback(cls, taskObj, sdUUID, slot_str):
+        """
+        This function is called only from tasks framework, with strings values.
+        """
+        cls.log.info("Metadata rollback for sdUUID=%s slot=%s", sdUUID,
+                     slot_str)
         sd = sdCache.produce_manifest(sdUUID)
-        sd.clear_metadata_block(slot)
+        sd.clear_metadata_block(int(slot_str))
 
     @classmethod
     def _create(cls, dom, imgUUID, volUUID, capacity, volFormat, preallocate,
-                volParent, srcImgUUID, srcVolUUID, volPath, initial_size=None):
+                volParent, srcImgUUID, srcVolUUID, volPath, initial_size=None,
+                add_bitmaps=False, bitmap=None):
         """
         Class specific implementation of volumeCreate. All the exceptions are
         properly handled and logged in volume.create()
@@ -521,7 +524,11 @@ class BlockVolume(volume.Volume):
             cls.log.info("Request to create snapshot %s/%s of volume %s/%s "
                          "with capacity %s",
                          imgUUID, volUUID, srcImgUUID, srcVolUUID, capacity)
-            volParent.clone(volPath, volFormat, capacity)
+            volParent.clone(
+                volPath, volFormat, capacity, add_bitmaps=add_bitmaps)
+
+        if bitmap:
+            cls._silent_add_bitmap(volPath, bitmap)
 
         with dom.acquireVolumeMetadataSlot(volUUID) as slot:
             mdTags = ["%s%s" % (sc.TAG_PREFIX_MD, slot),
@@ -636,10 +643,9 @@ class BlockVolume(volume.Volume):
 
         try:
             lvm.removeLVs(self.sdUUID, (self.volUUID,))
-        except se.CannotRemoveLogicalVolume as e:
-            self.log.exception("Failed to delete volume %s/%s. The "
-                               "logical volume must be removed manually.",
-                               self.sdUUID, self.volUUID)
+        except se.LogicalVolumeRemoveError as e:
+            self.log.exception("Cannot remove logical volume, the logical "
+                               "volume must be removed manually: %s", e)
 
         try:
             self.log.info("Unlinking %s", vol_path)

@@ -22,6 +22,7 @@ from __future__ import absolute_import
 from __future__ import division
 import errno
 import functools
+import glob
 import inspect
 import io
 import logging
@@ -39,12 +40,6 @@ import tempfile
 import threading
 from contextlib import contextmanager
 import xml.etree.ElementTree as ET
-
-try:
-    from unittest import mock
-except ImportError:  # py2
-    import mock
-mock
 
 from nose import config
 from nose import core
@@ -65,6 +60,7 @@ from testValidation import (
     ProcessLeakPlugin,
     FileLeakPlugin,
 )
+
 
 # /tmp may use tempfs filesystem, not suitable for some of the test assuming a
 # filesystem with direct io support.
@@ -304,17 +300,12 @@ class XMLTestCase(VdsmTestCase):
         In case of a mismatch, display normalized xmls to make it easier to
         find the differences.
         """
-        actual = xmlutils.fromstring(xml)
-        xmlutils.indent(actual)
-        actualXML = ET.tostring(actual)
+        actual = normalized(xml)
+        expected = normalized(expectedXML)
 
-        expected = xmlutils.fromstring(expectedXML)
-        xmlutils.indent(expected)
-        expectedXML = ET.tostring(expected)
-
-        self.assertEqual(actualXML, expectedXML,
+        self.assertEqual(actual, expected,
                          "XMLs are different:\nActual:\n%s\nExpected:\n%s\n" %
-                         (actualXML, expectedXML))
+                         (actual, expected))
 
     def assert_dom_xml_equal(self, dom, expected_xml):
         xml = xmlutils.tostring(dom)
@@ -635,6 +626,25 @@ def read_data(filename):
         return src.read()
 
 
+def read_files(pattern):
+    """
+    Reads files under the tests data directory, given by input pattern.
+    Returns a dict keyed by file base names with no extensions, storing
+    the read files content.
+    """
+    caller = inspect.stack()[1]
+    caller_mod = inspect.getmodule(caller[0])
+    test_path = os.path.realpath(caller_mod.__file__)
+    dir_name = os.path.dirname(test_path)
+    path = os.path.join(dir_name, 'data', pattern)
+    files = {}
+    for filepath in glob.glob(path):
+        with open(filepath) as src:
+            name = os.path.basename(filepath)
+            files[name] = src.read()
+    return files
+
+
 def make_uuid():
     """
     Return a new UUID version 4 string for use with vdsm APIs
@@ -656,3 +666,14 @@ def ipv6_enabled():
         return False
     # Kernel supports ipv6, but it may be disabled.
     return int(value) == 0
+
+
+def normalized(xml, sort_attrs=True):
+    """
+    Returns indented XML string with optionally sorted attributes.
+    """
+    element = xmlutils.fromstring(xml)
+    if sort_attrs:
+        xmlutils.sort_attributes(element)
+    xmlutils.indent(element)
+    return xmlutils.tostring(element)

@@ -1,5 +1,5 @@
 #
-# Copyright 2011-2017 Red Hat, Inc.
+# Copyright 2011-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -68,7 +68,7 @@ def _list_domains():
         try:
             dom_uuid = dom_obj.UUIDString()
             logging.debug("Found domain %s", dom_uuid)
-            dom_xml = dom_obj.XMLDesc(0)
+            dom_xml = dom_obj.XMLDesc()
         except libvirt.libvirtError as e:
             if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
                 logging.exception("domain %s is dead", dom_uuid)
@@ -107,8 +107,6 @@ def _recovery_params(vm_id, dom_xml, external):
     params['vmType'] = dom.vm_type()
     params['vmName'] = dom.name
     params['vmId'] = dom.id
-    params['smp'] = dom.get_number_of_cpus()
-    params['memSize'] = dom.get_memory_size()
     return params
 
 
@@ -140,7 +138,7 @@ def lookup_external_vms(cif):
     for vm_id in cif.pop_unknown_vm_ids():
         try:
             dom_obj = conn.lookupByUUIDString(vm_id)
-            dom_xml = dom_obj.XMLDesc(0)
+            dom_xml = dom_obj.XMLDesc()
         except libvirt.libvirtError as e:
             if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
                 logging.debug("External domain %s not found", vm_id)

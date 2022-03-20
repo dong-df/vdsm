@@ -182,11 +182,17 @@ def get(target=None, killOnFailure=True):
                            libvirt.VIR_DOMAIN_EVENT_ID_RTC_CHANGE,
                            libvirt.VIR_DOMAIN_EVENT_ID_IO_ERROR_REASON,
                            libvirt.VIR_DOMAIN_EVENT_ID_GRAPHICS,
-                           libvirt.VIR_DOMAIN_EVENT_ID_BLOCK_JOB,
+                           # Report stable drive name (e.g. vda) in block job
+                           # events instead of the drive path which may change
+                           # after active commit or block copy.  See
+                           # virConnectDomainEventBlockJobCallback in libvirt
+                           # docs.
+                           libvirt.VIR_DOMAIN_EVENT_ID_BLOCK_JOB_2,
                            libvirt.VIR_DOMAIN_EVENT_ID_WATCHDOG,
                            libvirt.VIR_DOMAIN_EVENT_ID_JOB_COMPLETED,
                            libvirt.VIR_DOMAIN_EVENT_ID_DEVICE_REMOVED,
-                           libvirt.VIR_DOMAIN_EVENT_ID_BLOCK_THRESHOLD):
+                           libvirt.VIR_DOMAIN_EVENT_ID_BLOCK_THRESHOLD,
+                           libvirt.VIR_DOMAIN_EVENT_ID_AGENT_LIFECYCLE):
                     conn.domainEventRegisterAny(None,
                                                 ev,
                                                 target.dispatchLibvirtEvents,
@@ -209,5 +215,6 @@ def libvirt_password():
 def __close_connections():
     for conn in __connections.values():
         conn.close()
+
 
 atexit.register(__close_connections)

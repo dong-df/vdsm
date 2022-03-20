@@ -20,18 +20,16 @@
 from __future__ import absolute_import
 from __future__ import division
 import os
-import selinux
-import shutil
 import sys
-import tempfile
-import time
 
-from . import YES, NO
-from vdsm.tool import service
 from vdsm.common import cmdutils
 from vdsm.common import commands
-from vdsm import constants
+from vdsm.storage import fileUtils
+from vdsm.tool import service
 
+from . import YES, NO
+
+_MULTIPATHD = cmdutils.CommandPath("multipathd", "/usr/sbin/multipathd")
 
 _CONF_FILE = "/etc/multipath.conf"
 
@@ -39,9 +37,12 @@ _CONF_FILE = "/etc/multipath.conf"
 # "VDSM REVISION X.Y" tag.  Note that older version used "RHEV REVISION X.Y"
 # format.
 
-_CURRENT_TAG = "# VDSM REVISION 1.9"
+_CURRENT_TAG = "# VDSM REVISION 2.2"
 
 _OLD_TAGS = (
+    "# VDSM REVISION 2.1",
+    "# VDSM REVISION 2.0",
+    "# VDSM REVISION 1.9",
     "# VDSM REVISION 1.8",
     "# VDSM REVISION 1.7",
     "# VDSM REVISION 1.6",
@@ -72,7 +73,7 @@ _OLD_PRIVATE_TAG = "# RHEV PRIVATE"
 # the kernel to stop queuing.  After that, all outstanding and future
 # I/O will immediately be failed, until a path is restored. Once a path
 # is restored the delay is reset for the next time all paths fail.
-_NO_PATH_RETRY = 4
+_NO_PATH_RETRY = 16
 
 _CONF_DATA = """\
 %(current_tag)s
@@ -98,20 +99,36 @@ defaults {
 
     polling_interval            5
 
-    # Ensures fast fail when no path is available.
+    # Ensure the minimal time I/O is queued when no path is available.
     #
-    # The number of retries until disable queueing, or fail for
-    # immediate failure (no queueing).
+    # The number of retries until disable queueing, or "fail" for
+    # immediate failure (no queueing), or "queue" for unlimited timeout.
     #
-    # oVirt is not designed to handle unlimited queuing used by many
-    # devices (no_path_retry queue) or big number of retries
-    # (no_path_retry 60).  These settings cause commands run by vdsm
-    # (e.g. lvm) to get stuck for a long time, causing timeouts in
-    # various flows, and may cause a host to become non-responsive.
+    # Using "queue" will cause commands run by vdsm (e.g. lvm) to get
+    # stuck for unlimited time, causing timeouts in various flows, and
+    # may cause a host to become non-responsive.
     #
-    # We use a small number of retries to protect from short outage.
-    # Assuming the default polling_interval (5 seconds), this gives
-    # extra 20 seconds grace time before failing the I/O.
+    # Using "fail" will cause VMs to pause shortly after all paths have
+    # failed. When using a HA VM with a storage lease, the lease will be
+    # released. This may delay the time to restart the VM on another
+    # host.
+    #
+    # The recommended setting is number of retries, keeping the VM
+    # running during storage outage, for example during storage server
+    # upgrades or failover scenarios.
+    #
+    # This value should be synchronized with sanlock lease renewal
+    # timeout (8 * sanlock:io_timeout). This ensures that HA VMs with a
+    # storage lease will be terminated by sanlock if their storage lease
+    # expire, and will be started quickly on another host. If you change
+    # sanlock:io_timeout you need to update this value.
+    #
+    # This value also depends on polling_interval (5 seconds). If you
+    # change polling interval you need to update this value.
+    #
+    # The recommended setting:
+    #
+    #   8 * sanlock:io_timeout / polling_interval
 
     no_path_retry               %(no_path_retry)d
 
@@ -177,8 +194,8 @@ defaults {
     max_fds                     4096
 }
 
-# Blacklist local and obsolete protocols which run on devices which are not
-# multipathable.
+# Blacklist local devices, obsolete protocols, and device nodes which
+# should not be used with multipath.
 #
 # Complete list of protocols recognized by multipath:
 # scsi:fcp        Fibre Channel
@@ -238,16 +255,22 @@ defaults {
 #   blacklist_exceptions {
 #       protocol "(scsi:spi|scsi:ssa)"
 #   }
+#
+# We blacklist all RADOS Block Device (RBD) devices.
+# When using Ceph, multipath prevents the rbd devices from being unmapped
+# and the devices remain busy.
 
 blacklist {
-        protocol "(scsi:adt|scsi:sbp)"
+    protocol "(scsi:adt|scsi:sbp)"
+    devnode "^(rbd)[0-9]*"
 }
 
 # Options defined here override device specific options embedded into
 # multipathd.
 
 overrides {
-      no_path_retry            %(no_path_retry)d
+    # NOTE: see comments in default section how to compute this value.
+    no_path_retry   %(no_path_retry)d
 }
 
 """ % {"current_tag": _CURRENT_TAG,
@@ -264,40 +287,44 @@ def configure():
     Set up the multipath daemon configuration to the known and
     supported state. The original configuration, if any, is saved
     """
+    backup = fileUtils.backup_file(_CONF_FILE)
+    if backup:
+        sys.stdout.write("Previous multipath.conf copied to %s\n" % backup)
 
-    if os.path.exists(_CONF_FILE):
-        backup = _CONF_FILE + '.' + time.strftime("%Y%m%d%H%M")
-        shutil.copyfile(_CONF_FILE, backup)
-        sys.stdout.write("Backup previous multipath.conf to %r\n" % backup)
+    data = _CONF_DATA.encode('utf-8')
+    fileUtils.atomic_write(_CONF_FILE, data, relabel=True)
 
-    with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=os.path.basename(_CONF_FILE) + ".tmp",
-            dir=os.path.dirname(_CONF_FILE),
-            delete=False) as f:
-        try:
-            f.write(_CONF_DATA.encode('utf-8'))
-            f.flush()
-            selinux.restorecon(f.name)
-            os.chmod(f.name, 0o644)
-            os.rename(f.name, _CONF_FILE)
-        except:
-            os.unlink(f.name)
-            raise
+    # We want to handle these cases:
+    #
+    # 1. multipathd is not running and the kernel module is not loaded. We
+    #    don't have any online multipath devices, so there is nothing to
+    #    reconfigure, but we want to make sure that multipathd is happy with
+    #    new multipath configuration.
+    #
+    # 2. multipathd is not running but the kernel module is loaded. We may have
+    #    online devices that need reconfiguration.
+    #
+    # 3. multipathd is running with older configuration not compatible with
+    #    vdsm configuration.
+    #
+    # 4. multipathd is running with older vdsm configuration. Reloading is
+    #    needed to update devices with new configuration.
+    #
+    # When we have online devices using incompatible configuration, they may
+    # use "user friendly" names (/dev/mapper/mpath{N}) instead of consistent
+    # names (/dev/mapper/{WWID}). Restarting multipathd with the new
+    # configuration will rename the devices, however due to multipathd bug,
+    # these devices may not pick all configuration changes. Reconfiguring
+    # multipathd ensures that all configurations changes are applied.
+    #
+    # To simplify handing of all cases, we first start multipathd service. This
+    # eliminates cases 1 and 2. Case 3 and 4 are handled by reconfiguring
+    # multipathd.
+    #
+    # If any of those steps fails, we want to fail the configuration.
 
-    # Flush all unused multipath device maps. 'multipath'
-    # returns 1 if any of the devices is in use and unable to flush.
-    try:
-        commands.run([constants.EXT_MULTIPATH, "-F"])
-    except cmdutils.Error:
-        pass
-
-    try:
-        service.service_reload("multipathd")
-    except service.ServiceOperationError:
-        status = service.service_status("multipathd", False)
-        if status == 0:
-            raise
+    service.service_start("multipathd")
+    commands.run([_MULTIPATHD.cmd, "reconfigure"])
 
 
 def isconfigured():

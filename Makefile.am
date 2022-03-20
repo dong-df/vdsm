@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2019 Red Hat, Inc.
+# Copyright 2008-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,7 +17,7 @@
 #
 # Refer to the README and COPYING files for full details of the license
 #
-TOX_MIN_VERSION = 3.14
+TOX_MIN_VERSION = 3.15
 
 # We don't want the standard gnu file setup (README, INSTALL, etc.)
 AUTOMAKE_OPTIONS = foreign
@@ -66,7 +66,7 @@ CLEANFILES = \
 
 PYLINT_TARGETS = \
 	static/usr/bin/vdsm-tool \
-	static/usr/share/vdsm/sitecustomize.py \
+	static/libexec/vdsm/sitecustomize.py \
 	lib/vdsm \
 	lib/vdsmclient \
 	lib/yajsonrpc \
@@ -88,7 +88,7 @@ pylint: tox
 		$(PYLINT_TARGETS)
 
 execcmd:
-	! git --no-pager grep execCmd `git ls-files | grep -v -F -f execcmd-blacklist.txt`
+	! git --no-pager grep execCmd `git ls-files | grep -v -F -f execcmd-allowlist.txt`
 
 
 .PHONY: pylint-diff
@@ -137,7 +137,11 @@ lint: gitignore execcmd black flake8 pylint
 
 .PHONY: tests
 tests: tox
-	tox -e "tests,storage,lib,network,virt,gluster"
+	tox -e "tests,lib,network,virt,gluster,hooks"
+
+.PHONY: tests-storage
+tests-storage: tox
+	tox -e "storage"
 
 .PHONY: storage
 storage:
@@ -156,13 +160,10 @@ rpm: dist
 	rpmbuild -ta $(if $(BUILDID),--define="extra_release .$(BUILDID)") \
 		--define="qemu_user $(QEMUUSER)" \
 		--define="qemu_group $(QEMUGROUP)" \
-		--define="with_ovirt_imageio $(OVIRT_IMAGEIO)" \
 		--define="with_ovirt_vmconsole $(OVIRT_VMCONSOLE)" \
 		--define="with_gluster_mgmt $(GLUSTER_MGMT)" \
 		--define="with_hooks $(HOOKS)" \
 		--define="with_vhostmd $(VHOSTMD)" \
-		--define="with_openvswitch $(OPENVSWITCH)" \
-		--define="target_py py3" \
 		--define="vdsm_version $(PACKAGE_VERSION)" \
 		--define="vdsm_release $(PACKAGE_RELEASE)" \
 		$(DIST_ARCHIVES)

@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2017 Red Hat, Inc.
+# Copyright 2015-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,9 +22,11 @@ from __future__ import absolute_import
 from __future__ import division
 
 import marshal
+import pickle
+
 from testlib import VdsmTestCase
 from testlib import expandPermutations, permutations
-from vdsm.common.compat import pickle, json
+from vdsm.common.compat import json
 
 from vdsm.common.password import (
     ProtectedPassword,
@@ -83,13 +85,13 @@ class ProtectTests(VdsmTestCase):
         self.assertEqual(result, unprotect_passwords(result))
 
     def test_protect_dict(self):
-        unprotected = dict_unprotedted()
+        unprotected = dict_unprotected()
         protected = dict_protected()
         self.assertEqual(protected, protect_passwords(unprotected))
 
     def test_unprotect_dict(self):
         protected = dict_protected()
-        unprotected = dict_unprotedted()
+        unprotected = dict_unprotected()
         self.assertEqual(unprotected, unprotect_passwords(protected))
 
     def test_protect_nested_dicts(self):
@@ -123,9 +125,10 @@ class ProtectTests(VdsmTestCase):
         self.assertEqual(unprotected, unprotect_passwords(protected))
 
 
-def dict_unprotedted():
+def dict_unprotected():
     return {
         "key": "value",
+        "_X_key": "secret",
         "password": "12345678"
     }
 
@@ -133,6 +136,7 @@ def dict_unprotedted():
 def dict_protected():
     return {
         "key": "value",
+        "_X_key": ProtectedPassword("secret"),
         "password": ProtectedPassword("12345678")
     }
 
@@ -140,10 +144,12 @@ def dict_protected():
 def nested_dicts_unprotected():
     return {
         "key": "value",
+        "_X_key": "secret",
         "nested": {
             "password": "12345678",
             "nested": {
                 "key": "value",
+                "_X_key": "secret",
                 "password": "87654321",
             }
         }
@@ -153,10 +159,12 @@ def nested_dicts_unprotected():
 def nested_dicts_protected():
     return {
         "key": "value",
+        "_X_key": ProtectedPassword("secret"),
         "nested": {
             "password": ProtectedPassword("12345678"),
             "nested": {
                 "key": "value",
+                "_X_key": ProtectedPassword("secret"),
                 "password": ProtectedPassword("87654321"),
             }
         }
@@ -167,10 +175,12 @@ def lists_of_dicts_unprotected():
     return [
         {
             "key": "value",
+            "_X_key": "secret",
             "password": "12345678",
         },
         {
             "key": "value",
+            "_X_key": "secret",
             "password": "87654321",
         }
     ]
@@ -180,10 +190,12 @@ def lists_of_dicts_protected():
     return [
         {
             "key": "value",
+            "_X_key": ProtectedPassword("secret"),
             "password": ProtectedPassword("12345678"),
         },
         {
             "key": "value",
+            "_X_key": ProtectedPassword("secret"),
             "password": ProtectedPassword("87654321"),
         }
     ]
@@ -198,6 +210,7 @@ def nested_lists_of_dicts_unprotected():
                 "nested": [
                     {
                         "key": "value",
+                        "_X_key": "secret",
                         "password": "12345678",
                     }
                 ]
@@ -215,6 +228,7 @@ def nested_lists_of_dicts_protected():
                 "nested": [
                     {
                         "key": "value",
+                        "_X_key": ProtectedPassword("secret"),
                         "password": ProtectedPassword("12345678"),
                     }
                 ]

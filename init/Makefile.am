@@ -1,5 +1,6 @@
 #
 # Copyright 2013 IBM, Inc.
+# Copyright 2020-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,12 +27,8 @@ nodist_vdsmexec_SCRIPTS = \
 	vdsmd_init_common.sh \
 	$(NULL)
 
-dist_vdsm_SCRIPTS = \
-	daemonAdapter \
-	$(NULL)
-
 dist_vdsmexec_SCRIPTS = \
-	wait_for_ipv4s \
+	daemonAdapter \
 	$(NULL)
 
 CLEANFILES = \
@@ -41,8 +38,4 @@ CLEANFILES = \
 
 EXTRA_DIST = \
 	vdsmd_init_common.sh.in \
-	$(NULL)
-
-all-local: \
-	$(nodist_vdsm_SCRIPTS) \
 	$(NULL)

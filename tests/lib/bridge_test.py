@@ -33,7 +33,7 @@ from vdsm.rpc.Bridge import DynamicBridge
 from monkeypatch import MonkeyPatch
 from testlib import VdsmTestCase as TestCaseBase
 
-apiWhitelist = (
+_COPIED_API_OBJECTS = (
     'Global.ctorArgs',
     'ISCSIConnection.ctorArgs',
     'Image.ctorArgs',
@@ -69,7 +69,8 @@ class Host():
     def ping(self):
         raise GeneralException("Kaboom!!!")
 
-    def getDeviceList(self, storageType=None, guids=(), checkStatus=True):
+    def getDeviceList(self, storageType=None, guids=(), checkStatus=True,
+                      refresh=True):
         if storageType != 3:
             return {'status': {'code': -1, 'message': 'Failed'}}
         if not isinstance(guids, tuple):
@@ -95,12 +96,15 @@ class VM():
 
 
 class StorageDomain():
-    ctorArgs = ['storagedomainID']
+    ctorArgs = []
 
-    def __init__(self, UUID):
-        self._UUID = UUID
-
-    def detach(self, spUUID, masterSdUUID=None, masterVersion=0, force=False):
+    def detach(
+            self,
+            storagedomainID,
+            spUUID,
+            masterSdUUID=None,
+            masterVersion=0,
+            force=False):
         if (spUUID == '00000002-0002-0002-0002-0000000000f6' and
             masterSdUUID is None and masterVersion == 0 and
                 force is not False):
@@ -118,13 +122,13 @@ def getFakeAPI():
     setattr(_newAPI, 'StorageDomain', StorageDomain)
     setattr(_newAPI, 'VM', VM)
 
-    # Apply the whitelist to our version of API
-    for name in apiWhitelist:
+    # Copy required API objects to our version of API
+    for name in _COPIED_API_OBJECTS:
         parts = name.split('.')
         dstObj = _newAPI
         srcObj = _API
-        # Walk the object hierarchy copying each component of the whitelisted
-        # attribute from the real API to our fake one
+        # Walk the object hierarchy copying each component of the
+        # _COPIED_API_OBJECTS attribute from the real API to our fake one
         for obj in parts:
             srcObj = getattr(srcObj, obj)
             try:

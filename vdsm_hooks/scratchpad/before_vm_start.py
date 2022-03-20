@@ -95,12 +95,13 @@ def add_disk(domxml, path):
     devices = domxml.getElementsByTagName('devices')[0]
     devices.appendChild(disk)
 
+
 if 'scratchpad' in os.environ:
     try:
         disks = os.environ['scratchpad']
 
         domxml = hooking.read_domxml()
-        size_re = re.compile('^[\d]{1,}[k,K,M,G,T,b]?$')
+        size_re = re.compile(r'^[\d]{1,}[k,K,M,G,T,b]?$')
 
         for disk in disks.split(':'):
             arr = disk.split(',')

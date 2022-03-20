@@ -1,6 +1,6 @@
 #
 # Copyright IBM Corp. 2012
-# Copyright 2013-2019 Red Hat, Inc.
+# Copyright 2013-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,26 +24,31 @@ from __future__ import division
 
 import libvirt
 from six.moves import zip
+import xml.etree.ElementTree as ET
 
+from vdsm import numa
 from vdsm.common import define
 from vdsm.common import exception
 from vdsm.common import hooks
 from vdsm.common import libvirtconnection
 from vdsm.common import password
 from vdsm.common import response
+from vdsm.common.units import MiB
 from vdsm.config import config
+from vdsm.virt import cpumanagement
 from vdsm.virt import saslpasswd2
 from vdsm.virt import virdomain
 from vdsm.virt import vmexitreason
 from vdsm.virt.vmdevices import hwclass
-from vdsm.virt.vmdevices import storage
 
 from monkeypatch import MonkeyPatch, MonkeyPatchScope
 from testlib import XMLTestCase
 from testlib import permutations, expandPermutations
-import vmfakelib as fake
 
 from testValidation import brokentest
+
+from . import vmfakelib as fake
+import pytest
 
 
 _VM_PARAMS = {
@@ -90,15 +95,14 @@ class TestVmOperations(XMLTestCase):
     def testTimeOffsetNotPresentByDefault(self, exitCode):
         with fake.VM() as testvm:
             testvm.setDownStatus(exitCode, vmexitreason.GENERIC_ERROR)
-            self.assertFalse('timeOffset' in testvm.getStats())
+            assert not ('timeOffset' in testvm.getStats())
 
     @MonkeyPatch(libvirtconnection, 'get', lambda x: fake.Connection())
     @permutations([[define.NORMAL], [define.ERROR]])
     def testTimeOffsetRoundtrip(self, exitCode):
         with fake.VM({'timeOffset': self.BASE_OFFSET}) as testvm:
             testvm.setDownStatus(exitCode, vmexitreason.GENERIC_ERROR)
-            self.assertEqual(testvm.getStats()['timeOffset'],
-                             self.BASE_OFFSET)
+            assert testvm.getStats()['timeOffset'] == self.BASE_OFFSET
 
     @MonkeyPatch(libvirtconnection, 'get', lambda x: fake.Connection())
     @permutations([[define.NORMAL], [define.ERROR]])
@@ -110,7 +114,7 @@ class TestVmOperations(XMLTestCase):
                 testvm.onRTCUpdate(offset)
                 testvm.setDownStatus(exitCode, vmexitreason.GENERIC_ERROR)
                 vmOffset = testvm.getStats()['timeOffset']
-                self.assertEqual(vmOffset, str(lastOffset + offset))
+                assert vmOffset == str(lastOffset + offset)
                 # the field in getStats is str, not int
                 lastOffset = int(vmOffset)
 
@@ -123,8 +127,8 @@ class TestVmOperations(XMLTestCase):
                 testvm.onRTCUpdate(offset)
             # beware of type change!
             testvm.setDownStatus(exitCode, vmexitreason.GENERIC_ERROR)
-            self.assertEqual(testvm.getStats()['timeOffset'],
-                             str(self.UPDATE_OFFSETS[-1]))
+            assert testvm.getStats()['timeOffset'] == \
+                str(self.UPDATE_OFFSETS[-1])
 
     @MonkeyPatch(libvirtconnection, 'get', lambda x: fake.Connection())
     @permutations([[define.NORMAL], [define.ERROR]])
@@ -134,8 +138,8 @@ class TestVmOperations(XMLTestCase):
                 testvm.onRTCUpdate(offset)
             # beware of type change!
             testvm.setDownStatus(exitCode, vmexitreason.GENERIC_ERROR)
-            self.assertEqual(testvm.getStats()['timeOffset'],
-                             str(self.BASE_OFFSET + self.UPDATE_OFFSETS[-1]))
+            assert testvm.getStats()['timeOffset'] == \
+                str(self.BASE_OFFSET + self.UPDATE_OFFSETS[-1])
 
     def testUpdateSingleDeviceGraphics(self):
         devXmls = (
@@ -190,7 +194,7 @@ class TestVmOperations(XMLTestCase):
 
     def _updateGraphicsDevice(self, testvm, device_type, graphics_params):
         def _check_ticket_params(domXML, conf, params):
-            self.assertEqual(params, _TICKET_PARAMS)
+            assert params == _TICKET_PARAMS
 
         def _fake_set_vnc_pwd(username, pwd):
             pass
@@ -219,7 +223,7 @@ class TestVmOperations(XMLTestCase):
         device = self.GRAPHIC_DEVICES[1]  # VNC
         graphics_xml = ('<graphics type="%s" port="5900"/>' %
                         (device['device'],))
-        device_xml = '<devices>%s</devices>''' % (graphics_xml,)
+        device_xml = '<devices>%s</devices>' % (graphics_xml,)
 
         with fake.VM(xmldevices=graphics_xml) as testvm:
             def _fake_set_vnc_pwd(username, pwd):
@@ -237,9 +241,9 @@ class TestVmOperations(XMLTestCase):
                                     _fake_set_vnc_pwd)]):
                 testvm.updateDevice(params)
 
-            self.assertEqual(password.unprotect(params['password']),
-                             testvm.pwd)
-            self.assertEqual(params['params']['vncUsername'], testvm.username)
+            assert password.unprotect(params['password']) == \
+                testvm.pwd
+            assert params['params']['vncUsername'] == testvm.username
 
     def testClearSaslPasswordNoFips(self):
         graphics_params = dict(_GRAPHICS_DEVICE_PARAMS)
@@ -247,7 +251,7 @@ class TestVmOperations(XMLTestCase):
         device = self.GRAPHIC_DEVICES[1]  # VNC
         graphics_xml = ('<graphics type="%s" port="5900"/>' %
                         (device['device'],))
-        device_xml = '<devices>%s</devices>''' % (graphics_xml,)
+        device_xml = '<devices>%s</devices>' % (graphics_xml,)
 
         with fake.VM(xmldevices=graphics_xml) as testvm:
             def _fake_remove_pwd(username):
@@ -262,26 +266,26 @@ class TestVmOperations(XMLTestCase):
                                     _fake_remove_pwd)]):
                 testvm.updateDevice(params)
 
-            self.assertEqual(params['params']['vncUsername'], testvm.username)
+            assert params['params']['vncUsername'] == testvm.username
 
     def testDomainNotRunningWithoutDomain(self):
         with fake.VM() as testvm:
-            self.assertFalse(testvm._isDomainRunning())
+            assert not testvm.isDomainRunning()
 
     def testDomainNotRunningByState(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain(domState=libvirt.VIR_DOMAIN_SHUTDOWN)
-            self.assertFalse(testvm._isDomainRunning())
+            assert not testvm.isDomainRunning()
 
     def testDomainIsRunning(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain(domState=libvirt.VIR_DOMAIN_RUNNING)
-            self.assertTrue(testvm._isDomainRunning())
+            assert testvm.isDomainRunning()
 
     def testDomainIsReadyForCommands(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain()
-            self.assertTrue(testvm.isDomainReadyForCommands())
+            assert testvm.isDomainReadyForCommands()
 
     @permutations([
         # code, text
@@ -296,11 +300,11 @@ class TestVmOperations(XMLTestCase):
             dom = fake.Domain()
             dom.controlInfo = _fail
             testvm._dom = dom
-            self.assertFalse(testvm.isDomainReadyForCommands())
+            assert not testvm.isDomainReadyForCommands()
 
     def testDomainNoneNotReadyForCommands(self):
         with fake.VM() as testvm:
-            self.assertFalse(testvm.isDomainReadyForCommands())
+            assert not testvm.isDomainReadyForCommands()
 
     def testReadyForCommandsRaisesLibvirtError(self):
         def _fail(*args):
@@ -312,13 +316,13 @@ class TestVmOperations(XMLTestCase):
             dom = fake.Domain()
             dom.controlInfo = _fail
             testvm._dom = dom
-            self.assertRaises(libvirt.libvirtError,
-                              testvm.isDomainReadyForCommands)
+            with pytest.raises(libvirt.libvirtError):
+                testvm.isDomainReadyForCommands()
 
     def testReadPauseCodeDomainRunning(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain(domState=libvirt.VIR_DOMAIN_RUNNING)
-            self.assertEqual(testvm._readPauseCode(), 'NOERR')
+            assert testvm._readPauseCode() == 'NOERR'
 
     def testReadPauseCodeDomainPausedCrash(self):
         with fake.VM() as testvm:
@@ -327,7 +331,7 @@ class TestVmOperations(XMLTestCase):
             dom = fake.Domain(domState=libvirt.VIR_DOMAIN_PAUSED,
                               domReason=libvirt.VIR_DOMAIN_PAUSED_CRASHED)
             testvm._dom = dom
-            self.assertNotEqual(testvm._readPauseCode(), 'ENOSPC')
+            assert testvm._readPauseCode() != 'ENOSPC'
 
     def testReadPauseCodeDomainPausedENOSPC(self):
         with fake.VM() as testvm:
@@ -336,7 +340,7 @@ class TestVmOperations(XMLTestCase):
             dom.setDiskErrors({'vda': libvirt.VIR_DOMAIN_DISK_ERROR_NO_SPACE,
                                'hdc': libvirt.VIR_DOMAIN_DISK_ERROR_NONE})
             testvm._dom = dom
-            self.assertEqual(testvm._readPauseCode(), 'ENOSPC')
+            assert testvm._readPauseCode() == 'ENOSPC'
 
     def testReadPauseCodeDomainPausedEIO(self):
         with fake.VM() as testvm:
@@ -345,7 +349,7 @@ class TestVmOperations(XMLTestCase):
             dom.setDiskErrors({'vda': libvirt.VIR_DOMAIN_DISK_ERROR_NONE,
                                'hdc': libvirt.VIR_DOMAIN_DISK_ERROR_UNSPEC})
             testvm._dom = dom
-            self.assertEqual(testvm._readPauseCode(), 'EIO')
+            assert testvm._readPauseCode() == 'EIO'
 
     @permutations([[1000, 24], [900, 0], [1200, -128]])
     def testSetCpuTuneQuote(self, quota, offset):
@@ -355,8 +359,7 @@ class TestVmOperations(XMLTestCase):
             # a new special-purpose trivial fake here.
             testvm._dom = ChangingSchedulerDomain(offset)
             testvm.setCpuTuneQuota(quota)
-            self.assertEqual(quota + offset,
-                             testvm._vcpuTuneInfo['vcpu_quota'])
+            assert quota + offset == testvm._vcpuTuneInfo['vcpu_quota']
 
     @permutations([[100000, 128], [150000, 0], [9999, -99]])
     def testSetCpuTunePeriod(self, period, offset):
@@ -364,8 +367,7 @@ class TestVmOperations(XMLTestCase):
             # same as per testSetCpuTuneQuota
             testvm._dom = ChangingSchedulerDomain(offset)
             testvm.setCpuTunePeriod(period)
-            self.assertEqual(period + offset,
-                             testvm._vcpuTuneInfo['vcpu_period'])
+            assert period + offset == testvm._vcpuTuneInfo['vcpu_period']
 
     @brokentest("sometimes on CI tries to connect to libvirt")
     @permutations([[libvirt.VIR_ERR_OPERATION_DENIED, 'setNumberOfCpusErr',
@@ -385,7 +387,42 @@ class TestVmOperations(XMLTestCase):
 
                 res = testvm.setNumberOfCpus(4)  # random value
 
-                self.assertEqual(res, response.error(vdsm_error))
+                assert res == response.error(vdsm_error)
+
+    @MonkeyPatch(numa, 'update', lambda: None)
+    @MonkeyPatch(numa, 'cpu_topology', lambda:
+                 numa.CpuTopology(1, 6, 6, [0, 1, 2, 3, 4, 5]))
+    def testAssignCpusets(self):
+        with fake.VM() as testvm:
+            dom = fake.Domain()
+            dom.vcpu_pinning = {}
+
+            def pinVcpu(vcpu, cpuset):
+                dom.vcpu_pinning[vcpu] = cpuset
+
+            dom.pinVcpu = pinVcpu
+            dom.setVcpusFlags = lambda vcpus, flags: None
+            testvm._dom = dom
+            testvm._updateDomainDescriptor = lambda: None
+
+            testvm._assignCpusets(['0', '2-3', '1,4-5'])
+            pinning = dom.vcpu_pinning
+            assert len(pinning) == 3
+            assert pinning[0] == (True, False, False, False, False, False)
+            assert pinning[1] == (False, False, True, True, False, False)
+            assert pinning[2] == (False, True, False, False, True, True)
+
+    @MonkeyPatch(hooks, 'before_set_num_of_cpus', lambda: None)
+    def testSetNumberOfVcpusWrongCpusets(self):
+        with fake.VM() as testvm:
+            testvm._cpu_policy = cpumanagement.CPU_POLICY_DEDICATED
+            with pytest.raises(exception.MissingParameter):
+                testvm.setNumberOfCpus(4)
+            # Check length matches number of CPUs
+            with pytest.raises(exception.InvalidParameter):
+                testvm.setNumberOfCpus(4, ['1', '2', '3'])
+            with pytest.raises(exception.InvalidParameter):
+                testvm.setNumberOfCpus(4, ['1', '2', '3', '4', '5'])
 
     def testUpdateDeviceGraphicsFailed(self):
         with fake.VM(devices=self.GRAPHIC_DEVICES) as testvm:
@@ -403,56 +440,50 @@ class TestVmOperations(XMLTestCase):
             domain.updateDeviceFlags = _fail
             testvm._dom = domain
 
-            self.assertRaises(
-                exception.SpiceTicketError,
-                self._updateGraphicsDevice,
-                testvm,
-                device,
-                _GRAPHICS_DEVICE_PARAMS
-            )
+            with pytest.raises(exception.SpiceTicketError):
+                self._updateGraphicsDevice(
+                    testvm, device, _GRAPHICS_DEVICE_PARAMS
+                )
 
     def testAcpiShutdownDisconnected(self):
         with fake.VM() as testvm:
             testvm._dom = virdomain.Disconnected(vmid='testvm')
-            self.assertTrue(response.is_error(testvm.acpiShutdown()))
+            assert response.is_error(testvm.acpiShutdown())
 
     def testAcpiShutdownConnected(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain(vmId='testvm')
-            self.assertFalse(response.is_error(testvm.acpiShutdown()))
+            assert not response.is_error(testvm.acpiShutdown())
 
     def testAcpiRebootDisconnected(self):
         with fake.VM() as testvm:
             testvm._dom = virdomain.Disconnected(vmid='testvm')
-            self.assertTrue(response.is_error(testvm.acpiReboot()))
+            assert response.is_error(testvm.acpiReboot())
 
     def testAcpiRebootConnected(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain(vmId='testvm')
-            self.assertFalse(response.is_error(testvm.acpiReboot()))
+            assert not response.is_error(testvm.acpiReboot())
+
+    def test_process_migration_cpusets(self):
+        with fake.VM() as testvm:
+            elements = testvm._process_migration_cpusets(['1,3-5'])
+            assert len(elements) == 1
+            assert isinstance(elements[0], ET.Element)
+            assert elements[0].tag == 'vcpupin'
+            assert sorted(elements[0].keys()) == ['cpuset', 'vcpu']
+            assert elements[0].get('vcpu') == '0'
+            assert elements[0].get('cpuset') == '1,3-5'
 
     @permutations([
-        # info, expected
-        ({'readonly': True, 'diskType': storage.DISK_TYPE.BLOCK}, []),
-        ({'readonly': True, 'diskType': storage.DISK_TYPE.FILE}, []),
-        ({'readonly': False, 'diskType': storage.DISK_TYPE.FILE}, []),
-        ({'readonly': False, 'diskType': storage.DISK_TYPE.FILE}, []),
-        ({'readonly': False, 'diskType': storage.DISK_TYPE.BLOCK,
-          'format': 'raw'}, []),
-        ({'readonly': False, 'diskType': storage.DISK_TYPE.BLOCK}, ['vda']),
-        ({'readonly': False, 'diskType': storage.DISK_TYPE.FILE,
-          'diskReplicate': {
-              'format': 'cow', 'diskType': storage.DISK_TYPE.BLOCK}
-          },
-         ['vda']),
+        [[], exception.InvalidParameter],
+        [['2', '4'], exception.InvalidParameter],
+        [['abc'], exception.InvalidParameter],
     ])
-    def testGetChunkedDrives(self, disk_conf, expected):
+    def test_process_migration_cpusets_invalid(self, cpusets, exception):
         with fake.VM() as testvm:
-            vda = storage.Drive(self.log, **drive_config(**disk_conf))
-            testvm._devices[hwclass.DISK] = [vda]
-
-            drives = [drive.name for drive in testvm.getChunkedDrives()]
-            self.assertEqual(drives, expected)
+            with pytest.raises(exception):
+                testvm._process_migration_cpusets(cpusets)
 
 
 def _mem_committed(mem_size_mb):
@@ -461,7 +492,7 @@ def _mem_committed(mem_size_mb):
     """
     memory = mem_size_mb
     memory += config.getint('vars', 'guest_ram_overhead')
-    return 2 ** 20 * memory
+    return memory * MiB
 
 
 class ChangingSchedulerDomain(object):

@@ -29,6 +29,7 @@ from vdsm.common import exception
 from vdsm.common.marks import deprecated
 from vdsm.common.threadlocal import vars
 
+from vdsm.storage import bitmaps
 from vdsm.storage import clusterlock
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -37,10 +38,11 @@ from vdsm.storage import guarded
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import task
+from vdsm.storage import utils as su
 from vdsm.storage.sdc import sdCache
 from vdsm.storage.volumemetadata import VolumeMetadata
 
-log = logging.getLogger('storage.Volume')
+log = logging.getLogger('storage.volume')
 
 
 def getBackingVolumePath(imgUUID, volUUID):
@@ -53,13 +55,8 @@ def getBackingVolumePath(imgUUID, volUUID):
     return volUUID
 
 
-def _next_generation(current_generation):
-    # Increment a generation value and wrap to 0 after MAX_GENERATION
-    return (current_generation + 1) % (sc.MAX_GENERATION + 1)
-
-
 class VolumeManifest(object):
-    log = logging.getLogger('storage.VolumeManifest')
+    log = logging.getLogger('storage.volumemanifest')
 
     # How this volume is presented to a vm.  Must be overriden in derived
     # classes.
@@ -82,6 +79,10 @@ class VolumeManifest(object):
         if not volUUID or volUUID == sc.BLANK_UUID:
             raise se.InvalidParameterException("volUUID", volUUID)
         self.validate()
+
+    @classmethod
+    def is_block(cls):
+        return False
 
     @property
     def imagePath(self):
@@ -117,7 +118,7 @@ class VolumeManifest(object):
         try:
             return meta[key]
         except KeyError:
-            raise se.MetaDataKeyNotFoundError(str(meta) + ":" + str(key))
+            raise se.InvalidMetadata(str(meta) + ":" + str(key))
 
     def getVolumePath(self):
         """
@@ -151,21 +152,21 @@ class VolumeManifest(object):
         try:
             legality = self.getMetaParam(sc.LEGALITY)
             return legality
-        except se.MetaDataKeyNotFoundError:
+        except se.InvalidMetadata:
             return sc.LEGAL_VOL
 
     def isLegal(self):
         try:
             legality = self.getMetaParam(sc.LEGALITY)
             return legality != sc.ILLEGAL_VOL
-        except se.MetaDataKeyNotFoundError:
+        except se.InvalidMetadata:
             return True
 
     def isFake(self):
         try:
             legality = self.getMetaParam(sc.LEGALITY)
             return legality == sc.FAKE_VOL
-        except se.MetaDataKeyNotFoundError:
+        except se.InvalidMetadata:
             return False
 
     def getCapacity(self):
@@ -198,7 +199,7 @@ class VolumeManifest(object):
         # always report the version. The clusterlock should be fixed to match
         # the schema.
         try:
-            version, host_id = sd_manifest.inquireVolumeLease(self.imgUUID,
+            version, host_id = sd_manifest.inspectVolumeLease(self.imgUUID,
                                                               self.volUUID)
         except clusterlock.InvalidLeaseName as e:
             self.log.warning("Cannot get lease status: %s", e)
@@ -227,7 +228,8 @@ class VolumeManifest(object):
             "ctime": meta.get(sc.CTIME, ""),
             "mtime": "0",
             "legality": meta.get(sc.LEGALITY, ""),
-            "generation": meta.get(sc.GENERATION, sc.DEFAULT_GENERATION)
+            "generation": meta.get(sc.GENERATION, sc.DEFAULT_GENERATION),
+            "sequence": meta.get(sc.SEQUENCE, sc.DEFAULT_SEQUENCE)
         }
 
     def getInfo(self):
@@ -245,7 +247,7 @@ class VolumeManifest(object):
             avsize = self.getVolumeTrueSize()
             info['apparentsize'] = str(vsize)
             info['truesize'] = str(avsize)
-            info['status'] = "OK"
+            info['status'] = sc.VOL_STATUS_OK
             # 'lease' is an optional property with null as the default value.
             # If volume doesn't have 'lease', we will not return it as part
             # of the volume info.
@@ -263,7 +265,7 @@ class VolumeManifest(object):
             self.log.debug("Failed to get volume info: %s", e)
             info['apparentsize'] = "0"
             info['truesize'] = "0"
-            info['status'] = "INVALID"
+            info['status'] = sc.VOL_STATUS_INVALID
 
         # Both engine and dumpStorageTable don't use this option so
         # only keeping it to not break existing scripts that look for the key
@@ -279,13 +281,30 @@ class VolumeManifest(object):
 
     def getQemuImageInfo(self):
         """
-        Returns volume information as returned by qemu-img info command
+        Returns volume information using qemu-img info command.
         """
         # As this helper may be called while the VM is running,
         # use unsafe=True when calling qemuimg.info()
-        return qemuimg.info(self.getVolumePath(),
-                            sc.fmt2str(self.getFormat()),
-                            unsafe=True)
+        info = qemuimg.info(
+            self.getVolumePath(),
+            sc.fmt2str(self.getFormat()),
+            unsafe=True)
+
+        # Build result according to the schema.
+
+        result = {
+            "virtualsize": info["virtual-size"],
+            "format": info["format"],
+        }
+
+        if "cluster-size" in info:
+            result["clustersize"] = info["cluster-size"]
+        if "backing-filename" in info:
+            result["backingfile"] = info["backing-filename"]
+        if "format-specific" in info:
+            result["compat"] = info["format-specific"]["data"]["compat"]
+
+        return result
 
     def getVolumeParams(self):
         volParams = {}
@@ -300,6 +319,7 @@ class VolumeManifest(object):
         volParams['parent'] = self.getParent()
         volParams['descr'] = self.getDescription()
         volParams['legality'] = self.getLegality()
+        volParams['block'] = self.is_block()
         return volParams
 
     def getVmVolumeInfo(self):
@@ -448,7 +468,7 @@ class VolumeManifest(object):
         if vol_attr.generation is not None:
             next_gen = vol_attr.generation
         else:
-            next_gen = _next_generation(meta[sc.GENERATION])
+            next_gen = su.next_generation(meta[sc.GENERATION])
 
         meta[sc.GENERATION] = next_gen
 
@@ -506,7 +526,7 @@ class VolumeManifest(object):
         # We also don't specify an image format, as some images can have
         # corrupted qcow2 header (see https://bugzilla.redhat.com/1282239).
         qemu_info = qemuimg.info(self.getVolumePath(), unsafe=True)
-        virtual_size = qemu_info["virtualsize"]
+        virtual_size = qemu_info["virtual-size"]
 
         # If capacity is smaller than virtual size, creating a snapshot on top
         # of this volume will create qcow2 volume with wrong virtual size. This
@@ -532,7 +552,7 @@ class VolumeManifest(object):
             if self.isShared():
                 raise se.CannotDeleteSharedVolume("img %s vol %s" %
                                                   (self.imgUUID, self.volUUID))
-        except se.MetaDataKeyNotFoundError as e:
+        except se.InvalidMetadata as e:
             # In case of metadata key error, we have corrupted
             # volume (One of metadata corruptions may be
             # previous volume deletion failure).
@@ -548,9 +568,21 @@ class VolumeManifest(object):
 
     @classmethod
     def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, capacity, format,
-                    type, voltype, disktype, desc="", legality=sc.ILLEGAL_VOL):
-        meta = VolumeMetadata(sdUUID, imgUUID, puuid, capacity, format, type,
-                              voltype, disktype, desc, legality)
+                    type, voltype, disktype, desc="", legality=sc.ILLEGAL_VOL,
+                    sequence=0):
+        meta = VolumeMetadata(
+            domain=sdUUID,
+            image=imgUUID,
+            parent=puuid,
+            capacity=capacity,
+            format=format,
+            type=type,
+            voltype=voltype,
+            disktype=disktype,
+            description=desc,
+            legality=legality,
+            sequence=sequence,
+        )
         cls.createMetadata(metaId, meta)
         return meta
 
@@ -575,18 +607,22 @@ class VolumeManifest(object):
         return None
 
     def prepare(self, rw=True, justme=False,
-                chainrw=False, setrw=False, force=False):
+                chainrw=False, setrw=False, force=False,
+                allow_illegal=False):
         """
         Prepare volume for use by consumer.
         If justme is false, the entire COW chain is prepared.
         Note: setrw arg may be used only by SPM flows.
         """
-        self.log.info("Volume: preparing volume %s/%s",
-                      self.sdUUID, self.volUUID)
+        self.log.info("Preparing volume %s/%s with parameters:"
+                      "justme=%s, rw=%s, setrw=%s, chainrw=%s, force=%s,"
+                      "allow_illegal=%s",
+                      self.sdUUID, self.volUUID, justme, rw, setrw, chainrw,
+                      force, allow_illegal)
 
         if not force:
-            # Cannot prepare ILLEGAL volume
-            if not self.isLegal():
+            # Cannot prepare ILLEGAL volume when allow_illegal is not True
+            if not self.isLegal() and not allow_illegal:
                 raise se.prepareIllegalVolumeError(self.volUUID)
 
             if rw and self.isShared():
@@ -679,7 +715,7 @@ class VolumeManifest(object):
         #
         # IMPORTANT: In order to provide an atomic state change, both legality
         # and the generation must be updated together in one write.
-        next_gen = _next_generation(actual_gen)
+        next_gen = su.next_generation(actual_gen)
         metadata = self.getMetadata()
         if set_illegal:
             metadata[sc.LEGALITY] = sc.LEGAL_VOL
@@ -798,14 +834,54 @@ class VolumeManifest(object):
     def getMetaSlot(self):
         raise NotImplementedError
 
+    # Copy volume helpers.
+
+    def requires_create(self):
+        """
+        Return True if we need to use qemuimg.convert(create=True) when this
+        volume is the target image.
+
+        We have 2 cases:
+
+        1. Raw sparse image on filesystem not supporting punching holes (e.g.
+           NFS < 4.2). qemu-img convert will fully allocate the entire image
+           when trying to punch holes in the unallocated areas.
+
+        2. qcow2 compat=0.10 when volume does not have a parent. qemu-img
+           convert will fully allocate the image instead of skipping the
+           unallocated areas.
+           TODO: Remove when qemu-5.1.0 is available.
+           https://bugzilla.redhat.com/1858632
+
+        When qemu-img convert creates the target image it knows that the image
+        is zeroed so it can skip the unallocated areas.
+        """
+        if self.getFormat() == sc.RAW_FORMAT:
+            return self.isSparse()
+        else:
+            puuid = self.getParent()
+            if puuid and puuid != sc.BLANK_UUID:
+                return False
+
+            dom = sdCache.produce(self.sdUUID)
+            return dom.qcow2_compat() == "0.10"
+
+    @classmethod
+    def zero_initialized(cls):
+        """
+        Return True if a new image is zeroed.
+        """
+        return False
+
 
 class Volume(object):
-    log = logging.getLogger('storage.Volume')
+    log = logging.getLogger('storage.volume')
     manifestClass = VolumeManifest
 
     @classmethod
     def _create(cls, dom, imgUUID, volUUID, capacity, volFormat, preallocate,
-                volParent, srcImgUUID, srcVolUUID, volPath, initial_size=None):
+                volParent, srcImgUUID, srcVolUUID, volPath, initial_size=None,
+                add_bitmaps=False, bitmap=None):
         raise NotImplementedError
 
     def __init__(self, repoPath, sdUUID, imgUUID, volUUID):
@@ -938,7 +1014,7 @@ class Volume(object):
                     [metaID[0], str(metaID[1]), self.sdUUID, self.volUUID]))
         self.newVolumeLease(metaID, self.sdUUID, newUUID)
 
-    def clone(self, dstPath, volFormat, capacity):
+    def clone(self, dstPath, volFormat, capacity, add_bitmaps=False):
         """
         Clone self volume to the specified dst_image_dir/dst_volUUID
         """
@@ -975,6 +1051,41 @@ class Volume(object):
             if wasleaf:
                 self.setLeaf()
             raise se.CannotCloneVolume(self.volumePath, dstPath, str(e))
+
+        if add_bitmaps:
+            self._silent_clone_bitmaps(dstPath)
+
+    def _silent_clone_bitmaps(self, child_path):
+        """
+        Try to clone bitmaps from this volume to child volume, logging
+        failures.
+        """
+        self.prepare(rw=False, justme=False)
+        try:
+            bitmaps.add_bitmaps(self.getVolumePath(), child_path)
+        except exception.AddBitmapError as e:
+            self.log.error(
+                "Cannot clone bitmaps to child volume %r, the next backup "
+                "will be a full backup: %s",
+                child_path, e)
+        finally:
+            self.teardown(self.sdUUID, self.volUUID, justme=False)
+
+    @classmethod
+    def _silent_add_bitmap(cls, vol_path, bitmap):
+        """
+        Try to add bitmap to this volume, logging failures.
+
+        Called in volume creation flow, when volume is not fully
+        created, so getVolumePath() may not work yet.
+        """
+        try:
+            bitmaps.add_bitmap(vol_path, bitmap)
+        except exception.AddBitmapError as e:
+            cls.log.error(
+                "Cannot create bitmap %r in volume %r, the next "
+                "backup will be a full backup: %s",
+                bitmap, vol_path, e)
 
     def _shareLease(self, dstImgPath):
         self._manifest._shareLease(dstImgPath)
@@ -1061,7 +1172,8 @@ class Volume(object):
     @classmethod
     def create(cls, repoPath, sdUUID, imgUUID, capacity, volFormat,
                preallocate, diskType, volUUID, desc, srcImgUUID, srcVolUUID,
-               initial_size=None):
+               initial_size=None, add_bitmaps=False, legal=True,
+               sequence=0, bitmap=None):
         """
         Create a new volume with given size or snapshot
             'capacity' - in bytes
@@ -1072,6 +1184,11 @@ class Volume(object):
             'srcVolUUID' - source volume UUID
             'initial_size' - initial volume size in bytes,
                              in case of thin provisioning
+            'add_bitmaps' - add all the bitmaps from source volume
+            'legal' - create the volume as legal if true,
+                      otherwise create as illegal.
+            'sequence' - the sequence number of the volume in the metadata
+            'bitmap' - create a new bitmap with name.
         """
         # Do the input values validation first.
         if initial_size is not None:
@@ -1090,7 +1207,8 @@ class Volume(object):
 
         dom = sdCache.produce(sdUUID)
         dom.validateCreateVolumeParams(
-            volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate)
+            volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate,
+            add_bitmaps=add_bitmaps, bitmap=bitmap)
 
         imgPath = dom.create_image(imgUUID)
 
@@ -1111,11 +1229,22 @@ class Volume(object):
 
                 volParent = cls(repoPath, sdUUID, srcImgUUID, srcVolUUID)
 
+                if add_bitmaps and volParent.getFormat() != sc.COW_FORMAT:
+                    raise se.UnsupportedOperation(
+                        "Cannot add bitmaps from parent volume with raw "
+                        "format", srcVolUUID=srcVolUUID)
+
                 if not volParent.isLegal():
                     raise se.createIllegalVolumeSnapshotError(
                         volParent.volUUID)
 
                 if imgUUID != srcImgUUID:
+                    if add_bitmaps:
+                        raise se.UnsupportedOperation(
+                            "Cannot add bitmaps from template volume",
+                            srcImgUUID=srcImgUUID,
+                            srcVolUUID=srcVolUUID)
+
                     volParent.share(imgPath)
                     volParent = cls(repoPath, sdUUID, imgUUID, srcVolUUID)
 
@@ -1160,7 +1289,8 @@ class Volume(object):
                 metaId = cls._create(dom, imgUUID, volUUID, capacity,
                                      volFormat, preallocate, volParent,
                                      srcImgUUID, srcVolUUID, volPath,
-                                     initial_size=initial_size)
+                                     initial_size=initial_size,
+                                     add_bitmaps=add_bitmaps, bitmap=bitmap)
             except (se.VolumeAlreadyExists, se.CannotCreateLogicalVolume,
                     se.VolumeCreationError, se.InvalidParameterException) as e:
                 cls.log.error("Failed to create volume %s: %s", volPath, e)
@@ -1191,9 +1321,11 @@ class Volume(object):
                               [str(x) for x in metaId])
             )
 
+            legality = sc.LEGAL_VOL if legal else sc.ILLEGAL_VOL
             cls.newMetadata(metaId, sdUUID, imgUUID, srcVolUUID, capacity,
                             sc.type2name(volFormat), sc.type2name(preallocate),
-                            volType, diskType, desc, sc.LEGAL_VOL)
+                            volType, diskType, desc, legality,
+                            sequence=sequence)
 
             if dom.hasVolumeLeases():
                 cls.newVolumeLease(metaId, sdUUID, volUUID)
@@ -1410,10 +1542,11 @@ class Volume(object):
 
     @classmethod
     def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, capacity, format,
-                    type, voltype, disktype, desc="", legality=sc.ILLEGAL_VOL):
+                    type, voltype, disktype, desc="", legality=sc.ILLEGAL_VOL,
+                    sequence=0):
         return cls.manifestClass.newMetadata(
             metaId, sdUUID, imgUUID, puuid, capacity, format, type, voltype,
-            disktype, desc, legality)
+            disktype, desc, legality, sequence=sequence)
 
     def getInfo(self):
         return self._manifest.getInfo()
@@ -1485,6 +1618,13 @@ class Volume(object):
 
     def setParentTag(self, puuid):
         raise NotImplementedError
+
+    def requires_create(self):
+        return self._manifest.requires_create()
+
+    @classmethod
+    def zero_initialized(cls):
+        return cls.manifestClass.zero_initialized()
 
 
 class VolumeLease(guarded.AbstractLock):

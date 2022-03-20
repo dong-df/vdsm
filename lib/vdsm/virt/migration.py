@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2019 Red Hat, Inc.
+# Copyright 2008-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,6 +23,8 @@ from __future__ import division
 
 import io
 import collections
+import enum
+import pickle
 import re
 import threading
 import time
@@ -30,6 +32,7 @@ import libvirt
 
 from vdsm.common import concurrent
 from vdsm.common import conv
+from vdsm.common import exception
 from vdsm.common import logutils
 from vdsm.common import response
 from vdsm import sslutils
@@ -37,14 +40,17 @@ from vdsm import utils
 from vdsm import jsonrpcvdscli
 from vdsm.config import config
 from vdsm.common import xmlutils
-from vdsm.common.compat import pickle
-from vdsm.common.define import NORMAL, Mbytes
+from vdsm.common.define import NORMAL
 from vdsm.common.network.address import normalize_literal_addr
+from vdsm.common.units import MiB
 from vdsm.virt.utils import DynamicBoundedSemaphore
+from vdsm.virt.utils import VolumeSize
 
+from vdsm.virt import cpumanagement
 from vdsm.virt import virdomain
 from vdsm.virt import vmexitreason
 from vdsm.virt import vmstatus
+from vdsm.virt import vmxml
 
 
 MODE_REMOTE = 'remote'
@@ -63,9 +69,6 @@ CONVERGENCE_SCHEDULE_POST_COPY = "postcopy"
 CONVERGENCE_SCHEDULE_SET_ABORT = "abort"
 
 
-_MiB_IN_GiB = 1024
-
-
 ADDRESS = '0'
 PORT = 54321
 
@@ -82,10 +85,44 @@ class MigrationLimitExceeded(RuntimeError):
     """
 
 
-class PostCopyPhase:
+class PostCopyPhase(enum.IntEnum):
     NONE = 0
     REQUESTED = 1
     RUNNING = 2
+
+
+class State(enum.IntEnum):
+
+    # Migration thread was created and initialized. The next state is PREPARED
+    # under normal circumstances. If anything fails, next state is FAILED.
+    INITIALIZED = 0
+
+    # Set right before defining VM on the destination host. Next state is
+    # STARTED.
+    PREPARED = 1
+
+    # VM on the destination host was created and migration is about to start.
+    # If anything fails, next state is FAILED. If everything goes well,
+    # currently there's no other state.
+    STARTED = 2
+
+    # Migration failed. Final state.
+    FAILED = 3
+
+
+@virdomain.expose(
+    "migrateToURI3",
+    "migrateSetMaxSpeed",
+    "state",
+    "migrateSetMaxDowntime",
+)
+class DomainAdapter(object):
+    """
+    VM wrapper class that exposes only
+    libvirt migration related operations.
+    """
+    def __init__(self, vm):
+        self._vm = vm
 
 
 class SourceThread(object):
@@ -93,6 +130,7 @@ class SourceThread(object):
     A thread that takes care of migration on the source vdsm.
     """
     _RECOVERY_LOOP_PAUSE = 10
+    _PARALLEL_CONNECTIONS_DISABLED_VALUE = 0
 
     ongoingMigrations = DynamicBoundedSemaphore(1)
 
@@ -101,9 +139,10 @@ class SourceThread(object):
                  tunneled=False, dstqemu='', abortOnError=False,
                  consoleAddress=None, compressed=False,
                  autoConverge=False, recovery=False, encrypted=False,
-                 **kwargs):
+                 cpusets=None, parallel=None, **kwargs):
         self.log = vm.log
         self._vm = vm
+        self._dom = DomainAdapter(self._vm)
         self._dst = dst
         self._mode = mode
         self._dstparams = dstparams
@@ -113,6 +152,9 @@ class SourceThread(object):
         self._consoleAddress = consoleAddress
         self._dstqemu = dstqemu
         self._encrypted = encrypted
+        if parallel == self._PARALLEL_CONNECTIONS_DISABLED_VALUE:
+            parallel = None
+        self._parallel = parallel
         self._maxBandwidth = int(
             kwargs.get('maxBandwidth') or
             config.getint('vars', 'migration_max_bandwidth')
@@ -145,16 +187,21 @@ class SourceThread(object):
                           self._convergence_schedule)
         self.log.debug('convergence schedule set to: %s',
                        str(self._convergence_schedule))
-        self._started = False
-        self._failed = False
+        self._state = State.STARTED if recovery else State.INITIALIZED
         self._recovery = recovery
         tunneled = conv.tobool(tunneled)
         abortOnError = conv.tobool(abortOnError)
         compressed = conv.tobool(compressed)
         autoConverge = conv.tobool(autoConverge)
+        parallel = self._parallel is not None
         self._migration_flags = self._calculate_migration_flags(
-            tunneled, abortOnError, compressed, autoConverge, encrypted
+            tunneled, abortOnError, compressed, autoConverge, encrypted,
+            parallel
         )
+        # True if destination host supports disk refresh. Initialized before
+        # the first extend of the disk during migration if finished.
+        self._supports_disk_refresh = None
+        self._destination_cpusets = cpusets
 
     def start(self):
         self._thread.start()
@@ -171,17 +218,30 @@ class SourceThread(object):
         managed migration (detected on Vdsm recovery) without the threads
         actually running.
         """
-        return ((self.is_alive() and not self._failed) or
+        return ((self.is_alive() and self._state != State.FAILED) or
                 (self._recovery and
                  self._vm.lastStatus == vmstatus.MIGRATION_SOURCE))
 
+    def needs_disk_refresh(self):
+        """
+        Return True if migrating to destination host, and the migration
+        reached the state when remote disks must be refreshed during extend
+        disk flow.
+        """
+        return State.PREPARED <= self._state < State.FAILED
+
     @property
     def started(self):
-        return self._started
+        return self._state == State.STARTED
 
     @property
     def hibernating(self):
         return self._mode == MODE_FILE
+
+    def _switch_state(self, value):
+        if value != self._state:
+            self.log.info("Switching from %s to %s", self._state, value)
+            self._state = value
 
     def _update_progress(self):
         if self._monitorThread is None:
@@ -296,14 +356,16 @@ class SourceThread(object):
         elif self._enableGuestEvents:
             self._vm.guestAgent.events.after_migration_failure()
         # either way, migration has finished
-        self._failed = True
+        self._switch_state(State.FAILED)
         if self._recovery:
             self._vm.set_last_status(vmstatus.UP, vmstatus.MIGRATION_SOURCE)
             self._recovery = False
         else:
             self._vm.lastStatus = vmstatus.UP
-        self._started = False
         self._vm.send_status_event()
+        if (self._vm.lastStatus == vmstatus.PAUSED and
+                self._vm.resume_postponed):
+            self._vm.maybe_resume()
 
     def _finishSuccessfully(self, machineParams):
         with self._lock:
@@ -398,11 +460,14 @@ class SourceThread(object):
         self._update_outgoing_limit()
         try:
             startTime = time.time()
+            # Guest agent API version must be updated before _srcDomXML
+            # is created to have the version in _srcDomXML metadata.
+            self._vm.update_guest_agent_api_version()
             machineParams = self._setupRemoteMachineParams()
             self._setupVdsConnection()
             self._prepareGuest()
 
-            while not self._started:
+            while not self.started:
                 try:
                     self.log.info("Migration semaphore: acquiring")
                     with SourceThread.ongoingMigrations:
@@ -428,6 +493,13 @@ class SourceThread(object):
                     if e.get_error_code() == libvirt.VIR_ERR_OPERATION_ABORTED:
                         self.status = response.error(
                             'migCancelErr', message='Migration canceled')
+                    # This error occurs when hypervisor cannot start
+                    # the migration. For example, when a domain with the same
+                    # name already exists on the destination.
+                    elif e.get_error_code() == \
+                            libvirt.VIR_ERR_OPERATION_FAILED:
+                        self.status = response.error(
+                            'migOperationErr', message=e.get_str2())
                     raise
                 except MigrationLimitExceeded:
                     retry_timeout = config.getint('vars',
@@ -441,13 +513,17 @@ class SourceThread(object):
         except Exception as e:
             self._recover(str(e))
             self.log.exception("Failed to migrate")
+        finally:
+            # Enable the volume monitor as it can be disabled during migration.
+            self._vm.volume_monitor.enable()
 
     def _startUnderlyingMigration(self, startTime, machineParams):
         if self.hibernating:
-            self._started = True
+            self._switch_state(State.STARTED)
             self._vm.hibernate(self._dst)
         else:
             self._vm.prepare_migration()
+            self._switch_state(State.PREPARED)
 
             # Do not measure the time spent for creating the VM on the
             # destination. In some cases some expensive operations can cause
@@ -469,7 +545,7 @@ class SourceThread(object):
                         'migration destination error: ' +
                         result['status']['message'])
 
-            self._started = True
+            self._switch_state(State.STARTED)
 
             # REQUIRED_FOR: destination Vdsm < 4.3
             if not self._vm.min_cluster_version(4, 3):
@@ -498,24 +574,7 @@ class SourceThread(object):
                 transport = 'tcp'
             duri = 'qemu+{}://{}/system'.format(
                 transport, normalize_literal_addr(self.remoteHost))
-
-            if self._encrypted:
-                # TODO: Stop using host names here and set the host
-                # name based certificate verification parameter once
-                # the corresponding functionality is available in
-                # libvirt, see https://bugzilla.redhat.com/1754533
-                #
-                # When an encrypted migration is requested, we must
-                # use the host name (stored in 'dst') rather than the
-                # IP address (stored in 'dstqemu') in order to match
-                # the target certificate.  That means that encrypted
-                # migrations are incompatible with setups that require
-                # an IP address to identify the host properly, such as
-                # when a separate migration network should be used or
-                # when using IPv4/IPv6 dual stack configurations.
-                dstqemu = self.remoteHost
-            else:
-                dstqemu = self._dstqemu
+            dstqemu = self._dstqemu
             if dstqemu:
                 muri = 'tcp://{}'.format(
                     normalize_literal_addr(dstqemu))
@@ -532,9 +591,9 @@ class SourceThread(object):
                           (time.time() - startTime) + destCreationTime)
 
     def _perform_migration(self, duri, muri):
-        if self._vm.hasSpice and self._vm.conf.get('clientIp'):
+        if self._vm.hasSpice and self._vm.client_ip:
             SPICE_MIGRATION_HANDOVER_TIME = 120
-            self._vm._reviveTicket(SPICE_MIGRATION_HANDOVER_TIME)
+            self._vm.reviveTicket(SPICE_MIGRATION_HANDOVER_TIME)
 
         # FIXME: there still a race here with libvirt,
         # if we call stop() and libvirt migrateToURI3 didn't start
@@ -542,14 +601,20 @@ class SourceThread(object):
         # side
         self._preparingMigrationEvt = False
         if not self._migrationCanceledEvt.is_set():
-            self._vm._dom.migrateToURI3(duri,
-                                        self._migration_params(muri),
-                                        self._migration_flags)
+            # pylint: disable=no-member
+            self._dom.migrateToURI3(duri,
+                                    self._migration_params(muri),
+                                    self._migration_flags)
         else:
             self._raiseAbortError()
 
     def _migration_params(self, muri):
-        params = {libvirt.VIR_MIGRATE_PARAM_BANDWIDTH: self._maxBandwidth}
+        params = {}
+        if self._maxBandwidth:
+            params[libvirt.VIR_MIGRATE_PARAM_BANDWIDTH] = self._maxBandwidth
+        if self._parallel is not None:
+            params[libvirt.VIR_MIGRATE_PARAM_PARALLEL_CONNECTIONS] = \
+                self._parallel
         if not self.tunneled:
             params[libvirt.VIR_MIGRATE_PARAM_URI] = str(muri)
         if self._consoleAddress:
@@ -557,15 +622,40 @@ class SourceThread(object):
             params[libvirt.VIR_MIGRATE_PARAM_GRAPHICS_URI] = str(
                 '%s://%s' % (graphics, self._consoleAddress)
             )
+        if self._encrypted:
+            # Use the standard host name or IP address when checking
+            # the remote certificate.  Not the migration destination,
+            # which may be e.g. an IP address from a migration
+            # network, not present in the certificate.
+            params[libvirt.VIR_MIGRATE_PARAM_TLS_DESTINATION] = \
+                normalize_literal_addr(self.remoteHost)
+        xml = self._vm.migratable_domain_xml()
         # REQUIRED_FOR: destination Vdsm < 4.3
         if self._legacy_payload_path is not None:
             alias, path = self._legacy_payload_path
-            dom = xmlutils.fromstring(self._vm.migratable_domain_xml())
+            dom = xmlutils.fromstring(xml)
             source = dom.find(".//alias[@name='%s']/../source" % (alias,))
             source.set('file', path)
             xml = xmlutils.tostring(dom)
-            self._vm.log.debug("Migrating domain XML: %s", xml)
-            params[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = xml
+        # Remove & replace CPU pinning added by VDSM
+        dom = xmlutils.fromstring(xml)
+        cputune = dom.find('cputune')
+        if cputune is not None:
+            for vcpu in vmxml.find_all(cputune, 'vcpupin'):
+                vcpu_id = int(vcpu.get('vcpu'))
+                if (self._vm.cpu_policy() == cpumanagement.CPU_POLICY_MANUAL
+                        and vcpu_id in self._vm.manually_pinned_cpus()):
+                    continue
+                cputune.remove(vcpu)
+        if self._destination_cpusets is not None:
+            if cputune is None:
+                cputune = xml.etree.ElementTree.Element('cputune')
+                dom.append(cputune)
+            for vcpupin in self._destination_cpusets:
+                cputune.append(vcpupin)
+        xml = xmlutils.tostring(dom)
+        self._vm.log.debug("Migrating domain XML: %s", xml)
+        params[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = xml
         return params
 
     @property
@@ -577,7 +667,8 @@ class SourceThread(object):
         return self._migration_flags
 
     def _calculate_migration_flags(self, tunneled, abort_on_error,
-                                   compressed, auto_converge, encrypted):
+                                   compressed, auto_converge, encrypted,
+                                   parallel):
         flags = libvirt.VIR_MIGRATE_LIVE | libvirt.VIR_MIGRATE_PEER2PEER
         if tunneled:
             flags |= libvirt.VIR_MIGRATE_TUNNELLED
@@ -589,6 +680,8 @@ class SourceThread(object):
             flags |= libvirt.VIR_MIGRATE_AUTO_CONVERGE
         if encrypted:
             flags |= libvirt.VIR_MIGRATE_TLS
+        if parallel:
+            flags |= libvirt.VIR_MIGRATE_PARALLEL
         if self._vm.min_cluster_version(4, 2):
             flags |= libvirt.VIR_MIGRATE_PERSIST_DEST
         # Migration may fail immediately when VIR_MIGRATE_POSTCOPY flag is
@@ -635,14 +728,14 @@ class SourceThread(object):
     def set_max_bandwidth(self, bandwidth):
         self._vm.log.debug('setting migration max bandwidth to %d', bandwidth)
         self._maxBandwidth = bandwidth
-        self._vm._dom.migrateSetMaxSpeed(bandwidth)
+        self._dom.migrateSetMaxSpeed(bandwidth)  # pylint: disable=no-member
 
     def stop(self):
         # if its locks we are before the migrateToURI3()
         # call so no need to abortJob()
         try:
             self._migrationCanceledEvt.set()
-            self._vm._dom.abortJob()
+            self._vm.abort_domjob()
         except libvirt.libvirtError:
             if not self._preparingMigrationEvt:
                 raise
@@ -652,14 +745,15 @@ class SourceThread(object):
     def _recovery_run(self):
         self.log.debug("Starting migration recovery thread")
         while True:
-            job_stats = self._vm._dom.jobStats()
+            job_stats = self._vm.job_stats()
             if not ongoing(job_stats):
                 break
             time.sleep(self._RECOVERY_LOOP_PAUSE)
         self.log.debug("Recovered migration finished")
         # Successful migration is handled in VM.onJobCompleted, here we need
         # just to ensure that migration failures are detected and handled.
-        if self._vm._dom.state(0)[0] == libvirt.VIR_DOMAIN_RUNNING:
+        # pylint: disable=no-member
+        if self._dom.state(0)[0] == libvirt.VIR_DOMAIN_RUNNING:
             self.recovery_cleanup()
 
     def recovery_cleanup(self):
@@ -675,6 +769,30 @@ class SourceThread(object):
         if self._recovery and \
            self._vm.lastStatus == vmstatus.MIGRATION_SOURCE:
             self._recover("Migration failed")
+
+    def refresh_destination_disk(self, vol_pdiv):
+        """
+        Refresh drive on the destination host.
+        """
+        if self._supports_disk_refresh is None:
+            caps = self._destServer.getVdsCapabilities()
+            if response.is_error(caps):
+                self.log.warning(
+                    "Failed to get destination host capabilities: %s",
+                    caps["status"]["message"])
+                self._supports_disk_refresh = False
+            else:
+                self._supports_disk_refresh = caps.get(
+                    "refresh_disk_supported", False)
+
+        if not self._supports_disk_refresh:
+            raise exception.DiskRefreshNotSupported()
+
+        result = self._destServer.refresh_disk(self._vm.id, vol_pdiv)
+        if response.is_error(result):
+            raise exception.CannotRefreshDisk(
+                reason=result["status"]["message"])
+        return VolumeSize(int(result["apparentsize"]), int(result["truesize"]))
 
 
 def exponential_downtime(downtime, steps):
@@ -696,6 +814,7 @@ class MonitorThread(object):
         super(MonitorThread, self).__init__()
         self._stop = threading.Event()
         self._vm = vm
+        self._dom = DomainAdapter(self._vm)
         self._startTime = startTime
         self.daemon = True
         self.progress = None
@@ -743,7 +862,13 @@ class MonitorThread(object):
             if stopped:
                 break
 
-            job_stats = self._vm._dom.jobStats()
+            try:
+                job_stats = self._vm.job_stats()
+            except libvirt.libvirtError as e:
+                if e.get_error_code() == libvirt.VIR_ERR_OPERATION_INVALID:
+                    # The migration stopped just now
+                    break
+                raise
             # It may happen that the migration did not start yet
             # so we'll keep waiting
             if not ongoing(job_stats):
@@ -782,7 +907,7 @@ class MonitorThread(object):
                 self._vm.log.warn(
                     'Migration stalling: remaining (%sMiB)'
                     ' > lowmark (%sMiB).',
-                    progress.data_remaining // Mbytes, lowmark // Mbytes)
+                    progress.data_remaining // MiB, lowmark // MiB)
 
             if not self._vm.post_copy and\
                progress.mem_iteration > last_iteration:
@@ -823,7 +948,8 @@ class MonitorThread(object):
         if action == CONVERGENCE_SCHEDULE_SET_DOWNTIME:
             downtime = int(action_with_params['params'][0])
             vm.log.debug('Setting downtime to %d', downtime)
-            vm._dom.migrateSetMaxDowntime(downtime, 0)
+            # pylint: disable=no-member
+            self._dom.migrateSetMaxDowntime(downtime, 0)
         elif action == CONVERGENCE_SCHEDULE_POST_COPY:
             if not self._vm.switch_migration_to_post_copy():
                 # Do nothing for now; the next action will be invoked after a
@@ -831,7 +957,7 @@ class MonitorThread(object):
                 vm.log.warning('Failed to switch to post-copy migration')
         elif action == CONVERGENCE_SCHEDULE_SET_ABORT:
             vm.log.warning('Aborting migration')
-            vm._dom.abortJob()
+            vm.abort_domjob()
             self.stop()
 
 
@@ -873,17 +999,17 @@ class Progress(_Progress):
             ' %s%% of data processed,'
             ' total data: %iMB,'
             ' processed data: %iMB, remaining data: %iMB,'
-            ' transfer speed %iMBps, zero pages: %iMB,'
+            ' transfer speed %iMbps, zero pages: %iMB,'
             ' compressed: %iMB, dirty rate: %i,'
             ' memory iteration: %i' % (
                 (self.time_elapsed / 1000),
                 self.percentage,
-                (self.data_total // Mbytes),
-                (self.data_processed // Mbytes),
-                (self.data_remaining // Mbytes),
-                (self.mem_bps // Mbytes),
+                (self.data_total // MiB),
+                (self.data_processed // MiB),
+                (self.data_remaining // MiB),
+                (self.mem_bps * 8 // MiB),
                 self.mem_constant,
-                (self.compression_bytes // Mbytes),
+                (self.compression_bytes // MiB),
                 self.dirty_rate,
                 self.mem_iteration,
             )

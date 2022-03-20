@@ -157,8 +157,8 @@ def setup_logging(log_file, verbosity, append):
     else:
         handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
-        "%(threadName)s::%(levelname)s::%(asctime)s::%(module)s::" +
-        "%(lineno)d::%(name)s::(%(funcName)s) %(message)s"))
+        "%(threadName)s::%(levelname)s::%(asctime)s::%(module)s::"
+        + "%(lineno)d::%(name)s::(%(funcName)s) %(message)s"))
 
     root_logger = logging.getLogger('')
     root_logger.setLevel(level)
@@ -207,7 +207,7 @@ def main():
 
     try:
         return tool_command[cmd]["command"](*args)
-    except vdsm.tool.ExtraArgsError as e:
+    except vdsm.tool.ExtraArgsError:
         print_command_usage(tool_command[cmd]["command"], sys.stderr)
         return 1
     except vdsm.tool.UsageError as e:
@@ -219,6 +219,7 @@ def main():
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())

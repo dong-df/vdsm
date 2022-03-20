@@ -1,5 +1,5 @@
 #
-# Copyright 2018 Red Hat, Inc.
+# Copyright 2018-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,6 +20,9 @@
 
 from __future__ import absolute_import
 from __future__ import division
+
+import datetime
+from dateutil import tz
 
 from collections import defaultdict
 
@@ -58,10 +61,11 @@ def translate_arch(arch):
     return arch_map.get(arch, 'unknown')
 
 
-def translate_fsinfo(filesystem):
+def translate_fsinfo(filesystem, idx=None):
     """
     Translate dictionary returned by guest-get-fsinfo info dictionary passed on
-    by VDSM.
+    by VDSM. When the info is retrieved using libvirt call the keys are
+    slightly different.
     """
     # Example on Linux:
     # {
@@ -73,18 +77,26 @@ def translate_fsinfo(filesystem):
     #   "type": "ext4"
     # },
     filesystem = defaultdict(str, filesystem)
+    if idx is not None:
+        # Info comes from libvirt
+        prefix = 'fs.{:d}.'.format(idx)
+        fstype = '{}fstype'.format(prefix)
+    else:
+        prefix = ''
+        fstype = 'type'
     return {
-        "path": filesystem['mountpoint'],
-        "total": str(filesystem['total-bytes']),
-        "used": str(filesystem['used-bytes']),
-        "fs": filesystem['type'],
+        "path": filesystem[prefix + 'mountpoint'],
+        "total": str(filesystem[prefix + 'total-bytes']),
+        "used": str(filesystem[prefix + 'used-bytes']),
+        "fs": filesystem[fstype],
     }
 
 
 def translate_linux_osinfo(os_info):
     """
     Translate dictionary returned by guest-get-osinfo for Linux guest into
-    guest info used in VDSM and understood by Engine.
+    guest info used in VDSM and understood by Engine. When the info is
+    retrieved using libvirt call the keys are slightly different.
     """
     # Example for Fedora 27:
     # {
@@ -102,15 +114,20 @@ def translate_linux_osinfo(os_info):
 
     # Treat missing values as empty strings
     os_info = defaultdict(str, os_info)
+    if 'os.id' in os_info:
+        # Info comes from libvirt
+        prefix = 'os.'
+    else:
+        prefix = ''
     return {
-        'guestOs': os_info['kernel-release'],
+        'guestOs': os_info[prefix + 'kernel-release'],
         'guestOsInfo': {
             'type': 'linux',
-            'arch': translate_arch(os_info['machine']),
-            'kernel': os_info['kernel-release'],
-            'distribution': os_info['name'],
-            'version': os_info['version-id'],
-            'codename': os_info['variant'],
+            'arch': translate_arch(os_info[prefix + 'machine']),
+            'kernel': os_info[prefix + 'kernel-release'],
+            'distribution': os_info[prefix + 'name'],
+            'version': os_info[prefix + 'version-id'],
+            'codename': os_info[prefix + 'variant'],
         }
     }
 
@@ -118,7 +135,8 @@ def translate_linux_osinfo(os_info):
 def translate_windows_osinfo(os_info):
     """
     Translate dictionary returned by guest-get-osinfo for Windows guest into
-    guest info used in VDSM and understood by Engine.
+    guest info used in VDSM and understood by Engine. When the info is
+    retrieved using libvirt call the keys are slightly different.
     """
     # Example for Windows 10:
     # {
@@ -136,14 +154,43 @@ def translate_windows_osinfo(os_info):
 
     # Treat missing values as empty strings
     os_info = defaultdict(str, os_info)
+    if 'os.id' in os_info:
+        # Info comes from libvirt
+        prefix = 'os.'
+    else:
+        prefix = ''
     return {
-        'guestOs': os_info['pretty-name'],
+        'guestOs': os_info[prefix + 'pretty-name'],
         'guestOsInfo': {
             'type': 'windows',
-            'arch': translate_arch(os_info['machine']),
+            'arch': translate_arch(os_info[prefix + 'machine']),
             'kernel': '',
             'distribution': '',
-            'version': os_info['kernel-version'],
-            'codename': os_info['pretty-name'],
+            'version': os_info[prefix + 'kernel-version'],
+            'codename': os_info[prefix + 'pretty-name'],
         }
     }
+
+
+def translate_pci_device(device):
+    device = defaultdict(str, device)
+    date = device['driver-date']
+    if type(date) is int:
+        # If type is int it is number of nanoseconds since epoch otherwise it
+        # is string in form YYYY-MM-DD and we don't have to do anything
+        dt = datetime.datetime.fromtimestamp(date // 10**9, tz=tz.tzutc())
+        return {
+            'device_id': int(device['id']['device-id']),
+            'driver_date': dt.date().isoformat(),
+            'driver_name': device['driver-name'],
+            'driver_version': device['driver-version'],
+            'vendor_id': int(device['id']['vendor-id']),
+        }
+    else:
+        return {
+            'device_id': int(device['address']['data']['device-id']),
+            'driver_date': date,
+            'driver_name': device['driver-name'],
+            'driver_version': device['driver-version'],
+            'vendor_id': int(device['address']['data']['vendor-id']),
+        }

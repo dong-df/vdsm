@@ -23,6 +23,7 @@ from __future__ import division
 import binascii
 import logging
 import os
+import stat
 import shutil
 import tempfile
 import threading
@@ -96,10 +97,11 @@ class FakeFileEnv(object):
     def make_volume(self, size, imguuid, voluuid, parent_vol_id=sc.BLANK_UUID,
                     vol_format=sc.RAW_FORMAT, vol_type=sc.LEAF_VOL,
                     prealloc=sc.SPARSE_VOL, disk_type=sc.DATA_DISKTYPE,
-                    desc='fake volume', qcow2_compat='0.10'):
+                    desc='fake volume', qcow2_compat='0.10', legal=True):
         return make_file_volume(self.sd_manifest, size, imguuid, voluuid,
                                 parent_vol_id, vol_format, vol_type,
-                                prealloc, disk_type, desc, qcow2_compat)
+                                prealloc, disk_type, desc, qcow2_compat,
+                                legal)
 
 
 class FakeBlockEnv(object):
@@ -185,11 +187,12 @@ def fake_env(storage_type, sd_version=3, data_center=None,
 
 
 @contextmanager
-def fake_volume(storage_type='file', size=MiB, format=sc.RAW_FORMAT):
+def fake_volume(storage_type='file', size=MiB, format=sc.RAW_FORMAT,
+                legal=True):
     img_id = make_uuid()
     vol_id = make_uuid()
     with fake_env(storage_type) as env:
-        env.make_volume(size, img_id, vol_id, vol_format=format)
+        env.make_volume(size, img_id, vol_id, vol_format=format, legal=legal)
         vol = env.sd_manifest.produceVolume(img_id, vol_id)
         yield vol
 
@@ -232,9 +235,12 @@ class FakeSD(object):
     def getVersion(self):
         return self._manifest.getVersion()
 
-    def extendVolume(self, volumeUUID, size, isShuttingDown=None):
+    def extendVolume(self, volumeUUID, size):
         if self.lvm:
             self.lvm.extendLV(self._manifest.sdUUID, volumeUUID, size)
+
+    def qcow2_compat(self):
+        return self._manifest.qcow2_compat()
 
 
 def make_sd_metadata(sduuid, version=3, dom_class=sd.DATA_DOMAIN, pools=None):
@@ -318,21 +324,42 @@ def make_file_volume(sd_manifest, size, imguuid, voluuid,
                      vol_type=sc.LEAF_VOL,
                      prealloc=sc.SPARSE_VOL,
                      disk_type=sc.DATA_DISKTYPE,
-                     desc='fake volume', qcow2_compat='0.10'):
+                     desc='fake volume', qcow2_compat='0.10',
+                     legal=True):
     volpath = os.path.join(sd_manifest.domaindir, "images", imguuid, voluuid)
 
     # Create needed path components.
     make_file(volpath, size)
 
-    # Create qcow2 file if needed.
+    # Create the image.
     if vol_format == sc.COW_FORMAT:
         backing = parent_vol_id if parent_vol_id != sc.BLANK_UUID else None
+        if backing:
+            backing_path = os.path.join(
+                sd_manifest.domaindir, "images", imguuid, backing)
+            backing_format = qemuimg.info(backing_path)["format"]
+        else:
+            backing_format = None
+
         op = qemuimg.create(
             volpath,
             size=size,
             format=qemuimg.FORMAT.QCOW2,
             qcow2Compat=qcow2_compat,
-            backing=backing)
+            backing=backing,
+            backingFormat=backing_format)
+        op.run()
+    else:
+        # TODO: Use fallocate helper like the real code.
+        if prealloc == sc.PREALLOCATED_VOL:
+            preallocation = qemuimg.PREALLOCATION.FALLOC
+        else:
+            preallocation = None
+        op = qemuimg.create(
+            volpath,
+            size=size,
+            format=qemuimg.FORMAT.RAW,
+            preallocation=preallocation)
         op.run()
 
     # Create meta files.
@@ -352,7 +379,7 @@ def make_file_volume(sd_manifest, size, imguuid, voluuid,
         sc.type2name(vol_type),
         disk_type,
         desc,
-        sc.LEGAL_VOL)
+        sc.LEGAL_VOL if legal else sc.ILLEGAL_VOL)
 
 
 def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
@@ -361,7 +388,7 @@ def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
                       vol_type=sc.LEAF_VOL,
                       prealloc=sc.PREALLOCATED_VOL,
                       disk_type=sc.DATA_DISKTYPE,
-                      desc='fake volume', qcow2_compat='0.10'):
+                      desc='fake volume', qcow2_compat='0.10', legal=True):
     sduuid = sd_manifest.sdUUID
     imagedir = sd_manifest.getImageDir(imguuid)
     if not os.path.exists(imagedir):
@@ -382,13 +409,20 @@ def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
         volpath = lvm.lvPath(sduuid, voluuid)
         backing = parent_vol_id if parent_vol_id != sc.BLANK_UUID else None
 
+        if backing:
+            backing_path = lvm.lvPath(sduuid, backing)
+            backing_format = qemuimg.info(backing_path)["format"]
+        else:
+            backing_format = None
+
         # Write qcow2 image to the fake block device - truncating the file.
         op = qemuimg.create(
             volpath,
             size=size,
             format=qemuimg.FORMAT.QCOW2,
             qcow2Compat=qcow2_compat,
-            backing=backing)
+            backing=backing,
+            backingFormat=backing_format)
         op.run()
 
         # Truncate fake block device back ot the proper size.
@@ -415,7 +449,7 @@ def make_block_volume(lvm, sd_manifest, size, imguuid, voluuid,
         sc.type2name(vol_type),
         disk_type,
         desc,
-        sc.LEGAL_VOL)
+        sc.LEGAL_VOL if legal else sc.ILLEGAL_VOL)
 
 
 def write_qemu_chain(vol_list):
@@ -587,8 +621,26 @@ class Callable(object):
         return self._done.is_set()
 
 
-def get_umask():
-    # Note that get_umask() is not thread safe
-    current_umask = os.umask(0)
-    os.umask(current_umask)
-    return current_umask
+@contextmanager
+def chmod(path, mode):
+    """
+    Changes path permissions.
+
+    Change the permissions of path to the numeric mode before entering the
+    context, and restore the original value when exiting from the context.
+
+    Arguments:
+        path (str): file/directory path
+        mode (int): new mode
+    """
+
+    orig_mode = stat.S_IMODE(os.stat(path).st_mode)
+
+    os.chmod(path, mode)
+    try:
+        yield
+    finally:
+        try:
+            os.chmod(path, orig_mode)
+        except Exception as e:
+            logging.error("Failed to restore %r mode: %s", path, e)

@@ -65,7 +65,7 @@ from vdsm.config import config
 from vdsm.storage import exception as se
 from vdsm.storage import constants as sc
 from vdsm.storage import outOfProcess as oop
-from vdsm.storage import resourceManager
+from vdsm.storage import resourceManager as rm
 
 
 KEY_SEPARATOR = "="
@@ -235,6 +235,9 @@ class State:
         return hash(self.state)
 
 
+# TODO: Consider removing some of these enum classes to simplify the code.
+#  If we never compare instances of the classes, they can be removed.
+#  Immediate suspects: EnumType and 3 its subclasses (Task*Type) below.
 class EnumType(object):
     def __init__(self, enum):
         if not getattr(self, enum, None):
@@ -246,8 +249,11 @@ class EnumType(object):
 
     def __eq__(self, x):
         if type(x) == str:
+            # TODO: This is really bad usage of __eq__, it should not succeed
+            #  when passing object with different type. If fixed should be done
+            #  carefully, may break code due to poor tests.
             return self.value == x
-        if isinstance(x, self):
+        if isinstance(x, type(self)):
             return x.value == self.value
         return False
 
@@ -466,7 +472,7 @@ class Task:
         "metadataVersion": int
     }
 
-    log = logging.getLogger('storage.TaskManager.Task')
+    log = logging.getLogger('storage.taskmanager.task')
 
     def __init__(self, id, name="", tag="",
                  recovery=TaskRecoveryType.none,
@@ -497,7 +503,7 @@ class Task:
         self.state = State(State.init)
         self.result = TaskResult(0, "Task is initializing", "")
 
-        self.resOwner = resourceManager.Owner(proxy(self), raiseonfailure=True)
+        self.resOwner = rm.Owner(proxy(self), raiseonfailure=True)
         self.error = se.TaskAborted("Unknown error encountered")
 
         self.mng = None
@@ -693,8 +699,8 @@ class Task:
     def _saveMetaFile(cls, filename, obj, fields):
         try:
             getProcPool().writeLines(filename,
-                                     [l.encode('utf-8') + b"\n"
-                                      for l in cls._dump(obj, fields)])
+                                     [line.encode('utf-8') + b"\n"
+                                      for line in cls._dump(obj, fields)])
         except Exception:
             cls.log.error("Unexpected error", exc_info=True)
             raise se.TaskMetaDataSaveError(filename)
@@ -844,8 +850,7 @@ class Task:
         # Callback from resourceManager.Owner. May be called by another thread.
         self._incref()
         try:
-            self.callbackLock.acquire()
-            try:
+            with self.callbackLock:
                 self.log.debug("_resourcesAcquired: %s.%s (%s)",
                                namespace, resource, locktype)
                 if self.state == State.preparing:
@@ -863,8 +868,6 @@ class Task:
                 else:
                     raise se.TaskStateError("acquire is not allowed in state"
                                             " %s" % self.state)
-            finally:
-                self.callbackLock.release()
         finally:
             self._decref()
 
@@ -936,13 +939,13 @@ class Task:
 
     def _doAbort(self, force=False):
         self.log.debug("Task._doAbort: force %s" % force)
-        self.lock.acquire()
-        # Am I really the last?
-        if self.ref != 0:
-            self.lock.release()
-            return
-        self.ref += 1
-        self.lock.release()
+
+        with self.lock:
+            # Am I really the last?
+            if self.ref != 0:
+                return
+            self.ref += 1
+
         try:
             try:
                 if (not self.state.canAbort() and
@@ -957,9 +960,9 @@ class Task:
             except se.TaskAborted:
                 self._updateState(State.failed)
         finally:
-            self.lock.acquire()
-            self.ref -= 1
-            self.lock.release()
+            with self.lock:
+                self.ref -= 1
+
             # If something horrible went wrong. Just fail the task.
             if not self.state.isDone():
                 self.log.warn("Task exited in non terminal state. "
@@ -967,37 +970,32 @@ class Task:
                 self._updateState(State.failed)
 
     def _doRecover(self):
-        self.lock.acquire()
-        # Am I really the last?
-        if self.ref != 0:
-            self.lock.release()
-            raise se.TaskHasRefs(six.text_type(self))
-        self.ref += 1
-        self.lock.release()
+        with self.lock:
+            # Am I really the last?
+            if self.ref != 0:
+                raise se.TaskHasRefs(six.text_type(self))
+
+            self.ref += 1
+
         try:
             self._updateState(State.racquiring)
         finally:
-            self.lock.acquire()
-            self.ref -= 1
-            self.lock.release()
+            with self.lock:
+                self.ref -= 1
 
     def _incref(self, force=False):
-        self.lock.acquire()
-        try:
+        with self.lock:
             if self.aborting() and (self._forceAbort or not force):
                 raise se.TaskAborted(six.text_type(self))
 
             self.ref += 1
             ref = self.ref
             return ref
-        finally:
-            self.lock.release()
 
     def _decref(self, force=False):
-        self.lock.acquire()
-        self.ref -= 1
-        ref = self.ref
-        self.lock.release()
+        with self.lock:
+            self.ref -= 1
+            ref = self.ref
 
         self.log.debug("ref %d aborting %s", ref, self.aborting())
         if ref == 0:
@@ -1374,17 +1372,11 @@ class Task:
         resName,
         timeout=config.getint('irs',
                               'task_resource_default_timeout')):
-        self.resOwner.acquire(namespace,
-                              resName,
-                              resourceManager.EXCLUSIVE,
-                              timeout)
+        self.resOwner.acquire(namespace, resName, rm.EXCLUSIVE, timeout)
 
     def getSharedLock(self,
                       namespace,
                       resName,
                       timeout=config.getint('irs',
                                             'task_resource_default_timeout')):
-        self.resOwner.acquire(namespace,
-                              resName,
-                              resourceManager.SHARED,
-                              timeout)
+        self.resOwner.acquire(namespace, resName, rm.SHARED, timeout)

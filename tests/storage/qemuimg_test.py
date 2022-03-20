@@ -44,6 +44,8 @@ from testlib import make_config
 from testlib import namedTemporaryDir
 from testlib import temporaryPath
 
+from . marks import requires_root
+
 CLUSTER_SIZE = 64 * KiB
 
 QEMU_IMG = qemuimg._qemuimg.cmd
@@ -87,6 +89,7 @@ class TestInfo:
                 }
             },
             "backing-filename": "/var/tmp/test.img",
+            "backing-filename-format": "raw",
             "dirty-flag": False
         }
 
@@ -103,15 +106,17 @@ class TestInfo:
                 op.run()
                 op = qemuimg.create(leaf_path,
                                     format=leaf_fmt,
-                                    backing=base_path)
+                                    backing=base_path,
+                                    backingFormat="raw")
                 op.run()
 
             info = qemuimg.info(leaf_path)
             assert leaf_fmt == info['format']
-            assert size == info['virtualsize']
-            assert self.CLUSTER_SIZE == info['clustersize']
-            assert base_path == info['backingfile']
-            assert '0.10' == info['compat']
+            assert size == info['virtual-size']
+            assert self.CLUSTER_SIZE == info['cluster-size']
+            assert base_path == info['backing-filename']
+            assert "raw" == info['backing-filename-format']
+            assert '0.10' == info['format-specific']['data']['compat']
 
     @pytest.mark.parametrize("unsafe", [True, False])
     def test_unsafe_info(self, unsafe):
@@ -121,7 +126,7 @@ class TestInfo:
             op = qemuimg.create(img, size=size, format=qemuimg.FORMAT.QCOW2)
             op.run()
             info = qemuimg.info(img, unsafe=unsafe)
-            assert size == info['virtualsize']
+            assert size == info['virtual-size']
 
     def test_parse_error(self):
         def call(cmd, **kw):
@@ -141,39 +146,6 @@ class TestInfo:
             with pytest.raises(cmdutils.Error):
                 qemuimg.info('leaf.img')
 
-    def test_missing_compat_for_qcow2_raises(self):
-        data = self._fake_info()
-        del data['format-specific']['data']['compat']
-        with MonkeyPatchScope([(commands, "execCmd",
-                                partial(fake_json_call, data))]):
-            with pytest.raises(cmdutils.Error):
-                qemuimg.info('leaf.img')
-
-    @pytest.mark.parametrize("qemu_field,info_field", [
-        ('backing-filename', 'backingfile'),
-        ('cluster-size', 'clustersize'),
-    ])
-    def test_optional_fields(self, qemu_field, info_field):
-        data = self._fake_info()
-        del data[qemu_field]
-        with MonkeyPatchScope([(commands, "execCmd",
-                                partial(fake_json_call, data))]):
-            info = qemuimg.info('unused')
-            assert info_field not in info
-
-    def test_compat_reported_for_qcow2_only(self):
-        data = {
-            "virtual-size": MiB,
-            "filename": "raw.img",
-            "format": "raw",
-            "actual-size": 0,
-            "dirty-flag": False
-        }
-        with MonkeyPatchScope([(commands, "execCmd",
-                                partial(fake_json_call, data))]):
-            info = qemuimg.info('unused')
-            assert 'compat' not in info
-
     def test_untrusted_image(self):
         with namedTemporaryDir() as tmpdir:
             img = os.path.join(tmpdir, 'untrusted.img')
@@ -181,7 +153,7 @@ class TestInfo:
             op = qemuimg.create(img, size=size, format=qemuimg.FORMAT.QCOW2)
             op.run()
             info = qemuimg.info(img, trusted_image=False)
-            assert size == info['virtualsize']
+            assert size == info['virtual-size']
 
     def test_untrusted_image_call(self):
         command = []
@@ -197,6 +169,107 @@ class TestInfo:
         assert command[:3] == [constants.EXT_PRLIMIT,
                                '--cpu=30',
                                '--as=1073741824']
+
+    def test_backing_chain(self, tmpdir):
+        virtual_size = 10 * MiB
+        base = str(tmpdir.join('base.raw'))
+        op = qemuimg.create(
+            base,
+            size=virtual_size,
+            format=qemuimg.FORMAT.RAW)
+        op.run()
+
+        mid = str(tmpdir.join('mid.qcow2'))
+        op = qemuimg.create(
+            mid,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat="1.1",
+            backing=base,
+            backingFormat="raw")
+        op.run()
+
+        op = qemuimg.bitmap_add(mid, "bitmap")
+        op.run()
+
+        top = str(tmpdir.join('top.qcow2'))
+        op = qemuimg.create(
+            top,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat="1.1",
+            backing=mid,
+            backingFormat="qcow2")
+        op.run()
+
+        op = qemuimg.bitmap_add(top, "bitmap")
+        op.run()
+
+        chain_info = qemuimg.info(top, backing_chain=True)
+
+        assert len(chain_info) == 3
+
+        # Check top image info.
+
+        top_info = chain_info[0]
+
+        assert top_info["virtual-size"] == virtual_size
+        assert top_info["format"] == "qcow2"
+        assert top_info["backing-filename"] == mid
+        assert top_info["backing-filename-format"] == "qcow2"
+
+        assert "actual-size" in top_info
+        assert "cluster-size" in top_info
+
+        qcow2_data = top_info["format-specific"]["data"]
+        assert qcow2_data["compat"] == "1.1"
+        assert len(qcow2_data["bitmaps"]) == 1
+
+        # Check middle image info.
+
+        mid_info = chain_info[1]
+
+        assert mid_info["virtual-size"] == virtual_size
+        assert mid_info["format"] == "qcow2"
+        assert mid_info["backing-filename"] == base
+        assert mid_info["backing-filename-format"] == "raw"
+
+        assert "actual-size" in mid_info
+        assert "cluster-size" in mid_info
+
+        qcow2_data = mid_info["format-specific"]["data"]
+        assert qcow2_data["compat"] == "1.1"
+        assert len(qcow2_data["bitmaps"]) == 1
+
+        # Check base image info.
+
+        base_info = chain_info[2]
+
+        assert base_info["virtual-size"] == virtual_size
+        assert base_info["format"] == "raw"
+        assert "actual-size" in base_info
+
+    def test_backing_chain_single(self, tmpdir):
+        virtual_size = 10 * MiB
+        img = str(tmpdir.join("single.qcow2"))
+        op = qemuimg.create(
+            img,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat="1.1")
+        op.run()
+
+        chain_info = qemuimg.info(img, backing_chain=True)
+
+        assert len(chain_info) == 1
+
+        img_info = chain_info[0]
+
+        assert img_info["virtual-size"] == virtual_size
+        assert img_info["format"] == "qcow2"
+        assert "actual-size" in img_info
+        assert "cluster-size" in img_info
+
+        qcow2_data = img_info["format-specific"]["data"]
+        assert qcow2_data["compat"] == "1.1"
 
 
 class TestCreate:
@@ -240,7 +313,7 @@ class TestCreate:
 
             info = qemuimg.info(image)
             assert info['format'] == qemuimg.FORMAT.RAW
-            assert info['virtualsize'] == size
+            assert info['virtual-size'] == size
 
     def test_zero_size(self):
         with namedTemporaryDir() as tmpdir:
@@ -250,7 +323,7 @@ class TestCreate:
 
             info = qemuimg.info(image)
             assert info['format'] == qemuimg.FORMAT.RAW
-            assert info['virtualsize'] == 0
+            assert info['virtual-size'] == 0
 
     def test_qcow2_compat(self):
         with namedTemporaryDir() as tmpdir:
@@ -261,8 +334,8 @@ class TestCreate:
 
             info = qemuimg.info(image)
             assert info['format'] == qemuimg.FORMAT.QCOW2
-            assert info['compat'] == "0.10"
-            assert info['virtualsize'] == size
+            assert info['format-specific']['data']['compat'] == "0.10"
+            assert info['virtual-size'] == size
 
     def test_qcow2_compat_version3(self):
         with namedTemporaryDir() as tmpdir:
@@ -274,8 +347,8 @@ class TestCreate:
 
             info = qemuimg.info(image)
             assert info['format'] == qemuimg.FORMAT.QCOW2
-            assert info['compat'] == "1.1"
-            assert info['virtualsize'] == size
+            assert info['format-specific']['data']['compat'] == "1.1"
+            assert info['virtual-size'] == size
 
     def test_qcow2_compat_invalid(self):
         with pytest.raises(ValueError):
@@ -320,7 +393,7 @@ class TestConvert:
     def test_qcow2_compat(self):
         def convert(cmd, **kw):
             expected = [QEMU_IMG, 'convert', '-p', '-t', 'none', '-T', 'none',
-                        'src', '-O', 'qcow2', '-o', 'compat=0.10', 'dst']
+                        '-O', 'qcow2', '-o', 'compat=0.10', 'src', 'dst']
             assert cmd == expected
 
         with MonkeyPatchScope([(qemuimg, 'config', CONFIG),
@@ -330,7 +403,7 @@ class TestConvert:
     def test_qcow2_compat_version3(self):
         def convert(cmd, **kw):
             expected = [QEMU_IMG, 'convert', '-p', '-t', 'none', '-T', 'none',
-                        'src', '-O', 'qcow2', '-o', 'compat=1.1', 'dst']
+                        '-O', 'qcow2', '-o', 'compat=1.1', 'src', 'dst']
             assert cmd == expected
 
         with MonkeyPatchScope([(qemuimg, 'config', CONFIG),
@@ -341,7 +414,7 @@ class TestConvert:
     def test_qcow2_no_backing_file(self):
         def convert(cmd, **kw):
             expected = [QEMU_IMG, 'convert', '-p', '-t', 'none', '-T', 'none',
-                        'src', '-O', 'qcow2', '-o', 'compat=0.10', 'dst']
+                        '-O', 'qcow2', '-o', 'compat=0.10', 'src', 'dst']
             assert cmd == expected
 
         with MonkeyPatchScope([(qemuimg, 'config', CONFIG),
@@ -351,8 +424,8 @@ class TestConvert:
     def test_qcow2_backing_file(self):
         def convert(cmd, **kw):
             expected = [QEMU_IMG, 'convert', '-p', '-t', 'none', '-T', 'none',
-                        'src', '-O', 'qcow2', '-o',
-                        'compat=0.10,backing_file=bak', 'dst']
+                        '-O', 'qcow2', '-o', 'compat=0.10,backing_file=bak',
+                        'src', 'dst']
             assert cmd == expected
 
         with MonkeyPatchScope([(qemuimg, 'config', CONFIG),
@@ -363,7 +436,7 @@ class TestConvert:
     def test_qcow2_backing_format(self):
         def convert(cmd, **kw):
             expected = [QEMU_IMG, 'convert', '-p', '-t', 'none', '-T', 'none',
-                        'src', '-O', 'qcow2', '-o', 'compat=0.10', 'dst']
+                        '-O', 'qcow2', '-o', 'compat=0.10', 'src', 'dst']
             assert cmd == expected
 
         with MonkeyPatchScope([(qemuimg, 'config', CONFIG),
@@ -374,9 +447,9 @@ class TestConvert:
     def test_qcow2_backing_file_and_format(self):
         def convert(cmd, **kw):
             expected = [QEMU_IMG, 'convert', '-p', '-t', 'none', '-T', 'none',
-                        'src', '-O', 'qcow2', '-o',
+                        '-O', 'qcow2', '-o',
                         'compat=0.10,backing_file=bak,backing_fmt=qcow2',
-                        'dst']
+                        'src', 'dst']
             assert cmd == expected
 
         with MonkeyPatchScope([(qemuimg, 'config', CONFIG),
@@ -390,6 +463,475 @@ class TestConvert:
                             backing='bak', backingFormat='qcow2',
                             dstQcow2Compat='1.11')
 
+    @pytest.mark.parametrize("dst_compat,create", [
+        pytest.param("0.10", True),
+        pytest.param("1.1", False),
+    ])
+    def test_qcow2(self, tmp_mount, dst_compat, create):
+        virtual_size = 10 * MiB
+
+        # Create source chain.
+        src_base = os.path.join(tmp_mount.path, 'src_base.img')
+        op = qemuimg.create(
+            src_base,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        src_top = os.path.join(tmp_mount.path, 'src_top.img')
+        op = qemuimg.create(
+            src_top,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+            backing=src_base,
+            backingFormat='qcow2'
+        )
+        op.run()
+
+        # Create dest chain
+        dst_base = os.path.join(tmp_mount.path, 'dst_base.img')
+        op = qemuimg.create(
+            dst_base,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat=dst_compat,
+        )
+        op.run()
+
+        dst_top = os.path.join(tmp_mount.path, 'dst_top.img')
+        op = qemuimg.create(
+            dst_top,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat=dst_compat,
+            backing=dst_base,
+            backingFormat='qcow2'
+        )
+        op.run()
+
+        # Write data to the source chain.
+        for i, path in enumerate([src_base, src_top]):
+            qemuio.write_pattern(
+                path,
+                "qcow2",
+                offset=i * MiB,
+                len=64 * KiB,
+                pattern=0xf0 + i)
+
+        # Copy base to base.
+        op = qemuimg.convert(
+            src_base,
+            dst_base,
+            srcFormat='qcow2',
+            dstFormat='qcow2',
+            dstQcow2Compat=dst_compat,
+            create=create,
+            target_is_zero=True,
+        )
+        op.run()
+
+        # Copy top to top.
+        op = qemuimg.convert(
+            src_top,
+            dst_top,
+            srcFormat='qcow2',
+            dstFormat='qcow2',
+            backing=dst_base,
+            backingFormat='qcow2',
+            dstQcow2Compat=dst_compat,
+            # With a backing we can always use False.
+            create=False
+        )
+        op.run()
+
+        # Run comparisons, if there is a mismatch in content or size
+        # op.run() will raise and fail the test.
+
+        op = qemuimg.compare(
+            src_base,
+            dst_base,
+            img1_format='qcow2',
+            img2_format='qcow2',
+            strict=True,
+        )
+        op.run()
+
+        op = qemuimg.compare(
+            src_top,
+            dst_top,
+            img1_format='qcow2',
+            img2_format='qcow2',
+            strict=True
+        )
+        op.run()
+
+    @pytest.mark.parametrize("dst_compat,create", [
+        pytest.param("0.10", True),
+        pytest.param("1.1", False),
+    ])
+    def test_qcow2_collapsed(self, tmp_mount, dst_compat, create):
+        virtual_size = 10 * MiB
+
+        # Create empty source chain.
+        src_base = os.path.join(tmp_mount.path, 'src_base.img')
+        op = qemuimg.create(
+            src_base,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        src_top = os.path.join(tmp_mount.path, 'src_top.img')
+        op = qemuimg.create(
+            src_top,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+            backing=src_base,
+            backingFormat='qcow2'
+        )
+        op.run()
+
+        # Write data to the source chain.
+        for i, path in enumerate([src_base, src_top]):
+            qemuio.write_pattern(
+                path,
+                "qcow2",
+                offset=i * MiB,
+                len=64 * KiB,
+                pattern=0xf0 + i)
+
+        # Create destination image.
+        dst = os.path.join(tmp_mount.path, 'dst.img')
+        op = qemuimg.create(
+            dst,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat=dst_compat,
+        )
+        op.run()
+
+        # Copy src chain to dst.
+        op = qemuimg.convert(
+            src_top,
+            dst,
+            srcFormat='qcow2',
+            dstFormat='qcow2',
+            dstQcow2Compat=dst_compat,
+            create=create,
+            target_is_zero=True,
+        )
+        op.run()
+
+        op = qemuimg.compare(
+            src_top,
+            dst,
+            img1_format='qcow2',
+            img2_format='qcow2',
+            strict=True,
+        )
+        op.run()
+
+    def test_raw_preallocated(self, tmp_mount):
+        virtual_size = 2 * MiB
+
+        # Create source image.
+        src = os.path.join(tmp_mount.path, 'src.img')
+        op = qemuimg.create(
+            src,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Write data to the source image.
+        qemuio.write_pattern(
+            src,
+            "qcow2",
+            offset=MiB,
+            len=64 * KiB,
+            pattern=0xf0)
+
+        # Create preallocated destination image.
+        dst = os.path.join(tmp_mount.path, 'dst.img')
+        op = qemuimg.create(
+            dst,
+            size=virtual_size,
+            format=qemuimg.FORMAT.RAW,
+            preallocation=qemuimg.PREALLOCATION.FALLOC,
+        )
+        op.run()
+
+        # Convert src to dst.
+        op = qemuimg.convert(
+            src,
+            dst,
+            srcFormat=qemuimg.FORMAT.QCOW2,
+            dstFormat=qemuimg.FORMAT.RAW,
+            create=False,
+            target_is_zero=True,
+        )
+        op.run()
+
+        # Compare content - since we copied to preallocated image, allocation
+        # cannot be compared.
+        op = qemuimg.compare(
+            src,
+            dst,
+            img1_format=qemuimg.FORMAT.QCOW2,
+            img2_format=qemuimg.FORMAT.RAW,
+            strict=False,
+        )
+        op.run()
+
+        # Check that dst is still preallocated.
+        info = qemuimg.info(dst)
+        assert info["virtual-size"] == info["actual-size"]
+
+    def test_copy_bitmaps(self, tmp_mount):
+        virtual_size = MiB
+        base_bitmaps = ['base_bitmap1', 'base_bitmap2']
+        top_bitmaps = ['top_bitmap1', 'top_bitmap2']
+
+        # Create source chain.
+        src_base = os.path.join(tmp_mount.path, 'src_base.img')
+        op = qemuimg.create(
+            src_base,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new bitmaps to src_base
+        for name in base_bitmaps:
+            op = qemuimg.bitmap_add(src_base, name)
+            op.run()
+
+        src_top = os.path.join(tmp_mount.path, 'src_top.img')
+        op = qemuimg.create(
+            src_top,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+            backing=src_base,
+            backingFormat='qcow2'
+        )
+        op.run()
+
+        # Add new bitmaps to src_top
+        for name in top_bitmaps:
+            op = qemuimg.bitmap_add(src_top, name)
+            op.run()
+
+        # Create destination chain.
+        dst_base = os.path.join(tmp_mount.path, 'dst_base.img')
+        op = qemuimg.create(
+            dst_base,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        dst_top = os.path.join(tmp_mount.path, 'dst_top.img')
+        op = qemuimg.create(
+            dst_top,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+            backing=dst_base,
+            backingFormat='qcow2'
+        )
+        op.run()
+
+        # Convert src_base to dst_base with bitmaps
+        op = qemuimg.convert(
+            src_base,
+            dst_base,
+            srcFormat=qemuimg.FORMAT.QCOW2,
+            dstFormat=qemuimg.FORMAT.QCOW2,
+            dstQcow2Compat='1.1',
+            bitmaps=True
+        )
+        op.run()
+
+        # Convert src_top to dst_top with bitmaps
+        op = qemuimg.convert(
+            src_top,
+            dst_top,
+            srcFormat=qemuimg.FORMAT.QCOW2,
+            dstFormat=qemuimg.FORMAT.QCOW2,
+            dstQcow2Compat='1.1',
+            bitmaps=True
+        )
+        op.run()
+
+        # Verify that all layers have the expected bitmaps
+        for vol, bitmaps in (
+                [dst_base, base_bitmaps], [dst_top, top_bitmaps]):
+            info = qemuimg.info(vol)
+            assert info['format-specific']['data']['bitmaps'] == [
+                {
+                    "flags": ["auto"],
+                    "name": bitmaps[0],
+                    "granularity": 65536
+                },
+                {
+                    "flags": ["auto"],
+                    "name": bitmaps[1],
+                    "granularity": 65536
+                },
+            ]
+
+    def test_convert_without_copy_bitmaps(self, tmp_mount):
+        virtual_size = MiB
+
+        # Create source chain.
+        src = os.path.join(tmp_mount.path, 'src.img')
+        op = qemuimg.create(
+            src,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new bitmap to src_base
+        op = qemuimg.bitmap_add(src, 'bitmap')
+        op.run()
+
+        dst = os.path.join(tmp_mount.path, 'dst.img')
+        op = qemuimg.create(
+            dst,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+        )
+        op.run()
+
+        op = qemuimg.convert(
+            src,
+            dst,
+            srcFormat=qemuimg.FORMAT.QCOW2,
+            dstFormat=qemuimg.FORMAT.QCOW2,
+            dstQcow2Compat='1.1',
+        )
+        op.run()
+
+        # validate that bitmaps doesn't copied to
+        # the leaf volume
+        info = qemuimg.info(dst)
+        assert 'bitmaps' not in info['format-specific']['data']
+
+    def test_copy_with_disabled_bitmaps(self, tmp_mount):
+        virtual_size = MiB
+        bitmaps = [("a", True), ("b", False)]
+
+        # Create source chain.
+        src = os.path.join(tmp_mount.path, 'src.img')
+        op = qemuimg.create(
+            src,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add bitmaps to src
+        for name, enable in bitmaps:
+            op = qemuimg.bitmap_add(src, name, enable=enable)
+            op.run()
+
+        dst = os.path.join(tmp_mount.path, 'dst.img')
+        op = qemuimg.create(
+            dst,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+        )
+        op.run()
+
+        op = qemuimg.convert(
+            src,
+            dst,
+            srcFormat=qemuimg.FORMAT.QCOW2,
+            dstFormat=qemuimg.FORMAT.QCOW2,
+            dstQcow2Compat='1.1',
+            bitmaps=True
+        )
+        op.run()
+
+        # validate that bitmaps were copied to the
+        # leaf volume including the invalid bitmap
+        info = qemuimg.info(dst)
+        assert info['format-specific']['data']['bitmaps'] == [
+            {
+                "flags": ["auto"],
+                "name": "a",
+                "granularity": 65536
+            },
+            {
+                "flags": [],
+                "name": "b",
+                "granularity": 65536
+            },
+        ]
+
+    def test_convert_with_inconsistent_bitmaps(self, tmp_mount):
+        virtual_size = MiB
+        broken_bitmap = 'broken_bitmap'
+
+        # Create source volume.
+        src_vol = os.path.join(tmp_mount.path, 'src_vol.img')
+        op = qemuimg.create(
+            src_vol,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new bitmaps to src_base
+        qemuimg.bitmap_add(src_vol, broken_bitmap).run()
+
+        # Simulate qemu crash, leaving bitmaps with the "in-use"
+        # flag by opening the image for writing and killing the process.
+        qemuio.abort(src_vol)
+
+        # Create destination chain.
+        dst_vol = os.path.join(tmp_mount.path, 'dst_vol.img')
+        op = qemuimg.create(
+            dst_vol,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Convert volume with inconsistent bitmaps when
+        # QEMU support of '--skip-broken-bitmaps' flag
+        # should skip the broken bitmaps -
+        # https://bugzilla.redhat.com/1984852
+        op = qemuimg.convert(
+            src_vol,
+            dst_vol,
+            srcFormat=qemuimg.FORMAT.QCOW2,
+            dstFormat=qemuimg.FORMAT.QCOW2,
+            dstQcow2Compat='1.1',
+            bitmaps=True
+        )
+        op.run()
+
+        info = qemuimg.info(dst_vol)
+        vol_bitmaps = info['format-specific']['data'].get("bitmaps", [])
+        assert broken_bitmap not in vol_bitmaps
+
 
 class TestConvertCompressed:
 
@@ -400,7 +942,7 @@ class TestConvertCompressed:
             f.truncate(1 * GiB)
             f.write(b"x" * MiB)
 
-        src_file_size = qemuimg.info(src_file)["actualsize"]
+        src_file_size = qemuimg.info(src_file)["actual-size"]
         op = qemuimg.convert(
             src_file,
             dst_file,
@@ -408,7 +950,7 @@ class TestConvertCompressed:
             dstFormat=qemuimg.FORMAT.QCOW2,
             compressed=True)
         op.run()
-        dst_file_size = qemuimg.info(dst_file)["actualsize"]
+        dst_file_size = qemuimg.info(dst_file)["actual-size"]
 
         assert src_file_size > dst_file_size
 
@@ -427,7 +969,7 @@ class TestConvertCompressed:
             len=1 * MiB,
             pattern=0xf0)
 
-        src_file_size = qemuimg.info(src_file)["actualsize"]
+        src_file_size = qemuimg.info(src_file)["actual-size"]
         op = qemuimg.convert(
             src_file,
             dst_file,
@@ -435,7 +977,7 @@ class TestConvertCompressed:
             dstFormat=qemuimg.FORMAT.QCOW2,
             compressed=True)
         op.run()
-        dst_file_size = qemuimg.info(dst_file)["actualsize"]
+        dst_file_size = qemuimg.info(dst_file)["actual-size"]
 
         assert src_file_size > dst_file_size
 
@@ -486,7 +1028,11 @@ class TestConvertUnorderedWrites:
 
         # Create top image with pattern.
         op = qemuimg.create(
-            top, format=qemuimg.FORMAT.QCOW2, qcow2Compat="1.1", backing=base)
+            top,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat="1.1",
+            backing=base,
+            backingFormat=qemuimg.FORMAT.RAW)
         op.run()
         qemuio.write_pattern(top, qemuimg.FORMAT.QCOW2, offset=top_offset)
 
@@ -598,7 +1144,7 @@ class TestConvertPreallocation:
             op.run()
 
             actual_size = os.stat(dst).st_size
-            disk_size = qemuimg.info(dst, format="qcow2")["actualsize"]
+            disk_size = qemuimg.info(dst, format="qcow2")["actual-size"]
 
             assert actual_size > virtual_size
             assert disk_size < virtual_size
@@ -610,9 +1156,13 @@ def check_raw_sparse_image(path, virtual_size):
     # https://github.com/qemu/qemu/commit/3a20013fbb26
     image_stat = os.stat(path)
     allocated = image_stat.st_blocks * 512
-    filesystem_block_size = os.statvfs(path).f_bsize
+
+    # On XFS filesystem qemu may set extent size of 1 MiB for better
+    # performance.
+    min_allocation = max(os.statvfs(path).f_bsize, MiB)
+
     assert image_stat.st_size == virtual_size
-    assert allocated <= filesystem_block_size
+    assert allocated <= min_allocation
 
 
 def check_raw_preallocated_image(path, virtual_size):
@@ -726,15 +1276,25 @@ class TestCommit:
         with namedTemporaryDir() as tmpdir:
             chain = []
             parent = None
+            parent_format = None
+
             # Create a chain of 4 volumes.
             for i in range(4):
                 vol = os.path.join(tmpdir, "vol%d.img" % i)
                 format = (qemuimg.FORMAT.RAW if i == 0 else
                           qemuimg.FORMAT.QCOW2)
-                make_image(vol, size, format, i, qcow2_compat, parent)
+                make_image(
+                    vol,
+                    size,
+                    format,
+                    i,
+                    qcow2_compat,
+                    backing=parent,
+                    backing_format=parent_format)
                 orig_offset = qemuimg.check(vol)["offset"] if i > 0 else None
                 chain.append((vol, orig_offset))
                 parent = vol
+                parent_format = format
 
             base_vol = chain[base][0]
             top_vol = chain[top][0]
@@ -772,7 +1332,14 @@ class TestCommit:
             make_image(base, size, qemuimg.FORMAT.RAW, 0, "1.1")
 
             top = os.path.join(tmpdir, "top.img")
-            make_image(top, size, qemuimg.FORMAT.QCOW2, 1, "1.1", base)
+            make_image(
+                top,
+                size,
+                qemuimg.FORMAT.QCOW2,
+                1,
+                "1.1",
+                backing=base,
+                backing_format=qemuimg.FORMAT.RAW)
 
             op = qemuimg.commit(top, topFormat=qemuimg.FORMAT.QCOW2)
             op.run()
@@ -882,14 +1449,20 @@ class TestAmend:
             base_path = os.path.join(tmpdir, 'base.img')
             leaf_path = os.path.join(tmpdir, 'leaf.img')
             size = MiB
-            op_base = qemuimg.create(base_path, size=size,
-                                     format=qemuimg.FORMAT.RAW)
+            op_base = qemuimg.create(
+                base_path,
+                size=size,
+                format=qemuimg.FORMAT.RAW)
             op_base.run()
-            op_leaf = qemuimg.create(leaf_path, format=qemuimg.FORMAT.QCOW2,
-                                     backing=base_path)
+            op_leaf = qemuimg.create(
+                leaf_path,
+                format=qemuimg.FORMAT.QCOW2,
+                backing=base_path,
+                backingFormat=qemuimg.FORMAT.RAW)
             op_leaf.run()
             qemuimg.amend(leaf_path, desired_compat)
-            assert qemuimg.info(leaf_path)['compat'] == desired_compat
+            info = qemuimg.info(leaf_path)
+            assert info['format-specific']['data']['compat'] == desired_compat
 
 
 class TestMeasure:
@@ -967,12 +1540,73 @@ class TestMeasure:
                 f.write(b"x" * MiB)
         self.check_measure(filename, compat, format, compressed)
 
+    @pytest.mark.parametrize("compat", ['0.10', '1.1'])
+    @requires_root
+    def test_measure_leaf(self, tmp_storage, compat):
+        dev_size = 1 * GiB
+
+        # Create base volume
+        base = tmp_storage.create_device(dev_size)
+        op = qemuimg.create(
+            base,
+            size=dev_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat=compat
+        )
+        op.run()
+
+        # Write 1 MiB to base
+        qemuio.write_pattern(
+            base,
+            format=qemuimg.FORMAT.QCOW2,
+            offset=0,
+            len=MiB,
+            pattern=0xf0)
+
+        # Create top volume over base
+        top = tmp_storage.create_device(dev_size)
+        op = qemuimg.create(
+            top,
+            size=dev_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat=compat,
+            backing=base,
+            backingFormat=qemuimg.FORMAT.QCOW2
+        )
+        op.run()
+
+        # Write 1 MiB to top
+        qemuio.write_pattern(
+            top,
+            format=qemuimg.FORMAT.QCOW2,
+            offset=1 * MiB,
+            len=MiB,
+            pattern=0xf0)
+
+        entire_image = qemuimg.measure(
+            top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=True,
+            backing=True
+        )
+
+        top_only = qemuimg.measure(
+            top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=True,
+            backing=False
+        )
+
+        assert entire_image["required"] >= top_only["required"] + MiB
+
     def check_measure(self, filename, compat, format, compressed):
         if format != qemuimg.FORMAT.RAW:
             filename = convert_to_qcow2(filename, compressed=compressed,
                                         compat=compat)
         qemu_info = qemuimg.info(filename)
-        virtual_size = qemu_info["virtualsize"]
+        virtual_size = qemu_info["virtual-size"]
         qemu_measure = qemuimg.measure(
             filename,
             format=format,
@@ -982,6 +1616,199 @@ class TestMeasure:
         error_pct = 100 * float(estimated_size - actual_size) / virtual_size
         assert estimated_size >= actual_size
         assert error_pct <= 0.1, error_pct
+
+
+class TestBitmaps:
+
+    @pytest.mark.parametrize("granularity, exp_granularity", [
+        (None, 65536),
+        (8 * 64 * 1024, 8 * 64 * 1024)
+    ])
+    def test_add_remove_bitmap(
+            self, tmp_mount, granularity, exp_granularity):
+        virtual_size = MiB
+        bitmap_name = 'bitmap1'
+        # Create source file
+        src_path = os.path.join(tmp_mount.path, 'source.img')
+        op = qemuimg.create(
+            src_path,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new bitmap to src
+        op = qemuimg.bitmap_add(
+            src_path,
+            bitmap_name,
+            granularity=granularity
+        )
+        op.run()
+
+        info = qemuimg.info(src_path)
+        assert info['format-specific']['data']['bitmaps'] == [
+            {
+                "flags": ["auto"],
+                "name": bitmap_name,
+                "granularity": exp_granularity
+            },
+        ]
+
+        # Remove bitmap from src
+        op = qemuimg.bitmap_remove(src_path, bitmap_name)
+        op.run()
+
+        info = qemuimg.info(src_path)
+        assert 'bitmaps' not in info['format-specific']['data']
+
+    def test_add_disabled_bitmap(self, tmp_mount):
+        virtual_size = MiB
+        bitmap_name = 'bitmap1'
+        # Create source file
+        src_path = os.path.join(tmp_mount.path, 'source.img')
+        op = qemuimg.create(
+            src_path,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new disabled bitmap to src
+        op = qemuimg.bitmap_add(
+            src_path,
+            bitmap_name,
+            enable=False
+        )
+        op.run()
+
+        info = qemuimg.info(src_path)
+        assert info['format-specific']['data']['bitmaps'] == [
+            {
+                "flags": [],
+                "name": bitmap_name,
+                "granularity": 65536
+            },
+        ]
+
+    def test_enable_disable_bitmap(self, tmp_mount):
+        virtual_size = MiB
+        bitmap_name = 'bitmap1'
+        # Create source file
+        src_path = os.path.join(tmp_mount.path, 'source.img')
+        op = qemuimg.create(
+            src_path,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new bitmap to src
+        op = qemuimg.bitmap_add(
+            src_path,
+            bitmap_name,
+        )
+        op.run()
+
+        # Disable the bitmap on src
+        op = qemuimg.bitmap_update(
+            src_path,
+            bitmap_name,
+            enable=False
+        )
+        op.run()
+
+        info = qemuimg.info(src_path)
+        assert info['format-specific']['data']['bitmaps'] == [
+            {
+                "flags": [],
+                "name": bitmap_name,
+                "granularity": 65536
+            },
+        ]
+
+        # Enable the bitmap on src
+        op = qemuimg.bitmap_update(
+            src_path,
+            bitmap_name,
+            enable=True
+        )
+        op.run()
+
+        info = qemuimg.info(src_path)
+        assert info['format-specific']['data']['bitmaps'] == [
+            {
+                "flags": ["auto"],
+                "name": bitmap_name,
+                "granularity": 65536
+            },
+        ]
+
+    def test_merge_bitmaps(self, tmp_mount):
+        virtual_size = MiB
+        base_bitmap = 'base_bitmap'
+        top_bitmap = 'top_bitmap'
+
+        # Create base file
+        base_path = os.path.join(tmp_mount.path, 'base.img')
+        op = qemuimg.create(
+            base_path,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1'
+        )
+        op.run()
+
+        # Add new bitmap to base
+        op = qemuimg.bitmap_add(
+            base_path,
+            base_bitmap,
+        )
+        op.run()
+
+        # Create top file
+        top_path = os.path.join(tmp_mount.path, 'src_top.img')
+        op = qemuimg.create(
+            top_path,
+            size=virtual_size,
+            format=qemuimg.FORMAT.QCOW2,
+            qcow2Compat='1.1',
+            backing=base_path,
+            backingFormat='qcow2'
+        )
+        op.run()
+
+        # Add new bitmap to top
+        op = qemuimg.bitmap_add(
+            top_path,
+            top_bitmap,
+        )
+        op.run()
+
+        # Merge bitmaps from top to base
+        op = qemuimg.bitmap_merge(
+            top_path,
+            top_bitmap,
+            'qcow2',
+            base_path,
+            base_bitmap
+        )
+        op.run()
+
+        # TODO: This assert does not test the merge data
+        # itself, only the bitmaps metadata.
+        # We need to find a good way to test the
+        # bitmap internals.
+        info = qemuimg.info(base_path)
+        assert info['format-specific']['data']['bitmaps'] == [
+            {
+                "flags": ["auto"],
+                "name": base_bitmap,
+                "granularity": 65536
+            },
+        ]
 
 
 def converted_size(filename, compat):
@@ -1002,11 +1829,18 @@ def convert_to_qcow2(src, compressed=False, compat="1.1"):
     return dst
 
 
-def make_image(path, size, format, index, qcow2_compat, backing=None):
-    op = qemuimg.create(path, size=size, format=format,
-                        qcow2Compat=qcow2_compat,
-                        backing=backing)
+def make_image(
+        path, size, format, index, qcow2_compat, backing=None,
+        backing_format=None):
+    op = qemuimg.create(
+        path,
+        size=size,
+        format=format,
+        qcow2Compat=qcow2_compat,
+        backing=backing,
+        backingFormat=backing_format)
     op.run()
+
     offset = index * KiB
     qemuio.write_pattern(
         path,

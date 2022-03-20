@@ -34,6 +34,7 @@ import six
 
 from vdsm import constants
 from vdsm import utils
+from vdsm.common.osutils import get_umask
 from vdsm.config import config
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -167,17 +168,18 @@ class _IOProcessFileUtils(object):
             except OSError as e:
                 if e.errno != errno.EEXIST:
                     raise
-                else:
-                    if tmpPath == path and mode is not None:
-                        statinfo = self._iop.stat(path)
-                        curMode = statinfo[stat.ST_MODE]
-                        if curMode != mode:
-                            raise OSError(errno.EPERM,
-                                          ("Existing %s "
-                                           "permissions %s are not as "
-                                           "requested %s") % (path,
-                                                              oct(curMode),
-                                                              oct(mode)))
+                statinfo = self._iop.stat(tmpPath)
+                if not stat.S_ISDIR(statinfo.st_mode):
+                    raise OSError(errno.ENOTDIR,
+                                  "Not a directory %s" % tmpPath)
+                if tmpPath == path and mode is not None:
+                    actual_mode = stat.S_IMODE(statinfo.st_mode)
+                    expected_mode = mode & ~get_umask()
+                    if actual_mode != expected_mode:
+                        raise OSError(
+                            errno.EPERM,
+                            "Existing {} permissions {:o} are not as requested"
+                            " {:o}".format(path, actual_mode, expected_mode))
 
     def padToBlockSize(self, path):
         size = _IOProcessOs(self._iop).stat(path).st_size
@@ -261,7 +263,7 @@ class _IOProcessOs(object):
 
         def islink(self, path):
             # Note: islink does not follow symlinks. This is not documented
-            # excplicitly, but it deos not make sense otherwise.
+            # explicitly, but it does not make sense otherwise.
             try:
                 res = self._iop.lstat(path)
             except OSError as e:

@@ -31,8 +31,10 @@ import sys
 
 from vdsm.config import config
 from vdsm import utils
+from vdsm.common import concurrent
 from vdsm.common import supervdsm
 from vdsm.common import udevadm
+from vdsm.common.marks import deprecated
 from vdsm.gluster import cli as gluster_cli
 from vdsm.gluster import exception as ge
 from vdsm.storage import exception as se
@@ -40,6 +42,7 @@ from vdsm.storage import fileSD
 from vdsm.storage import fileUtils
 from vdsm.storage import iscsi
 from vdsm.storage import mount
+from vdsm.storage import sd
 from vdsm.storage.mount import MountError
 
 
@@ -62,8 +65,67 @@ FcpConnectionParameters = namedtuple("FcpConnectionParameters", "id")
 
 ConnectionInfo = namedtuple("ConnectionInfo", "type, params")
 
+# Connection Management API competability code
+# Remove when deprecating dis\connectStorageServer
 
-class ExampleConnection(object):
+CON_TYPE_ID_2_CON_TYPE = {
+    sd.LOCALFS_DOMAIN: 'localfs',
+    sd.NFS_DOMAIN: 'nfs',
+    sd.ISCSI_DOMAIN: 'iscsi',
+    sd.FCP_DOMAIN: 'fcp',
+    sd.POSIXFS_DOMAIN: 'posixfs',
+    sd.GLUSTERFS_DOMAIN: 'glusterfs'}
+
+log = logging.getLogger("storage.storageServer")
+
+
+class Connection:
+
+    @classmethod
+    def connect_all(cls, connections):
+        results = []
+
+        for con in connections:
+            try:
+                con.connect()
+            except Exception as err:
+                log.exception("Could not connect to storage server")
+                status, _ = cls.translate_error(err)
+            else:
+                status = 0
+
+            results.append((con, status))
+
+        return results
+
+    @classmethod
+    def disconnect_all(cls, connections):
+        results = []
+
+        for con in connections:
+            try:
+                con.disconnect()
+                status = 0
+            except Exception as err:
+                log.exception("Could not disconnect from storage server")
+                status, _ = cls.translate_error(err)
+
+            results.append((con, status))
+
+        return results
+
+    @classmethod
+    def translate_error(cls, e):
+        if e is None:
+            return 0, ""
+
+        if hasattr(e, 'code'):
+            return e.code, e.msg
+
+        return se.GeneralException.code, str(e)
+
+
+class ExampleConnection(Connection):
     """Do not inherit from this object it is just to show and document the
     connection object interface"""
 
@@ -109,12 +171,11 @@ class ExampleConnection(object):
         of dictionaries"""
 
 
-class MountConnection(object):
+class MountConnection(Connection):
 
     CGROUP = None
     DIR = ""
 
-    log = logging.getLogger("storage.StorageServer.MountConnection")
     localPathBase = "/tmp"
 
     @property
@@ -141,6 +202,12 @@ class MountConnection(object):
     def getLocalPathBase(cls):
         return cls.localPathBase
 
+    @classmethod
+    def translate_error(cls, e):
+        if isinstance(e, mount.MountError):
+            return se.MountError.code, se.MountError.msg
+        return super().translate_error(e)
+
     def __init__(self,
                  id,
                  spec,
@@ -164,7 +231,7 @@ class MountConnection(object):
             return
 
         self.validate()
-        self.log.info("Creating directory %r", self._getLocalPath())
+        log.info("Creating directory %r", self._getLocalPath())
         fileUtils.createdir(self._getLocalPath())
 
         try:
@@ -174,8 +241,9 @@ class MountConnection(object):
             try:
                 os.rmdir(self._getLocalPath())
             except OSError as e:
-                self.log.warn("Error removing mountpoint directory %r: %s",
-                              self._getLocalPath(), e)
+                log.warning(
+                    "Error removing mountpoint directory %r: %s",
+                    self._getLocalPath(), e)
             six.reraise(t, v, tb)
         else:
             try:
@@ -186,7 +254,7 @@ class MountConnection(object):
                 try:
                     self.disconnect()
                 except OSError:
-                    self.log.exception("Error disconnecting")
+                    log.exception("Error disconnecting")
                 six.reraise(t, v, tb)
 
     def validate(self):
@@ -271,7 +339,8 @@ class GlusterFSConnection(MountConnection):
     def options(self):
         backup_servers_option = ""
         if "backup-volfile-servers" in self._options:
-            self.log.warn("Using user specified backup-volfile-servers option")
+            log.warning(
+                "Using user specified backup-volfile-servers option")
         elif self._have_gluster_cli:
             backup_servers_option = self._get_backup_servers_option()
         return ",".join(
@@ -285,22 +354,30 @@ class GlusterFSConnection(MountConnection):
 
     def validate(self):
         if not self._have_gluster_cli:
-            self.log.warning("Required glusterfs-cli package is missing "
-                             "on this host. Note that automatic detection "
-                             "of backup servers will be disabled! Please "
-                             "install the missing package in order to "
-                             "automatically mount gluster storage backup "
-                             "servers")
+            log.warning("Required glusterfs-cli package is missing "
+                        "on this host. Note that automatic detection "
+                        "of backup servers will be disabled! Please "
+                        "install the missing package in order to "
+                        "automatically mount gluster storage backup "
+                        "servers")
             return
 
         if not self.volinfo:
             return
 
+        if "disperse" in self.volinfo['volumeType'].lower():
+            log.warning("Unsupported volume type, volume: %r, "
+                        "volume type: %r. Please use the replicate type."
+                        "To recover existing migrate it to "
+                        "supported type.",
+                        self._volname, self.volinfo['volumeType'])
+            return
+
         replicaCount = self.volinfo['replicaCount']
         if replicaCount not in self.ALLOWED_REPLICA_COUNTS:
-            self.log.warning("Unsupported replica count (%s) for volume %r, "
-                             "please upgrade volume to replica 3",
-                             replicaCount, self._volname)
+            log.warning("Unsupported replica count (%s) for volume %r, "
+                        "please upgrade volume to replica 3",
+                        replicaCount, self._volname)
 
     def _get_backup_servers_option(self):
         if not self.volinfo:
@@ -308,13 +385,13 @@ class GlusterFSConnection(MountConnection):
 
         servers = utils.unique(brick.split(":")[0] for brick
                                in self.volinfo['bricks'])
-        self.log.debug("Using bricks: %s", servers)
+        log.debug("Using bricks: %s", servers)
         if self._volfileserver in servers:
             servers.remove(self._volfileserver)
         else:
-            self.log.warning("gluster server %r is not in bricks %s, possibly "
-                             "mounting duplicate servers",
-                             self._volfileserver, servers)
+            log.warning("gluster server %r is not in bricks %s, possibly "
+                        "mounting duplicate servers",
+                        self._volfileserver, servers)
 
         if not servers:
             return ""
@@ -328,14 +405,12 @@ class GlusterFSConnection(MountConnection):
                                                        self._volfileserver)
             return volinfo[self._volname]
         except ge.GlusterCmdExecFailedException as e:
-            self.log.warning("Failed to get volume info: %s", e)
+            log.warning("Failed to get volume info: %s", e)
             return {}
 
 
-class NFSConnection(object):
+class NFSConnection(Connection):
     DEFAULT_OPTIONS = ["soft", "nosharecache"]
-
-    log = logging.getLogger("storage.Server.NFS")
 
     @property
     def id(self):
@@ -378,8 +453,27 @@ class NFSConnection(object):
         # Return -1 to signify the version has not been negotiated yet
         return -1
 
-    def __init__(self, id, export, timeout=600, retrans=6, version=None,
+    def __init__(self, id, export, timeout=100, retrans=3, version=None,
                  extraOptions=""):
+        """
+        According to nfs(5), NFS will retry a request after 100 deciseconds (10
+        seconds). After each retransmission, the timeout is increased by timeo
+        value (up to maximum of 600 seconds). After retrans retires, the NFS
+        client will fail with "server not responding" message.
+
+        With the default configuration we expect failures in 60 seconds, which
+        is about 3 times longer than multipath timeout (20 seconds) for block
+        storage.
+
+        00:00   retry 1 (10 seconds timeout)
+        00:10   retry 2 (20 seconds timeout)
+        00:30   retry 3 (30 seconds timeout)
+        01:00  request fail
+
+        WARNNING: timeout value must not be smaller than sanlock iotimeout (10
+        seconds). Using smaller value may cause sanlock to fail to renew
+        leases.
+        """
         self._remotePath = normpath(export)
         options = self.DEFAULT_OPTIONS[:]
         self._timeout = timeout
@@ -417,10 +511,10 @@ class NFSConnection(object):
             # See https://bugzilla.redhat.com/1550127
 
             if "lock" in extraOptions:
-                self.log.warning("Using remote locks for NFSv3 locks, HA VMs "
-                                 "should not be used with this mount")
+                log.warning("Using remote locks for NFSv3 locks, HA VMs "
+                            "should not be used with this mount")
             elif "nolock" not in extraOptions:
-                self.log.debug("Using local locks for NFSv3 locks")
+                log.debug("Using local locks for NFSv3 locks")
                 extraOptions.append("nolock")
 
         optionsString = ",".join(options + extraOptions)
@@ -445,8 +539,7 @@ class NFSConnection(object):
         return hash(type(self)) ^ hash(self._mountCon)
 
 
-class IscsiConnection(object):
-    log = logging.getLogger("storage.Server.ISCSI")
+class IscsiConnection(Connection):
 
     class Mismatch(Exception):
 
@@ -473,6 +566,10 @@ class IscsiConnection(object):
     def iface(self):
         return self._iface
 
+    @property
+    def cred(self):
+        return self._cred
+
     def __init__(self, id, target, iface=None, credentials=None):
         self._id = id
         self._target = target
@@ -483,10 +580,122 @@ class IscsiConnection(object):
         self._iface = iface
         self._cred = credentials
 
-    def connect(self):
-        iscsi.addIscsiNode(self._iface, self._target, self._cred)
+    @classmethod
+    def connect_all(cls, prep_cons):
+        results = []
+        logins = []
+
+        # Prepare connections and setup iSCSI nodes serially. These operations
+        # happen on the host and are very fast, so there's no need to run them
+        # in parallel. Also, running them concurrently could cause locking
+        # issues when multiple threads try to access local iscsi database.
+
+        for con in prep_cons:
+            try:
+                con.setup_node()
+            except Exception as err:
+                log.error(
+                    "Could configure connection to % and iface %s",
+                    con.target, con.iface)
+                status, _ = cls.translate_error(err)
+                results.append((con, status))
+            else:
+                logins.append(con)
+
+        # Run login to nodes in parallel. This operations happen on remote
+        # iscsi server and if the some targets are not available, the operation
+        # can take quite some time (by default 120 seconds) and can cause
+        # engine command times out. Running login to targets in parallel should
+        # mitigate this issue.
+
+        max_workers = cls.max_workers(logins)
+
+        log.info("Log in to %s targets using %s workers",
+                 len(logins), max_workers)
+
+        def iscsi_login(con):
+            try:
+                iscsi.loginToIscsiNode(con.iface, con.target)
+                return con, 0
+            except Exception as e:
+                log.exception("Could not login to target")
+                status, _ = cls.translate_error(e)
+                return con, status
+
+        login_results = concurrent.tmap(
+            iscsi_login,
+            logins,
+            max_workers=max_workers,
+            name="iscsi-login")
+
+        for res in login_results:
+            results.append(res.value)
+
+        # Wait for all new devices to be settled.
+        cls.settle_devices()
+
+        return results
+
+    @classmethod
+    def max_workers(cls, logins):
+        max_workers = config.getint("iscsi", "parallel_logins")
+        if max_workers < 1:
+            log.warning("Number of parallel logins (%d) is less then 1, "
+                        "using only one thread", max_workers)
+            max_workers = 1
+        return min(len(logins), max_workers)
+
+    @classmethod
+    def settle_devices(cls):
         timeout = config.getint("irs", "udev_settle_timeout")
         udevadm.settle(timeout)
+
+    @classmethod
+    def translate_error(cls, e):
+        if isinstance(e, iscsi.iscsiadm.IscsiAuthenticationError):
+            return se.iSCSILoginAuthError.code, se.iSCSILoginAuthError.msg
+        if isinstance(e, iscsi.iscsiadm.IscsiInterfaceError):
+            return se.iSCSIifaceError.code, se.iSCSIifaceError.msg
+        if isinstance(e, iscsi.iscsiadm.IscsiError):
+            return se.iSCSISetupError.code, se.iSCSISetupError.msg
+        return super().translate_error(e)
+
+    def connect(self):
+        self._maybe_connect_iser()
+        self._connect_iscsi()
+        self.settle_devices()
+
+    def _connect_iscsi(self):
+        iscsi.addIscsiNode(self._iface, self._target, self._cred)
+        iscsi.loginToIscsiNode(self._iface, self._target)
+
+    def setup_node(self):
+        self._maybe_connect_iser()
+        iscsi.addIscsiNode(self.iface, self.target, self.cred)
+
+    @deprecated
+    def _maybe_connect_iser(self):
+        """
+        Tries to connect the storage server over iSER.
+        This applies if 'iser' is in the configuration option
+        'iscsi_default_ifaces'.
+        """
+        # FIXME: remove this method when iface selection is in higher interface
+        try:
+            self._iface.initiatorName
+        except KeyError:
+            ifaces = config.get('irs', 'iscsi_default_ifaces').split(',')
+            if 'iser' in ifaces:
+                orig_iface = self._iface
+                self._iface = iscsi.IscsiInterface('iser')
+                try:
+                    self._connect_iscsi()
+                    self._disconnect_iscsi()
+                except:
+                    log.warning(
+                        "Cannot connect to storage over iSER, using original "
+                        "iface %r", orig_iface)
+                    self._iface = orig_iface
 
     def _match(self, session):
         target = session.target
@@ -535,7 +744,7 @@ class IscsiConnection(object):
             else:
                 return session
 
-        self.log.debug("Session mismatches: %s", errors)
+        log.debug("Session mismatches: %s", errors)
         raise OSError(errno.ENOENT, "Session not found")
 
     def isConnected(self):
@@ -548,12 +757,14 @@ class IscsiConnection(object):
             raise
 
     def disconnect(self):
-        self.log.info("disconnecting")
+        self._disconnect_iscsi()
+
+    def _disconnect_iscsi(self):
         try:
             sid = self.getSessionInfo().id
         except OSError as e:
             if e.errno == errno.ENOENT:
-                self.log.debug("not connected")
+                log.debug("not connected")
                 return
             raise
 
@@ -583,7 +794,7 @@ class IscsiConnection(object):
         return hsh
 
 
-class FcpConnection(object):
+class FcpConnection(Connection):
 
     @property
     def id(self):
@@ -612,7 +823,7 @@ class FcpConnection(object):
         return hash((self.__class__, self._id))
 
 
-class LocalDirectoryConnection(object):
+class LocalDirectoryConnection(Connection):
 
     @property
     def id(self):
@@ -688,7 +899,7 @@ class UnknownConnectionTypeError(RuntimeError):
 
 
 class ConnectionFactory(object):
-    _registeredConnectionTypes = {
+    registeredConnectionTypes = {
         "nfs": NFSConnection,
         "posixfs": MountConnection,
         "glusterfs": GlusterFSConnection,
@@ -705,8 +916,138 @@ class ConnectionFactory(object):
             if params[param] is None:
                 del params[param]
         try:
-            ctor = cls._registeredConnectionTypes[conType]
+            ctor = cls.registeredConnectionTypes[conType]
         except KeyError:
             raise UnknownConnectionTypeError(conType)
 
         return ctor(**params)
+
+
+def connect(dom_type, con_defs):
+    con_class, connections = _prepare_connections(dom_type, con_defs)
+    return con_class.connect_all(connections)
+
+
+def disconnect(dom_type, con_defs):
+    con_class, connections = _prepare_connections(dom_type, con_defs)
+    return con_class.disconnect_all(connections)
+
+
+def _prepare_connections(dom_type, con_defs):
+    prep_cons = []
+    con_type = None
+    for con_def in con_defs:
+        con_info = _connectionDict2ConnectionInfo(dom_type, con_def)
+        prep_con = ConnectionFactory.createConnection(con_info)
+        prep_cons.append(prep_con)
+        con_type = con_info.type
+    con_class = ConnectionFactory.registeredConnectionTypes[con_type]
+    return con_class, prep_cons
+
+
+def _connectionDict2ConnectionInfo(conTypeId, conDict):
+    def getIntParam(optDict, key, default):
+        res = optDict.get(key, default)
+        if res is None:
+            return res
+
+        try:
+            return int(res)
+        except ValueError:
+            raise se.InvalidParameterException(key, res)
+
+    # FIXME: Remove when nfs_mount_options is no longer supported.  This is
+    # in the compatibility layer so that the NFSConnection class stays clean.
+    # Engine options have precendence, so use deprecated nfs_mount_options
+    # only if engine passed nothing (indicated by default params of 'None').
+    def tryDeprecatedNfsParams(conDict):
+        if (conDict.get('protocol_version', None),
+                conDict.get('retrans', None),
+                conDict.get('timeout', None)) == (None, None, None):
+            conf_options = config.get(
+                'irs', 'nfs_mount_options').replace(' ', '')
+            if (frozenset(conf_options.split(',')) !=
+                    frozenset(NFSConnection.DEFAULT_OPTIONS)):
+                logging.warning("Using deprecated nfs_mount_options from"
+                                " vdsm.conf to mount %s: %s",
+                                conDict.get('connection', '(unknown)'),
+                                conf_options)
+                return PosixFsConnectionParameters(
+                    conDict["id"],
+                    conDict.get('connection', None),
+                    'nfs',
+                    conf_options)
+        return None
+
+    typeName = CON_TYPE_ID_2_CON_TYPE[conTypeId]
+    if typeName == 'localfs':
+        params = LocaFsConnectionParameters(
+            conDict["id"],
+            conDict.get('connection', None))
+    elif typeName == 'nfs':
+        params = tryDeprecatedNfsParams(conDict)
+        if params is not None:
+            # Hack to support vdsm.conf nfs_mount_options
+            typeName = 'posixfs'
+        else:
+            version = conDict.get('protocol_version', "3")
+            version = str(version)
+            if version == "auto":
+                version = None
+
+            params = NfsConnectionParameters(
+                conDict["id"],
+                conDict.get('connection', None),
+                getIntParam(conDict, 'retrans', None),
+                getIntParam(conDict, 'timeout', None),
+                version,
+                conDict.get('mnt_options', None))
+    elif typeName == 'posixfs':
+        params = PosixFsConnectionParameters(
+            conDict["id"],
+            conDict.get('connection', None),
+            conDict.get('vfs_type', None),
+            conDict.get('mnt_options', None))
+    elif typeName == 'glusterfs':
+        params = GlusterFsConnectionParameters(
+            conDict["id"],
+            conDict.get('connection', None),
+            conDict.get('vfs_type', None),
+            conDict.get('mnt_options', None))
+    elif typeName == 'iscsi':
+        portal = iscsi.IscsiPortal(
+            conDict.get('connection', None),
+            int(conDict.get('port', None)))
+        tpgt = int(conDict.get('tpgt', iscsi.DEFAULT_TPGT))
+
+        target = iscsi.IscsiTarget(portal, tpgt, conDict.get('iqn', None))
+
+        iface = iscsi.resolveIscsiIface(conDict.get('ifaceName', None),
+                                        conDict.get('initiatorName', None),
+                                        conDict.get('netIfaceName', None))
+
+        # NOTE: ChapCredentials must match the way we initialize username and
+        # password when reading session info in iscsi.readSessionInfo(). Empty
+        # or missing username or password are stored as None.
+
+        username = conDict.get('user')
+        if not username:
+            username = None
+        password = conDict.get('password')
+        if not getattr(password, "value", None):
+            password = None
+        cred = None
+        if username or password:
+            cred = iscsi.ChapCredentials(username, password)
+
+        params = IscsiConnectionParameters(
+            conDict["id"],
+            target,
+            iface,
+            cred)
+    elif typeName == 'fcp':
+        params = FcpConnectionParameters(conDict["id"])
+    else:
+        raise se.StorageServerActionError()
+
+    return ConnectionInfo(typeName, params)

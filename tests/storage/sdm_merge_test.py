@@ -44,6 +44,7 @@ from testlib import expandPermutations, make_uuid, permutations
 from testlib import VdsmTestCase
 
 from vdsm import jobs
+from vdsm.common.units import KiB, MiB
 from vdsm.storage import blockVolume
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
@@ -73,9 +74,11 @@ class TestMergeSubchain(VdsmTestCase):
         jobs._clear()
 
     @contextmanager
-    def make_env(self, sd_type, chain_len=2):
-        size = 1048576
-        base_fmt = sc.RAW_FORMAT
+    def make_env(
+            self, sd_type, chain_len=2,
+            base_format=sc.RAW_FORMAT, qcow2_compat='0.10'):
+        size = MiB
+        base_fmt = base_format
         with fake_env(sd_type) as env:
             rm = FakeResourceManager()
             with MonkeyPatchScope([
@@ -85,7 +88,12 @@ class TestMergeSubchain(VdsmTestCase):
                 (blockVolume, 'rm', rm),
                 (image, 'Image', FakeImage),
             ]):
-                env.chain = make_qemu_chain(env, size, base_fmt, chain_len)
+                env.chain = make_qemu_chain(
+                    env,
+                    size,
+                    base_fmt,
+                    chain_len,
+                    qcow2_compat=qcow2_compat)
 
                 def fake_chain(sdUUID, imgUUID, volUUID=None):
                     return env.chain
@@ -119,7 +127,7 @@ class TestMergeSubchain(VdsmTestCase):
 
             # Verify that the chain data was merged
             for i in range(base_index, top_index + 1):
-                offset = i * 1024
+                offset = i * KiB
                 pattern = 0xf0 + i
 
                 # We expect to read all data from top
@@ -127,7 +135,7 @@ class TestMergeSubchain(VdsmTestCase):
                     top_vol.volumePath,
                     qemuimg.FORMAT.QCOW2,
                     offset=offset,
-                    len=1024,
+                    len=KiB,
                     pattern=pattern)
 
                 # And base, since top was merged into base
@@ -135,7 +143,7 @@ class TestMergeSubchain(VdsmTestCase):
                     base_vol.volumePath,
                     sc.fmt2str(base_vol.getFormat()),
                     offset=offset,
-                    len=1024,
+                    len=KiB,
                     pattern=pattern)
 
             self.assertEqual(sorted(self.expected_locks(base_vol)),
@@ -175,9 +183,9 @@ class TestMergeSubchain(VdsmTestCase):
         img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, base_vol.sdUUID)
         ret = [
             # Domain lock
-            rm.ResourceManagerLock(sc.STORAGE, base_vol.sdUUID, rm.SHARED),
+            rm.Lock(sc.STORAGE, base_vol.sdUUID, rm.SHARED),
             # Image lock
-            rm.ResourceManagerLock(img_ns, base_vol.imgUUID, rm.EXCLUSIVE),
+            rm.Lock(img_ns, base_vol.imgUUID, rm.EXCLUSIVE),
             # Volume lease
             volume.VolumeLease(
                 0, base_vol.sdUUID, base_vol.imgUUID, base_vol.volUUID)
@@ -213,8 +221,74 @@ class TestMergeSubchain(VdsmTestCase):
 
             # Check that validate is called *before* attempting - verify that
             # the chain data was *not* merged
-            offset = base_index * 1024
+            offset = base_index * KiB
             pattern = 0xf0 + base_index
             verify_pattern(base_vol.volumePath, qemuimg.FORMAT.RAW,
-                           offset=offset, len=1024, pattern=pattern)
+                           offset=offset, len=KiB, pattern=pattern)
             self.assertEqual(base_vol.getMetaParam(sc.GENERATION), 0)
+
+    @permutations([
+        # sd_type, chain_len, base_index, top_index
+        ('file', 4, 0, 1),
+        ('block', 2, 0, 1),
+        ('file', 3, 1, 2),
+        ('block', 3, 1, 2),
+    ])
+    def test_merge_subchain_with_bitmaps(
+            self, sd_type, chain_len, base_index, top_index):
+        job_id = make_uuid()
+        bitmap1_name = 'bitmap1'
+        bitmap2_name = 'bitmap2'
+        with self.make_env(
+                sd_type=sd_type,
+                chain_len=chain_len,
+                base_format=sc.COW_FORMAT,
+                qcow2_compat='1.1') as env:
+            base_vol = env.chain[base_index]
+            top_vol = env.chain[top_index]
+            # Add new bitmap to base_vol and top_vol
+            for vol in [base_vol, top_vol]:
+                op = qemuimg.bitmap_add(
+                    vol.getVolumePath(),
+                    bitmap1_name,
+                )
+                op.run()
+            # Add another bitmap to top_vol only
+            # to test add + merge
+            op = qemuimg.bitmap_add(
+                top_vol.getVolumePath(),
+                bitmap2_name,
+            )
+            op.run()
+
+            # Writing data to the chain to modify the bitmaps
+            write_qemu_chain(env.chain)
+
+            subchain_info = dict(sd_id=base_vol.sdUUID,
+                                 img_id=base_vol.imgUUID,
+                                 base_id=base_vol.volUUID,
+                                 top_id=top_vol.volUUID,
+                                 base_generation=0)
+            subchain = merge.SubchainInfo(subchain_info, 0)
+
+            job = api_merge.Job(job_id, subchain, merge_bitmaps=True)
+            job.run()
+
+            self.assertEqual(job.status, jobs.STATUS.DONE)
+
+            info = qemuimg.info(base_vol.getVolumePath())
+            # TODO: we should improve this test by adding a
+            # a verification to the extents that are reported
+            # by qemu-nbd.
+            assert info['format-specific']['data']['bitmaps'] == [
+                {
+                    "flags": ["auto"],
+                    "name": bitmap1_name,
+                    "granularity": 65536
+                },
+                {
+                    "flags": ["auto"],
+                    "name": bitmap2_name,
+                    "granularity": 65536
+                },
+            ]

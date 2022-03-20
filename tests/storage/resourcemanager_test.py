@@ -248,18 +248,25 @@ class TestResourceManager:
             "string", "resource", rm.EXCLUSIVE, callback)
 
         assert req1 != req2
+        assert hash(req1) != hash(req2)
         assert req1 == req1
+        assert hash(req1) == hash(req1)
         assert req2 == req2
         req1.wait()
         req1Clone = requests.pop()
         assert req1 == req1Clone
+        assert hash(req1) == hash(req1Clone)
         assert req1Clone != req2
+        assert hash(req1Clone) != hash(req2)
         resources.pop().release()
         req2.wait()
         req2Clone = requests.pop()
         assert req2 == req2Clone
+        assert hash(req2) == hash(req2Clone)
         assert req1 != req2Clone
+        assert hash(req1) != hash(req2Clone)
         assert req1Clone != req2Clone
+        assert hash(req1Clone) != hash(req2Clone)
         resources[0].release()
 
         assert req1 != "STUFF"
@@ -432,7 +439,7 @@ class TestResourceManager:
         log.info("Waiting for autoclean")
         while True:
             resStatus = rm._getResourceStatus("storage", "resource")
-            if resStatus == rm.LockState.free:
+            if resStatus == rm.STATUS_FREE:
                 break
             time.sleep(1)
 
@@ -445,14 +452,14 @@ class TestResourceManager:
 
     def testResourceStatuses(self, tmp_manager):
         status = rm._getResourceStatus("storage", "resource")
-        assert status == rm.LockState.free
+        assert status == rm.STATUS_FREE
         exclusive1 = rm.acquireResource("storage", "resource", rm.EXCLUSIVE)
         status = rm._getResourceStatus("storage", "resource")
-        assert status == rm.LockState.locked
+        assert status == rm.STATUS_LOCKED
         exclusive1.release()
         shared1 = rm.acquireResource("storage", "resource", rm.SHARED)
         status = rm._getResourceStatus("storage", "resource")
-        assert status == rm.LockState.shared
+        assert status == rm.STATUS_SHARED
         shared1.release()
         with pytest.raises(KeyError):
             status = rm._getResourceStatus("null", "resource")
@@ -618,10 +625,10 @@ class TestResourceManager:
             t.join()
 
 
-class TestResourceManagerLock:
+class TestLock:
 
     def test_properties(self):
-        a = rm.ResourceManagerLock('ns', 'name', 'mode')
+        a = rm.Lock('ns', 'name', 'mode')
         assert a.ns == 'ns'
         assert a.name == 'name'
         assert a.mode == 'mode'
@@ -631,29 +638,29 @@ class TestResourceManagerLock:
         (('nsA', 'nameA', 'mode'), ('nsA', 'nameB', 'mode')),
     ])
     def test_less_than(self, a, b):
-        b = rm.ResourceManagerLock(*b)
-        a = rm.ResourceManagerLock(*a)
+        b = rm.Lock(*b)
+        a = rm.Lock(*a)
         assert a < b
 
     def test_equality(self):
-        a = rm.ResourceManagerLock('ns', 'name', 'mode')
-        b = rm.ResourceManagerLock('ns', 'name', 'mode')
+        a = rm.Lock('ns', 'name', 'mode')
+        b = rm.Lock('ns', 'name', 'mode')
         assert a == b
 
     def test_mode_used_for_equality(self):
-        a = rm.ResourceManagerLock('nsA', 'nameA', 'modeA')
-        b = rm.ResourceManagerLock('nsA', 'nameA', 'modeB')
+        a = rm.Lock('nsA', 'nameA', 'modeA')
+        b = rm.Lock('nsA', 'nameA', 'modeB')
         assert a != b
 
     def test_mode_ignored_for_sorting(self):
-        a = rm.ResourceManagerLock('nsA', 'nameA', 'modeA')
-        b = rm.ResourceManagerLock('nsA', 'nameA', 'modeB')
+        a = rm.Lock('nsA', 'nameA', 'modeA')
+        b = rm.Lock('nsA', 'nameA', 'modeB')
         assert not a < b
         assert not b < a
 
     def test_acquire_release(self, monkeypatch):
         monkeypatch.setattr(rm, "_manager", FakeResourceManager())
-        lock = rm.ResourceManagerLock('ns_A', 'name_A', rm.SHARED)
+        lock = rm.Lock('ns_A', 'name_A', rm.SHARED)
         expected = []
         lock.acquire()
         expected.append(('acquireResource',
@@ -664,11 +671,90 @@ class TestResourceManagerLock:
         expected.append(('releaseResource', (lock.ns, lock.name), {}))
         assert expected == rm._manager.__calls__
 
+    def test_with(self, monkeypatch):
+        monkeypatch.setattr(rm, "_manager", FakeResourceManager())
+        lock = rm.Lock('ns_A', 'name_A', rm.SHARED)
+
+        with lock:
+            # Resource should be aquired here.
+            assert rm._manager.__calls__ == [
+                (
+                    'acquireResource',
+                    (lock.ns, lock.name, lock.mode),
+                    {"timeout": None}
+                )
+            ]
+            rm._manager.__calls__.clear()
+
+        # Resource should be released here.
+        assert rm._manager.__calls__ == [
+            ('releaseResource', (lock.ns, lock.name), {})
+        ]
+
+    def test_with_user_error(self, monkeypatch):
+        monkeypatch.setattr(rm, "_manager", FakeResourceManager())
+        lock = rm.Lock('ns_A', 'name_A', rm.SHARED)
+
+        class UserError(Exception):
+            pass
+
+        with pytest.raises(UserError):
+            with lock:
+                raise UserError
+
+        assert rm._manager.__calls__ == [
+            (
+                'acquireResource',
+                (lock.ns, lock.name, lock.mode),
+                {"timeout": None}
+            ),
+            (
+                'releaseResource',
+                (lock.ns, lock.name),
+                {}
+            )
+        ]
+
+    def test_with_release_error(self, monkeypatch):
+        monkeypatch.setattr(rm, "_manager", FakeResourceManager())
+        lock = rm.Lock('ns_A', 'name_A', rm.SHARED)
+
+        class ReleaseError(Exception):
+            pass
+
+        def releaseResource(ns, name):
+            raise ReleaseError
+
+        rm._manager.releaseResource = releaseResource
+
+        with pytest.raises(ReleaseError):
+            with lock:
+                pass
+
+    def test_with_release_error_and_user_error(self, monkeypatch):
+        monkeypatch.setattr(rm, "_manager", FakeResourceManager())
+        lock = rm.Lock('ns_A', 'name_A', rm.SHARED)
+
+        class ReleaseError(Exception):
+            pass
+
+        class UserError(Exception):
+            pass
+
+        def releaseResource(ns, name):
+            raise ReleaseError
+
+        rm._manager.releaseResource = releaseResource
+
+        with pytest.raises(UserError):
+            with lock:
+                raise UserError
+
     def test_repr(self):
         mode = rm.SHARED
-        lock = rm.ResourceManagerLock('ns', 'name', mode)
+        lock = rm.Lock('ns', 'name', mode)
         lock_string = str(lock)
-        assert "ResourceManagerLock" in lock_string
+        assert "Lock" in lock_string
         assert "ns=ns" in lock_string
         assert "name=name" in lock_string
         assert "mode=" + mode in lock_string

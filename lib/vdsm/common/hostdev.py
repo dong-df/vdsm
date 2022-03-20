@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2019 Red Hat, Inc.
+# Copyright 2014-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,14 +24,18 @@ from __future__ import division
 import collections
 import functools
 import hashlib
+import json
+import logging
 import operator
 import os
 import uuid
 import xml.etree.ElementTree as etree
 
+from collections import namedtuple
 import libvirt
 import six
 
+from vdsm.common import commands
 from vdsm.common import conv
 from vdsm.common import cpuarch
 from vdsm.common import exception
@@ -96,6 +100,16 @@ class Vendor:
 class MdevPlacement:
     COMPACT = 'compact'
     SEPARATE = 'separate'
+
+
+MdevProperties = namedtuple('MdevProperties', [
+    # Device type, such as "nvidia-22", string
+    'device_type',
+    # One of the MdevPlacement constants
+    'placement',
+    # Raw driver parameters to set, string or None
+    'driver_parameters'
+])
 
 
 class NoIOMMUSupportException(Exception):
@@ -228,7 +242,7 @@ def name_to_pci_path(device_name):
 def _each_device_xml(libvirt_devices):
     for device in libvirt_devices:
         try:
-            yield device.name(), device.XMLDesc(0)
+            yield device.name(), device.XMLDesc()
         except libvirt.libvirtError:
             # The object still exists, but the underlying device is gone. For
             # us, the device is also gone - ignore it.
@@ -489,7 +503,30 @@ def _process_scsi_device_params(device_name, cache):
     if scsi_generic_dev_params:
         params['udev_path'] = scsi_generic_dev_params['udev_path']
 
+    if params.get('udev_path'):
+        mapping = _get_udev_block_mapping()
+        block_path = mapping.get(params['udev_path'])
+        if block_path:
+            params['block_path'] = block_path
+
     return params
+
+
+@memoized
+def _get_udev_block_mapping():
+    """
+    Read system udev path -> block path mapping
+    """
+    mapping_command = ["lsscsi", "-g"],
+
+    try:
+        output = commands.run(*mapping_command).decode('utf-8')
+        lines = output.strip().split("\n")
+        return {m.split()[-1]: m.split()[-2] for m in lines}
+    except Exception as e:
+        logging.error(
+            "Could not read system udev path -> block path mapping: %s", e)
+        return {}
 
 
 def _process_device_params(device_xml):
@@ -517,7 +554,7 @@ def _process_device_params(device_xml):
 def _get_device_ref_and_params(device_name):
     libvirt_device = libvirtconnection.get().\
         nodeDeviceLookupByName(device_name)
-    params = _process_device_params(libvirt_device.XMLDesc(0))
+    params = _process_device_params(libvirt_device.XMLDesc())
 
     if params['capability'] != 'scsi':
         return libvirt_device, params
@@ -615,9 +652,11 @@ def _mdev_type_devices(mdev_type, path):
     return os.listdir(os.path.join(path, mdev_type, 'devices'))
 
 
-def _suitable_device_for_mdev_type(target_mdev_type, mdev_placement, log):
+def _suitable_device_for_mdev_type(mdev_properties, log):
     target_device = None
-
+    target_mdev_type = mdev_properties.device_type
+    mdev_placement = mdev_properties.placement
+    log.debug("Looking for a mdev of type {}".format(target_mdev_type))
     for device in _each_mdev_device():
         vendor = _mdev_device_vendor(device)
         for mdev_type, path in _each_supported_mdev_type(device):
@@ -627,11 +666,16 @@ def _suitable_device_for_mdev_type(target_mdev_type, mdev_placement, log):
                 if vendor == '0x10de' and \
                    len(_mdev_type_devices(mdev_type, path)) > 0:
                     target_device = None
+                    log.debug("Mdev type {} is different from already "
+                              "allocated type {}, skipping device {}"
+                              .format(target_mdev_type, mdev_type, device))
                     break
                 continue
             elif mdev_placement == MdevPlacement.SEPARATE:
                 if len(_mdev_type_devices(mdev_type, path)) > 0:
                     target_device = None
+                    log.debug("Mdev {} already used and separate "
+                              "placement requested, skipping".format(device))
                     break
             # Make sure to cast to int as the value is read from sysfs.
             if int(
@@ -642,21 +686,23 @@ def _suitable_device_for_mdev_type(target_mdev_type, mdev_placement, log):
             target_device = device
 
         if target_device is not None:
+            log.debug("Matching mdev found: {}".format(target_device))
             return target_device
+        else:
+            log.debug("Mdev not suitable: {}".format(device))
 
     if target_device is None and mdev_placement == MdevPlacement.SEPARATE:
         log.info("Separate mdev placement failed, trying compact placement.")
         return _suitable_device_for_mdev_type(
-            target_mdev_type, MdevPlacement.COMPACT, log
+            mdev_properties._replace(placement=MdevPlacement.COMPACT), log
         )
     return target_device
 
 
 def device_name_from_address(address_type, device_address):
     _, address_to_name = _get_devices_from_libvirt()
-    return address_to_name[
-        _format_address(address_type, device_address)
-    ]
+    address = _format_address(address_type, device_address)
+    return address_to_name.get(address)
 
 
 def list_by_caps(caps=None):
@@ -676,9 +722,75 @@ def list_by_caps(caps=None):
 
     for devName, params in libvirt_devices.items():
         devices[devName] = {'params': params}
+    devices.update(list_nvdimms())
 
     devices = hooks.after_hostdev_list_by_caps(devices)
     return devices
+
+
+def list_nvdimms():
+    """
+    Return dictionary of available NVDIMM namespace devices.
+
+    Physical or virtual NVDIMM devices or their parts are organized
+    into regions, possibly spanning multiple physical devices, and
+    each region can have one or more namespaces. QEMU can be
+    instructed to make a virtual NVDIMM device in the guest from a
+    namespace NVDIMM device on the host.
+
+    Engine consumes the following parameters for each device:
+
+    - 'device_path' of the namespace device, to know where to access the
+      device
+    - 'device_size' of the device in bytes, to know what size to set
+    - 'align_size' in bytes, to specify the device alignment to libvirt
+    - 'mode' of the device, to know whether the device should be set as
+      persistent and to inform the user
+    - 'numa_node' of the device, to know the NUMA node to put the
+      device into
+
+    The returned dictionary is in a host device compatible format, the
+    same as in `list_by_caps()`.
+
+    NVDIMM devices are memory devices from the point of view of
+    libvirt but we report NVDIMM devices as host devices, of a
+    separate 'nvdimm' capability, as this is closer to the way they
+    are actually used.
+    """
+    ndctl_command = ['ndctl', 'list', '--namespaces', '-v']
+    try:
+        output = commands.run(ndctl_command)
+    except Exception:
+        logging.exception("Couldn't retrieve NVDIMM device data")
+        return {}
+    if not output:
+        return {}
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        logging.exception("Couldn't parse NVDIMM device data")
+        return {}
+    nvdimms = {}
+    for device in data:
+        dev_file = device.get('blockdev') or device.get('chardev')
+        if not dev_file:
+            try:
+                dev_file = device['daxregion']['devices'][0]['chardev']
+            except (KeyError, IndexError,):
+                logging.warning("No NVDIMM device file: %s", device)
+                continue
+        parameters = {
+            'capability': 'nvdimm',
+            'parent': 'computer',
+            'device_path': '/dev/' + dev_file,
+            'numa_node': device['numa_node'],
+            'mode': device['mode'],
+            'device_size': int(device['size']),
+        }
+        if 'align' in device:
+            parameters['align_size'] = int(device['align'])
+        nvdimms[device['dev']] = {'params': parameters}
+    return nvdimms
 
 
 def get_device_params(device_name):
@@ -715,20 +827,21 @@ def reattach_detachable(device_name, pci_reattach=True):
 
 def change_numvfs(device_name, numvfs):
     net_name = physical_function_net_name(device_name)
-    supervdsm.getProxy().change_numvfs(name_to_pci_path(device_name), numvfs,
-                                       net_name)
+    supervdsm.getProxy().change_numvfs(numvfs, net_name)
 
 
-def spawn_mdev(mdev_type, mdev_uuid, mdev_placement, log):
-    device = _suitable_device_for_mdev_type(mdev_type, mdev_placement, log)
+def spawn_mdev(mdev_properties, mdev_uuid, log):
+    device = _suitable_device_for_mdev_type(mdev_properties, log)
     if device is None:
-        message = 'vgpu: No device with type {} is available'.format(mdev_type)
+        message = 'vgpu: No device with type {} is available'.format(
+            mdev_properties.device_type
+        )
         log.error(message)
         raise exception.ResourceUnavailable(message)
     try:
-        supervdsm.getProxy().mdev_create(device, mdev_type, mdev_uuid)
+        supervdsm.getProxy().mdev_create(device, mdev_properties, mdev_uuid)
     except IOError:
-        message = 'vgpu: Failed to create mdev type {}'.format(mdev_type)
+        message = f'vgpu: Failed to create mdev: {mdev_properties}'
         log.error(message)
         raise exception.ResourceUnavailable(message)
 

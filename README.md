@@ -1,6 +1,9 @@
-# Vdsm: Virtual Desktop Server Manager
+# Virtual Desktop Server Manager
 
-[![Build Status](https://travis-ci.org/oVirt/vdsm.svg?branch=master)](https://travis-ci.org/oVirt/vdsm)
+[![CI Status](https://github.com/oVirt/vdsm/actions/workflows/ci.yml/badge.svg)](https://github.com/oVirt/vdsm/actions)
+[![Copr build status](https://copr.fedorainfracloud.org/coprs/ovirt/ovirt-master-snapshot/package/vdsm/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/ovirt/ovirt-master-snapshot/package/vdsm/)
+
+Welcome to the Vdsm source repository.
 
 The Vdsm service exposes an API for managing virtualization
 hosts running the KVM hypervisor technology. Vdsm manages and monitors
@@ -8,15 +11,34 @@ the host's storage, memory and networks as well as virtual machine
 creation, other host administration tasks, statistics gathering, and
 log collection.
 
+## How to contribute
+
+### Submitting patches
+
+Please use GitHub pull requests.
+
+### Found a bug or documentation issue?
+
+To submit a bug or suggest an enhancement for Vdsm please use
+[oVirt Bugzilla for vdsm product](https://bugzilla.redhat.com/enter_bug.cgi?product=vdsm).
+
+If you find a documentation issue on the oVirt website please navigate
+and click "Report an issue on GitHub" in the page footer.
+
+### Code review history
+
+Vdsm moved to GitHub on Jan 9, 2022. To look up code reviews before this
+date, please check the [Gerrit vdsm project](https://gerrit.ovirt.org/q/project:vdsm+is:merged).
+
 ## Manual installation
 
 Add ovirt repositories to your repositories list:
 
-    sudo yum install -y http://resources.ovirt.org/pub/yum-repo/ovirt-release-master.rpm
+    sudo dnf install -y http://resources.ovirt.org/pub/yum-repo/ovirt-release-master.rpm
 
 Install Vdsm:
 
-    sudo yum install vdsm vdsm-client
+    sudo dnf install vdsm vdsm-client
 
 Configure Vdsm:
 
@@ -38,24 +60,32 @@ Vdsm logs can be found at `/var/log/vdsm/*.log` (refer to README.logging for fur
 
 ## Development environment setup
 
-Set local git clone:
+Fork the project on https://github.com/oVirt/vdsm.
 
-    sudo yum install -y git
-    git clone http://gerrit.ovirt.org/p/vdsm.git .
+Clone your fork:
 
-Install additional packages for Fedora:
+    sudo dnf install -y git
+    git@github.com:{user}/vdsm.git
 
-    sudo dnf install -y `cat automation/check-patch.packages.fc30`
+Install additional packages for Fedora, CentOS, and RHEL:
 
-Install additional packages for CentOS:
+    sudo dnf install -y `cat automation/check-patch.packages`
 
-    sudo yum install -y `cat automation/check-patch.packages.el8`
-    easy_install pip
+Create virtual environment for vdsm:
 
-Install tox:
+    python3 -m venv ~/.venv/vdsm
+    source ~/.venv/vdsm/bin/activate
+    pip install --upgrade pip
+    pip install -r docker/requirements.txt
+    deactivate
 
-    pip install --user tox
+Before running vdsm tests, activate the environment:
 
+    source ~/.venv/vdsm/bin/activate
+
+When done, you can deactivate the environment:
+
+    deactivate
 
 ## Building Vdsm
 
@@ -76,7 +106,7 @@ To create an RPM:
 
 To update your system with local build's RPM:
 
-    (cd ~/rpmbuild/RPMS && sudo yum upgrade */vdsm*.rpm)
+    (cd ~/rpmbuild/RPMS && sudo dnf upgrade */vdsm*.rpm)
 
 
 ## Making new releases
@@ -138,22 +168,18 @@ There are two mailing lists for discussions:
 
 - For technical discussions about the project and its code base.
 
-  http://lists.ovirt.org/mailman/listinfo/devel
+  https://lists.ovirt.org/admin/lists/devel.ovirt.org/
 
 - For questions by users, who do not want to be swamped by
   technicalities.
 
-  http://lists.ovirt.org/mailman/listinfo/users
+  https://lists.ovirt.org/admin/lists/users.ovirt.org/
 
 The developers also hang out on IRC at #vdsm hosted on freenode.net
 
 The latest upstream code can be obtained from GIT:
 
     git clone https://gerrit.ovirt.org/vdsm
-
-To setup development with ovirt gerrit visit:
-
-  https://ovirt.org/develop/dev-process/working-with-gerrit.html
 
 
 ## Licensing

@@ -47,7 +47,6 @@ from vdsm.common import concurrent
 from vdsm.common import libvirtconnection
 from vdsm.common import password
 from vdsm.common import response
-from vdsm.common import zombiereaper
 from vdsm.common.cmdutils import wrap_command
 from vdsm.common.commands import execCmd, BUFFSIZE, terminating
 from vdsm.common.compat import subprocess
@@ -55,13 +54,14 @@ from vdsm.common.config import config
 from vdsm.common.define import errCode, doneCode
 from vdsm.common.logutils import traceback
 from vdsm.common.time import monotonic_time
+from vdsm.common.units import MiB
 from vdsm.constants import P_VDSM_LOG, P_VDSM_RUN, EXT_KVM_2_OVIRT
 from vdsm.utils import NICENESS, IOCLASS
 
 try:
-    import ovirt_imageio_common
+    import ovirt_imageio
 except ImportError:
-    ovirt_imageio_common = None
+    ovirt_imageio = None
 
 
 _lock = threading.Lock()
@@ -75,7 +75,7 @@ _SSH_ADD = cmdutils.CommandPath('ssh-add', '/usr/bin/ssh-add')
 _XEN_SSH_PROTOCOL = 'xen+ssh'
 _VMWARE_PROTOCOL = 'vpx'
 _KVM_PROTOCOL = 'qemu'
-_SSH_AUTH_RE = b'(SSH_AUTH_SOCK)=([^;]+).*;\nSSH_AGENT_PID=(\d+)'
+_SSH_AUTH_RE = br'(SSH_AUTH_SOCK)=([^;]+).*;\nSSH_AGENT_PID=(\d+)'
 _OVF_RESOURCE_CPU = 3
 _OVF_RESOURCE_MEMORY = 4
 _OVF_RESOURCE_NETWORK = 10
@@ -147,7 +147,7 @@ class JobNotDone(ClientError):
 
 
 class NoSuchOvf(V2VError):
-    ''' Ovf path is not exists in /var/run/vdsm/v2v/ '''
+    ''' Ovf path is not exists in /run/vdsm/v2v/ '''
     err_name = 'V2VNoSuchOvf'
 
 
@@ -206,8 +206,8 @@ def convert_external_vm(uri, username, password, vminfo, job_id, irs):
         command = LibvirtCommand(uri, username, password, vminfo, job_id,
                                  irs)
     elif uri.startswith(_KVM_PROTOCOL):
-        if ovirt_imageio_common is None:
-            raise V2VError('Unsupported protocol KVM, ovirt_imageio_common'
+        if ovirt_imageio is None:
+            raise V2VError('Unsupported protocol KVM, ovirt_imageio '
                            'package is needed for importing KVM images')
         command = KVMCommand(uri, username, password, vminfo, job_id, irs)
     else:
@@ -286,7 +286,7 @@ def get_jobs_status():
     for job_id, job in items:
         ret[job_id] = {
             'status': job.status,
-            'description': job.description.decode('utf-8'),
+            'description': job.description,
             'progress': job.progress
         }
     return ret
@@ -515,7 +515,10 @@ class V2VCommand(object):
         env = os.environ.copy()
 
         # virt-v2v specific variables
-        env['LIBGUESTFS_BACKEND'] = 'direct'
+        if isinstance(self, XenCommand):
+            # It is not possible to use libvirt backend due to outstanding
+            # issues with xen+ssh input. See RHBZ#1370055 for discussion.
+            env['LIBGUESTFS_BACKEND'] = 'direct'
         if 'virtio_iso_path' in self._vminfo:
             env['VIRTIO_WIN'] = self._vminfo['virtio_iso_path']
         return env
@@ -709,7 +712,7 @@ class KVMCommand(V2VCommand):
             vm = con.lookupByName(self._vminfo['vmName'])
             if vm:
                 params = {}
-                root = ET.fromstring(vm.XMLDesc(0))
+                root = ET.fromstring(vm.XMLDesc())
                 _add_disks(root, params)
                 src = []
                 fmt = []
@@ -807,8 +810,6 @@ class PipelineProc(object):
 
 
 class ImportVm(object):
-    TERM_DELAY = 30
-    PROC_WAIT_TIMEOUT = 30
 
     def __init__(self, job_id, command):
         self._id = job_id
@@ -893,9 +894,7 @@ class ImportVm(object):
         if self._proc.returncode is not None:
             return
         logging.debug("Job %r waiting for virt-v2v process", self._id)
-        if not self._proc.wait(timeout=self.PROC_WAIT_TIMEOUT):
-            raise V2VProcessError("Job %r timeout waiting for process pid=%s",
-                                  self._id, self._proc.pids)
+        self._proc.wait()
 
     def _watch_process_output(self):
         out = io.BufferedReader(io.FileIO(self._proc.stdout.fileno(),
@@ -944,8 +943,7 @@ class ImportVm(object):
                 logging.debug('Job %r virt-v2v process was killed',
                               self._id)
             finally:
-                for pid in self._proc.pids:
-                    zombiereaper.autoReapPID(pid)
+                self._proc.wait()
 
 
 class OutputParser(object):
@@ -957,7 +955,7 @@ class OutputParser(object):
             if b'Copying disk' in line:
                 description, current_disk, disk_count = self._parse_line(line)
                 yield ImportProgress(int(current_disk), int(disk_count),
-                                     description)
+                                     description.decode('utf-8'))
                 for chunk in self._iter_progress(stream):
                     progress = self._parse_progress(chunk)
                     if progress is not None:
@@ -979,7 +977,7 @@ class OutputParser(object):
             if not c:
                 raise OutputParserError('copy-disk stream closed unexpectedly')
             chunk += c
-            if c == b'\r':
+            if c in [b'\n', b'\r']:
                 yield chunk
                 chunk = b''
 
@@ -997,7 +995,7 @@ class OutputParser(object):
 def _mem_to_mib(size, unit):
     lunit = unit.lower()
     if lunit in ('bytes', 'b'):
-        return size // 1024 // 1024
+        return size // MiB
     elif lunit in ('kib', 'k'):
         return size // 1024
     elif lunit in ('mib', 'm'):
@@ -1048,7 +1046,7 @@ def _add_vm(conn, vms, vm):
         logging.error("error getting domain information: %s", e)
         return
     try:
-        xml = vm.XMLDesc(0)
+        xml = vm.XMLDesc()
     except libvirt.libvirtError as e:
         logging.error("error getting domain xml for vm %r: %s",
                       vm.name(), e)
@@ -1406,22 +1404,22 @@ def _parse_allocation_units(units):
     base-units must be bytes.
     """
     # Format description
-    sp = '[ \t\n]?'
-    base_unit = 'byte'
-    operator = '[*]'  # we support only multiplication
-    number = '[+]?[0-9]+'  # we support only positive integers
-    exponent = '[+]?[0-9]+'  # we support only positive integers
-    modifier1 = '(?P<m1>{op}{sp}(?P<m1_num>{num}))'.format(
+    sp = r'[ \t\n]?'
+    base_unit = r'byte'
+    operator = r'[*]'  # we support only multiplication
+    number = r'[+]?[0-9]+'  # we support only positive integers
+    exponent = r'[+]?[0-9]+'  # we support only positive integers
+    modifier1 = r'(?P<m1>{op}{sp}(?P<m1_num>{num}))'.format(
         op=operator,
         num=number,
         sp=sp)
     modifier2 = \
-        '(?P<m2>{op}{sp}' \
-        '(?P<m2_base>[0-9]+){sp}\^{sp}(?P<m2_exp>{exp}))'.format(
+        r'(?P<m2>{op}{sp}' \
+        r'(?P<m2_base>[0-9]+){sp}\^{sp}(?P<m2_exp>{exp}))'.format(
             op=operator,
             exp=exponent,
             sp=sp)
-    r = '^{base_unit}({sp}{mod1})?({sp}{mod2})?$'.format(
+    r = r'^{base_unit}({sp}{mod1})?({sp}{mod2})?$'.format(
         base_unit=base_unit,
         mod1=modifier1,
         mod2=modifier2,

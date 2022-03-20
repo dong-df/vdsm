@@ -42,6 +42,7 @@ from vdsm.common import supervdsm
 from vdsm.common.network.address import hosttail_join
 from vdsm.network.netinfo.routes import getRouteDeviceTo
 from vdsm.storage import devicemapper
+from vdsm.storage import exception as se
 from vdsm.storage import iscsiadm
 from vdsm.storage import misc
 from vdsm.storage import sysfs
@@ -81,7 +82,7 @@ IscsiSession = namedtuple("IscsiSession", "id, iface, target, credentials")
 
 _iscsiadmTransactionLock = RLock()
 
-log = logging.getLogger('storage.ISCSI')
+log = logging.getLogger('storage.iscsi')
 
 
 def getDevIscsiSessionId(dev):
@@ -182,7 +183,7 @@ def readSessionInfo(sessionID):
 
     # NOTE: ChapCredentials must match the way we initialize username and
     # password when receiving request from engine in
-    # hsm._connectionDict2ConnectionInfo().
+    # storageServer.connectionDict2ConnectionInfo().
     # iscsi reports empty user/password as "<NULL>" (RHEL5) or "(null)"
     # (RHEL6);  empty values are stored as None.
 
@@ -204,9 +205,15 @@ def addIscsiNode(iface, target, credentials=None):
     # bounded iface. Explicitly specifying tpgt on iSCSI login imposes creation
     # of the node record in the new style format which enables to access a
     # portal through multiple ifaces for multipathing.
+
+    log.info("Adding iscsi node for target %s iface %s", target, iface.name)
+
     with _iscsiadmTransactionLock:
         iscsiadm.node_new(iface.name, target.address, target.iqn)
         try:
+            iscsiadm.node_update(iface.name, target.address, target.iqn,
+                                 "node.startup", "manual")
+
             if credentials is not None:
                 for key, value in credentials.getIscsiadmOptions():
                     key = "node.session." + key
@@ -215,20 +222,27 @@ def addIscsiNode(iface, target, credentials=None):
 
             setRpFilterIfNeeded(iface.netIfaceName, target.portal.hostname,
                                 True)
-
-            iscsiadm.node_login(iface.name, target.address, target.iqn)
-
-            iscsiadm.node_update(iface.name, target.address, target.iqn,
-                                 "node.startup", "manual")
         except:
             removeIscsiNode(iface, target)
             raise
+
+
+def loginToIscsiNode(iface, target):
+    log.info("Logging in to iscsi target %s via iface %s", target, iface.name)
+    try:
+        iscsiadm.node_login(iface.name, target.address, target.iqn)
+    except:
+        removeIscsiNode(iface, target)
+        raise
 
 
 def removeIscsiNode(iface, target):
     # Basically this command deleting a node record (see addIscsiNode).
     # Once we create a record in the new style format by specifying a tpgt,
     # we delete it in the same way.
+
+    log.info("Removing iscsi node for target %s iface %s", target, iface.name)
+
     with _iscsiadmTransactionLock:
         try:
             iscsiadm.node_disconnect(iface.name, target.address, target.iqn)
@@ -240,8 +254,9 @@ def removeIscsiNode(iface, target):
 
 
 def addIscsiPortal(iface, portal, credentials=None):
-    discoverType = "sendtargets"
+    log.info("Adding iscsi portal %s iface %s", portal, iface.name)
 
+    discoverType = "sendtargets"
     with _iscsiadmTransactionLock:
         iscsiadm.discoverydb_new(discoverType, iface.name, str(portal))
 
@@ -259,6 +274,7 @@ def addIscsiPortal(iface, portal, credentials=None):
 
 
 def deleteIscsiPortal(iface, portal):
+    log.info("Deleting iscsi portal %s iface %s", portal, iface.name)
     discoverType = "sendtargets"
     iscsiadm.discoverydb_delete(discoverType, iface.name, str(portal))
 
@@ -266,6 +282,10 @@ def deleteIscsiPortal(iface, portal):
 def discoverSendTargets(iface, portal, credentials=None):
     # Because proper discovery actually has to clear the DB having multiple
     # discoveries at once will cause unpredictable results
+
+    log.info("Discovering iscsi targets for portal %s iface %s",
+             portal, iface.name)
+
     discoverType = "sendtargets"
 
     with _iscsiadmTransactionLock:
@@ -538,6 +558,8 @@ def disconnectFromUndelyingStorage(devPath):
 
 
 def disconnectiScsiSession(sessionID):
+    log.info("Disconnecting iscsi session %s", sessionID)
+
     # FIXME : Should throw exception on error
     sessionID = int(sessionID)
     sessionInfo = getSessionInfo(sessionID)
@@ -590,3 +612,40 @@ def setRpFilterIfNeeded(netIfaceName, hostname, loose_mode):
             log.info("Setting strict mode rp_filter for device %r." %
                      netIfaceName)
             supervdsm.getProxy().set_rp_filter_strict(netIfaceName)
+
+
+def _updateIfaceNameIfNeeded(iface, netIfaceName):
+    if iface.netIfaceName is None:
+        iface.netIfaceName = netIfaceName
+        iface.update()
+        return True
+
+    return False
+
+
+def resolveIscsiIface(ifaceName, initiatorName, netIfaceName):
+    if not ifaceName:
+        return IscsiInterface('default')
+
+    for iface in iterateIscsiInterfaces():
+
+        if iface.name != ifaceName:
+            continue
+
+        if netIfaceName is not None:
+            if (not _updateIfaceNameIfNeeded(iface, netIfaceName) and
+                    netIfaceName != iface.netIfaceName):
+                logging.error('iSCSI netIfaceName coming from engine [%s] '
+                              'is different from iface.net_ifacename '
+                              'present on the system [%s]. Aborting iscsi '
+                              'iface [%s] configuration.' %
+                              (netIfaceName, iface.netIfaceName, iface.name))
+
+                raise se.iSCSIifaceError()
+
+        return iface
+
+    iface = IscsiInterface(ifaceName, initiatorName=initiatorName,
+                           netIfaceName=netIfaceName)
+    iface.create()
+    return iface

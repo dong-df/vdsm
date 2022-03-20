@@ -65,11 +65,6 @@ class MissingModule(object):
 
 
 try:
-    import cPickle as pickle
-except ImportError:  # py3
-    import pickle  # NOQA: F401 (unused import)
-
-try:
     # on RHEL/Centos 6.x, the JSON module in the python standard
     # library does not include significant speedups:
     # stdlib is based on simplejson 1.9, speedups were added on 2.0.9.
@@ -89,10 +84,6 @@ try:
     from glob import escape as glob_escape
 except ImportError:
     from vdsm.common.glob import escape as glob_escape  # NOQA: F401
-
-
-# python2-enum34 or Python's 3 std library version
-from enum import Enum  # NOQA: F401
 
 
 # Wrapper function for inspect arg spec API

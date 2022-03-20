@@ -30,7 +30,6 @@ from vdsm.clientIF import clientIF
 from vdsm.common import response
 from vdsm.common import exception
 from vdsm.virt import vm
-from vdsm.virt.drivemonitor import DriveMonitor
 from vdsm.virt.vmdevices import hwclass
 
 
@@ -130,6 +129,9 @@ def test_diskreplicatefinish_job_not_finished():
 
     assert result == response.error("unavail")
 
+    # if pivot was not called the monitor should not have been disabled
+    assert not _vm.volume_monitor.was_disabled
+
 
 def test_blockjobabort_failed(monkeypatch):
     def raising_blockjobabort():
@@ -161,6 +163,10 @@ def test_replicatefinish_successful():
     assert (_vm._devices[hwclass.DISK][0]['domainID'] ==
             dst_drive_conf['domainID'])
 
+    # we need to check whether the monitor was disabled during the
+    # run of diskReplicateFinish
+    assert _vm.volume_monitor.was_disabled
+
 
 def make_drive(drive_conf, shared_type=storage.DRIVE_SHARED_TYPE.EXCLUSIVE):
     drive_conf['shared'] = shared_type
@@ -171,7 +177,7 @@ class FakeVm(vm.Vm):
     def __init__(self, devices=[]):
         self._devices = {hwclass.DISK: devices}
         self.id = "testvm"
-        self.drive_monitor = FakeDriveMonitor(log)
+        self.volume_monitor = FakeVolumeMonitor()
         self._dom = FakeDomain()
         self.cif = FakeClientIF(log)
         # We don't always pass the destination drive
@@ -197,10 +203,10 @@ class FakeDomain(object):
     def __init__(self, block_job_info={}):
         self.block_job_info = block_job_info
 
-    def blockJobInfo(self, drive_name, flags):
+    def blockJobInfo(self, drive_name, flags=0):
         return self.block_job_info
 
-    def blockJobAbort(self, drive_name, flags):
+    def blockJobAbort(self, drive_name, flags=0):
         pass
 
 
@@ -210,7 +216,15 @@ class FakeClientIF(clientIF):
         self.log = log
 
 
-class FakeDriveMonitor(DriveMonitor):
+class FakeVolumeMonitor(object):
 
-    def __init__(self, log):
-        self._log = log
+    def __init__(self):
+        self.enabled = False
+        self.was_disabled = False
+
+    def disable(self):
+        self.was_disabled = True
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True

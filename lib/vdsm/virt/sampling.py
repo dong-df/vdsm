@@ -40,6 +40,7 @@ from vdsm import hugepages
 from vdsm import numa
 from vdsm import utils
 import vdsm.common.time
+from vdsm.common.units import KiB, MiB
 from vdsm.config import config
 from vdsm.constants import P_VDSM_RUN
 from vdsm.host import api as hostapi
@@ -50,6 +51,7 @@ _THP_STATE_PATH = '/sys/kernel/mm/transparent_hugepage/enabled'
 if not os.path.exists(_THP_STATE_PATH):
     _THP_STATE_PATH = '/sys/kernel/mm/redhat_transparent_hugepage/enabled'
 _METRICS_ENABLED = config.getboolean('metrics', 'enabled')
+_NOWAIT_ENABLED = config.getboolean('vars', 'nowait_domain_stats')
 
 
 class TotalCpuSample(object):
@@ -117,6 +119,9 @@ class NumaNodeMemorySample(object):
             if int(memInfo['total']) != 0:
                 nodeMemSample['memPercent'] = 100 - \
                     int(100.0 * int(memInfo['free']) // int(memInfo['total']))
+            page_sizes = list(numaTopology[nodeIndex]['hugepages'].keys())
+            nodeMemSample['hugepages'] = \
+                numa.free_pages_by_cell(page_sizes, idx)
             self.nodesMemSample[nodeIndex] = nodeMemSample
 
 
@@ -146,7 +151,7 @@ class HostSample(object):
             free = 0
             try:
                 stat = os.statvfs(p)
-                free = stat.f_bavail * stat.f_bsize // (2 ** 20)
+                free = stat.f_bavail * stat.f_bsize // MiB
             except:
                 pass
             d[p] = {'free': str(free)}
@@ -165,9 +170,11 @@ class HostSample(object):
         self.totcpu = TotalCpuSample()
         meminfo = utils.readMemInfo()
         freeOrCached = (meminfo['MemFree'] +
-                        meminfo['Cached'] + meminfo['Buffers'])
+                        meminfo['Cached'] +
+                        meminfo['Buffers'] +
+                        meminfo['SReclaimable'])
         self.memUsed = 100 - int(100.0 * (freeOrCached) / meminfo['MemTotal'])
-        self.anonHugePages = meminfo.get('AnonHugePages', 0) // 1024
+        self.anonHugePages = meminfo.get('AnonHugePages', 0) // KiB
         try:
             with open('/proc/loadavg') as loadavg:
                 self.cpuLoad = loadavg.read().split()[1]
@@ -412,8 +419,10 @@ class VMBulkstatsMonitor(object):
         # we are deep in the hot path. bool(ExpiringCache)
         # *is* costly so we should avoid it if we can.
         fast_path = acquired and not self._skip_doms
-        doms = []  # whitelist, meaningful only in the slow path
-        flags = libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_RUNNING  # shortcut
+        responsive_doms = []
+        flags = libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_RUNNING
+        if _NOWAIT_ENABLED:
+            flags |= libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT
         try:
             if fast_path:
                 # This is expected to be the common case.
@@ -422,11 +431,11 @@ class VMBulkstatsMonitor(object):
                     stats=self._stats_types, flags=flags)
             else:
                 # A previous call got stuck, or not every domain
-                # has properly recovered. Thus we must whitelist domains.
-                doms = self._get_responsive_doms()
-                if doms:
+                # has properly recovered. Thus we query only responsive ones.
+                responsive_doms = self._get_responsive_doms()
+                if responsive_doms:
                     bulk_stats = self._conn.domainListGetStats(
-                        doms, stats=self._stats_types, flags=flags)
+                        responsive_doms, stats=self._stats_types, flags=flags)
                 else:
                     bulk_stats = []
         except Exception:
@@ -441,7 +450,7 @@ class VMBulkstatsMonitor(object):
             self._log.debug(
                 'sampled timestamp %r elapsed %.3f acquired %r domains %s',
                 timestamp, self._stats_cache.clock() - timestamp, acquired,
-                'all' if fast_path else len(doms))
+                'all' if fast_path else len(responsive_doms))
 
     def _get_responsive_doms(self):
         vms = self._get_vms()
@@ -456,7 +465,7 @@ class VMBulkstatsMonitor(object):
                 # TODO: This racy check may fail if the underlying libvirt
                 # domain has died just after checking isDomainReadyForCommands
                 # succeeded.
-                doms.append(vm_obj._dom._dom)
+                doms.append(vm_obj._dom.dom)
         return doms
 
 

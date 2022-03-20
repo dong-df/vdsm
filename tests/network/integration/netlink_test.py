@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2019 Red Hat, Inc.
+# Copyright 2016-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,7 +22,6 @@ from __future__ import absolute_import
 from __future__ import division
 
 from collections import deque
-import os
 import threading
 import time
 
@@ -30,16 +29,42 @@ import pytest
 
 from vdsm.common.time import monotonic_time
 
+from ..nettestlib import dummy_device
+from ..nettestlib import dummy_devices
 from ..nettestlib import Dummy
+from ..nettestlib import Interface
 from vdsm.network.netlink import NLSocketPool
 from vdsm.network.netlink import monitor
 from vdsm.network.sysctl import is_disabled_ipv6
+
+from network.nettestlib import Bond
+from network.nettestlib import IpFamily
+from network.nettestlib import running_on_ovirt_ci
+
 
 IP_ADDRESS = '192.0.2.1'
 IP_CIDR = '24'
 
 
-running_on_ovirt_ci = 'OVIRT_CI' in os.environ
+@pytest.fixture(scope='function')
+def slaves():
+    with dummy_devices(2) as slaves:
+        yield slaves
+
+
+@pytest.fixture(scope='function')
+def bond_in_mode_1(slaves):
+    bond = Bond()
+    bond.create()
+
+    bond.down()
+    bond.set_options({'mode': '1'})
+    for dev in slaves:
+        bond.add_slave(dev)
+    bond.up()
+
+    yield bond
+    bond.remove()
 
 
 class TestNetlinkEventMonitor(object):
@@ -47,10 +72,9 @@ class TestNetlinkEventMonitor(object):
     TIMEOUT = 5
 
     def test_iterate_after_events(self):
-        with monitor.Monitor(timeout=self.TIMEOUT) as mon:
-            dummy = Dummy()
-            dummy_name = dummy.create()
-            dummy.remove()
+        with monitor.object_monitor(timeout=self.TIMEOUT) as mon:
+            with dummy_device() as dummy:
+                dummy_name = dummy
             for event in mon:
                 if event.get('name') == dummy_name:
                     break
@@ -68,7 +92,7 @@ class TestNetlinkEventMonitor(object):
             dummy.up()
             dummy.remove()
 
-        with monitor.Monitor(timeout=self.TIMEOUT) as mon:
+        with monitor.object_monitor(timeout=self.TIMEOUT) as mon:
             add_device_thread = _start_thread(_set_and_remove_device)
             for event in mon:
                 if event.get('name') == dummy_name:
@@ -76,26 +100,24 @@ class TestNetlinkEventMonitor(object):
             add_device_thread.join()
 
     def test_stopped(self):
-        with monitor.Monitor(timeout=self.TIMEOUT) as mon:
-            dummy = Dummy()
-            dummy_name = dummy.create()
-            dummy.remove()
+        with monitor.object_monitor(timeout=self.TIMEOUT) as mon:
+            with dummy_device() as dummy:
+                dummy_name = dummy
 
         found = any(event.get('name') == dummy_name for event in mon)
         assert found, 'Expected event was not caught.'
 
     def test_event_groups(self):
-        with monitor.Monitor(
+        with monitor.object_monitor(
             timeout=self.TIMEOUT, groups=('ipv4-ifaddr',)
         ) as mon_a:
-            with monitor.Monitor(
+            with monitor.object_monitor(
                 timeout=self.TIMEOUT, groups=('link', 'ipv4-route')
             ) as mon_l_r:
-                dummy = Dummy()
-                dummy.create()
-                dummy.set_ip(IP_ADDRESS, IP_CIDR)
-                dummy.up()
-                dummy.remove()
+                with dummy_device() as dummy:
+                    Interface.from_existing_dev_name(dummy).add_ip(
+                        IP_ADDRESS, IP_CIDR, IpFamily.IPv4
+                    )
 
         for event in mon_a:
             assert '_addr' in event['event'], (
@@ -113,7 +135,7 @@ class TestNetlinkEventMonitor(object):
             )
 
     def test_iteration(self):
-        with monitor.Monitor(timeout=self.TIMEOUT) as mon:
+        with monitor.object_monitor(timeout=self.TIMEOUT) as mon:
             iterator = iter(mon)
 
             # Generate events to avoid blocking
@@ -129,14 +151,14 @@ class TestNetlinkEventMonitor(object):
                 next(iterator)
 
     @pytest.mark.xfail(
-        condition=running_on_ovirt_ci,
+        condition=running_on_ovirt_ci(),
         raises=AssertionError,
         reason='Sometimes we miss some events on CI',
         strict=False,
     )
     def test_events_keys(self):
         def _simplify_event(event):
-            """ Strips event keys except event, address, name, destination,
+            """Strips event keys except event, address, name, destination,
             family.
             """
             allow = set(['event', 'address', 'name', 'destination', 'family'])
@@ -145,29 +167,40 @@ class TestNetlinkEventMonitor(object):
         def _expected_events(nic, address, cidr):
             events_add = [
                 {'event': 'new_link', 'name': nic},
-                {'event': 'new_addr', 'address': address + '/' + cidr},
                 {'event': 'new_link', 'name': nic},
             ]
-            events_del = [
+            events_del = [{'event': 'del_link', 'name': nic}]
+            events_add_ipv4 = [
+                {'event': 'new_addr', 'address': address + '/' + cidr}
+            ]
+            events_add_ipv6 = [{'event': 'new_addr', 'family': 'inet6'}]
+            events_del_ipv4 = [
                 {'address': address + '/' + cidr, 'event': 'del_addr'},
                 {'destination': address, 'event': 'del_route'},
-                {'event': 'del_link', 'name': nic},
             ]
-            events_ipv6 = [
-                {'event': 'new_addr', 'family': 'inet6'},
-                {'event': 'del_addr', 'family': 'inet6'},
-            ]
+            events_del_ipv6 = [{'event': 'del_addr', 'family': 'inet6'}]
             if is_disabled_ipv6():
-                return deque(events_add + events_del)
+                return deque(
+                    events_add + events_add_ipv4 + events_del_ipv4 + events_del
+                )
             else:
-                return deque(events_add + events_ipv6 + events_del)
+                return deque(
+                    events_add
+                    + events_add_ipv6
+                    + events_add_ipv4
+                    + events_del_ipv6
+                    + events_del_ipv4
+                    + events_del
+                )
 
-        with monitor.Monitor(timeout=self.TIMEOUT, silent_timeout=True) as mon:
-            dummy = Dummy()
-            dummy_name = dummy.create()
-            dummy.set_ip(IP_ADDRESS, IP_CIDR)
-            dummy.up()
-            dummy.remove()
+        with monitor.object_monitor(
+            timeout=self.TIMEOUT, silent_timeout=True
+        ) as mon:
+            with dummy_device() as dummy:
+                dummy_name = dummy
+                Interface.from_existing_dev_name(dummy).add_ip(
+                    IP_ADDRESS, IP_CIDR, IpFamily.IPv4
+                )
 
             expected_events = _expected_events(dummy_name, IP_ADDRESS, IP_CIDR)
             _expected = list(expected_events)
@@ -194,7 +227,7 @@ class TestNetlinkEventMonitor(object):
     def test_timeout(self):
         with pytest.raises(monitor.MonitorError):
             try:
-                with monitor.Monitor(timeout=0.01) as mon:
+                with monitor.object_monitor(timeout=0.01) as mon:
                     for event in mon:
                         pass
             except monitor.MonitorError as e:
@@ -204,7 +237,7 @@ class TestNetlinkEventMonitor(object):
         assert mon.is_stopped()
 
     def test_timeout_silent(self):
-        with monitor.Monitor(timeout=0.01, silent_timeout=True) as mon:
+        with monitor.object_monitor(timeout=0.01, silent_timeout=True) as mon:
             for event in mon:
                 pass
 
@@ -212,10 +245,9 @@ class TestNetlinkEventMonitor(object):
 
     def test_timeout_not_triggered(self):
         time_start = monotonic_time()
-        with monitor.Monitor(timeout=self.TIMEOUT) as mon:
-            dummy = Dummy()
-            dummy.create()
-            dummy.remove()
+        with monitor.object_monitor(timeout=self.TIMEOUT) as mon:
+            with dummy_device():
+                pass
 
             for event in mon:
                 break
@@ -225,8 +257,20 @@ class TestNetlinkEventMonitor(object):
 
     def test_passing_invalid_groups(self):
         with pytest.raises(AttributeError):
-            monitor.Monitor(groups=('blablabla',))
-        monitor.Monitor(groups=('link',))
+            monitor.object_monitor(groups=('blablabla',))
+        monitor.object_monitor(groups=('link',))
+
+    def test_ifla_event(self, bond_in_mode_1, slaves):
+        bond = bond_in_mode_1
+        slaves = iter(slaves)
+        bond.set_options({'active_slave': next(slaves)})
+        with monitor.ifla_monitor(
+            timeout=self.TIMEOUT, groups=('link',)
+        ) as mon:
+            bond.set_options({'active_slave': next(slaves)})
+            for event in mon:
+                if event.get('IFLA_EVENT') == 'IFLA_EVENT_BONDING_FAILOVER':
+                    break
 
 
 class TestSocketPool(object):

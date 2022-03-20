@@ -22,12 +22,9 @@
 from __future__ import absolute_import
 from __future__ import division
 
-import os
-import uuid
 
-from vdsm import constants
 from vdsm.common import conv
-from vdsm.common import supervdsm
+from vdsm.common import hostdev
 from vdsm.common import validate
 from vdsm.common.hostdev import get_device_params, detach_detachable, \
     pci_address_to_name, reattach_detachable, NoIOMMUSupportException
@@ -39,11 +36,11 @@ from . import compat
 from . import core
 from . import hwclass
 
-VHOST_SOCK_DIR = os.path.join(constants.P_VDSM_RUN, 'vhostuser')
-
 METADATA_KEYS = ('network',)
 
 METADATA_NESTED_KEYS = ('custom', 'portMirroring')
+
+PCI_LINK_UP_TIMEOUT = 5
 
 
 class UnsupportedAddress(Exception):
@@ -58,15 +55,23 @@ class Interface(core.Base):
     __slots__ = ('nicModel', 'macAddr', 'network', 'bootOrder', 'address',
                  'linkActive', 'portMirroring', 'filter', 'filterParameters',
                  'sndbufParam', 'driver', 'name', 'vlanId', 'hostdev', 'mtu',
-                 'numa_node', '_device_params', 'vm_custom', '_is_vhostuser')
+                 'numa_node', '_device_params', 'vm_custom', 'port_isolated',
+                 'teaming')
 
     @classmethod
     def get_identifying_attrs(cls, dev_elem):
-        return core.get_xml_elem(dev_elem, 'mac_address', 'mac', 'address')
+        attrs = {'mac_address': vmxml.find_attr(dev_elem, 'mac', 'address')}
+        teaming = vmxml.find_first(dev_elem, 'teaming', None)
+        if teaming is not None:
+            attrs['alias'] = core.find_device_alias(dev_elem)
+
+        return attrs
 
     def get_metadata(self, dev_class):
         # dev_class unused
         attrs = {'mac_address': self.macAddr}
+        if self.teaming:
+            attrs['alias'] = self.alias
         data = core.get_metadata_values(self)
         core.update_metadata_from_object(
             data, self, METADATA_KEYS + METADATA_NESTED_KEYS)
@@ -102,6 +107,9 @@ class Interface(core.Base):
         mtu = vmxml.find_first(dev, "mtu", None)
         if mtu is not None:
             params['mtu'] = int(vmxml.attr(mtu, 'size'))
+        port = vmxml.find_first(dev, 'port', None)
+        if port is not None:
+            params['port_isolated'] = vmxml.attr(port, 'isolated')
         filterref = vmxml.find_first(dev, 'filterref', None)
         if filterref is not None:
             params['filter'] = vmxml.attr(filterref, 'filter')
@@ -117,6 +125,9 @@ class Interface(core.Base):
             params['custom'].update(
                 core.parse_device_attrs(driver, ('queues',))
             )
+        teaming = vmxml.find_first(dev, 'teaming', None)
+        if teaming is not None:
+            params['teaming'] = True
         sndbuf = dev.find('./tune/sndbuf')
         if sndbuf is not None:
             params['vm_custom']['sndbuf'] = vmxml.text(sndbuf)
@@ -147,10 +158,13 @@ class Interface(core.Base):
             elif attr == 'network' and value == '':
                 kwargs[attr] = net_api.DUMMY_BRIDGE
         self.portMirroring = []
+        self.filter = None
         self.filterParameters = []
         self.vm_custom = {}
         self.linkActive = True
         self.mtu = None
+        self.port_isolated = None
+        self.teaming = False
         super(Interface, self).__init__(log, **kwargs)
         self.sndbufParam = False
         self.is_hostdevice = self.device == hwclass.HOSTDEV
@@ -159,7 +173,6 @@ class Interface(core.Base):
         if self.is_hostdevice:
             self._device_params = get_device_params(self.hostdev)
             self.numa_node = self._device_params.get('numa_node', None)
-        self._is_vhostuser = False
 
     def _customize(self):
         # Customize network device
@@ -237,19 +250,8 @@ class Interface(core.Base):
           [<alias name="ua-2b418ef2-91d8-4479-88b1-98461192a54e/>]
          </interface>
 
-         -- In case of an ovs dpdk bridge --
-
-        <interface type="vhostuser">
-          <address bus="0x00" domain="0x0000" slot="0x04" type="pci"/>
-          <mac address="00:1a:4a:16:01:54"/>
-          <model type="virtio"/>
-          <source mode="server" path='socket path' type="unix"/>
-        </interface>
-
-
         """
-        devtype = 'vhostuser' if self._is_vhostuser else self.device
-        iface = self.createXmlElem('interface', devtype, ['address'])
+        iface = self.createXmlElem('interface', self.device, ['address'])
         iface.appendChildWithArgs('mac', address=self.macAddr)
 
         if hasattr(self, 'nicModel'):
@@ -269,21 +271,17 @@ class Interface(core.Base):
                 vlan = iface.appendChildWithArgs('vlan')
                 vlan.appendChildWithArgs('tag', id=str(self.vlanId))
         else:
-            ovs_bridge = supervdsm.getProxy().ovs_bridge(self.network)
-            if ovs_bridge:
-                if ovs_bridge['dpdk_enabled']:
-                    self._source_ovsdpdk_bridge(iface, ovs_bridge['name'])
-                else:
-                    self._source_ovs_bridge(iface, ovs_bridge['name'])
-            else:
-                iface.appendChildWithArgs('source', bridge=self.network)
+            iface.appendChildWithArgs('source', bridge=self.network)
 
         if self.mtu is not None:
             iface.appendChildWithArgs('mtu', size=str(self.mtu))
 
-        if hasattr(self, 'filter'):
+        if self.port_isolated is not None:
+            iface.appendChildWithArgs('port', isolated=str(self.port_isolated))
+
+        if self.filter is not None:
             filter = iface.appendChildWithArgs('filterref', filter=self.filter)
-            self._set_parameters_filter(filter)
+            _set_parameters_filter(filter, self.filterParameters)
 
         if hasattr(self, 'linkActive'):
             iface.appendChildWithArgs('link', state='up'
@@ -309,29 +307,6 @@ class Interface(core.Base):
             iface.appendChildWithArgs('alias', name=self.alias)
 
         return iface
-
-    def _source_ovs_bridge(self, iface, ovs_bridge):
-        iface.appendChildWithArgs('source', bridge=ovs_bridge)
-        iface.appendChildWithArgs('virtualport', type='openvswitch')
-        vlan_tag = net_api.net2vlan(self.network)
-        if vlan_tag:
-            vlan = iface.appendChildWithArgs('vlan')
-            vlan.appendChildWithArgs('tag', id=str(vlan_tag))
-
-    def _source_ovsdpdk_bridge(self, iface, ovs_bridge):
-        socket_path = os.path.join(
-            VHOST_SOCK_DIR, self._get_vhostuser_port_name())
-        iface.appendChildWithArgs(
-            'source', type='unix', path=socket_path, mode='server')
-
-    def _create_vhost_port(self, ovs_bridge):
-        port = self._get_vhostuser_port_name()
-        socket_path = os.path.join(VHOST_SOCK_DIR, port)
-        supervdsm.getProxy().add_ovs_vhostuser_port(
-            ovs_bridge, port, socket_path)
-
-    def _get_vhostuser_port_name(self):
-        return str(uuid.uuid3(uuid.UUID(self.vmid), self.macAddr))
 
     def _set_parameters_filter(self, filter):
         for name, value in self._filter_parameter_map():
@@ -364,34 +339,22 @@ class Interface(core.Base):
         if self.is_hostdevice:
             self.log.info('Detaching device %s from the host.' % self.hostdev)
             detach_detachable(self.hostdev)
-        else:
-            bridge_info = supervdsm.getProxy().ovs_bridge(self.network)
-            if bridge_info and bridge_info['dpdk_enabled']:
-                self._is_vhostuser = True
-                self._create_vhost_port(bridge_info['name'])
 
     def teardown(self):
         if self.is_hostdevice:
             self.log.info('Reattaching device %s to host.' % self.hostdev)
             try:
-                # TODO: avoid reattach when Engine can tell free VFs otherwise
-                reattach_detachable(self.hostdev)
+                pci_path = hostdev.name_to_pci_path(self.hostdev)
+                with net_api.wait_for_pci_link_up(
+                    pci_path, PCI_LINK_UP_TIMEOUT
+                ):
+                    # TODO: avoid reattach when Engine can tell free VFs
+                    # otherwise
+                    reattach_detachable(self.hostdev)
             except NoIOMMUSupportException:
                 self.log.exception('Could not reattach device %s back to host '
                                    'due to missing IOMMU support.',
                                    self.hostdev)
-
-        if self._is_vhostuser:
-            bridge_info = supervdsm.getProxy().ovs_bridge(self.network)
-            if bridge_info:
-                port = self._get_vhostuser_port_name()
-                supervdsm.getProxy().remove_ovs_port(bridge_info['name'], port)
-
-    def recover(self):
-        if self.network:
-            bridge_info = supervdsm.getProxy().ovs_bridge(self.network)
-            if bridge_info and bridge_info['dpdk_enabled']:
-                self._is_vhostuser = True
 
     @property
     def _xpath(self):
@@ -440,13 +403,18 @@ class Interface(core.Base):
                         vmxml.attr(source, 'network'))
 
             address = core.find_device_guest_address(x)
+            teaming = vmxml.find_first(x, 'teaming', None) is not None
 
             for nic in device_conf:
-                if nic.macAddr.lower() == mac.lower():
+                if (
+                    nic.macAddr.lower() == mac.lower()
+                    and (not teaming or nic.alias == alias)
+                ):
                     nic.name = name
                     nic.alias = alias
                     nic.address = address
                     nic.linkActive = linkActive
+                    nic.teaming = teaming
                     if driver:
                         # If a driver was reported, pass it back to libvirt.
                         # Engine (vm's conf) is not interested in this value.
@@ -454,12 +422,16 @@ class Interface(core.Base):
             # Update vm's conf with address for known nic devices
             knownDev = False
             for dev in vm.conf['devices']:
-                if (dev['type'] == hwclass.NIC and
-                        dev['macAddr'].lower() == mac.lower()):
+                if (
+                    dev['type'] == hwclass.NIC
+                    and dev['macAddr'].lower() == mac.lower()
+                    and (not teaming or dev['alias'] == alias)
+                ):
                     dev['address'] = address
                     dev['alias'] = alias
                     dev['name'] = name
                     dev['linkActive'] = linkActive
+                    dev['teaming'] = teaming
                     knownDev = True
             # Add unknown nic device to vm's conf
             if not knownDev:
@@ -470,7 +442,8 @@ class Interface(core.Base):
                           'address': address,
                           'alias': alias,
                           'name': name,
-                          'linkActive': linkActive}
+                          'linkActive': linkActive,
+                          'teaming': teaming}
                 if network:
                     nicDev['network'] = network
                 vm.conf['devices'].append(nicDev)
@@ -500,7 +473,28 @@ class Interface(core.Base):
             params['linkActive'] = False
         if self.mtu is not None:
             params['mtu'] = self.mtu
+        if self.port_isolated is not None:
+            params['port_isolated'] = self.port_isolated
+        if self.filter is not None:
+            params['filter'] = self.filter
+            params['filterParameters'] = self.filterParameters
         return params
+
+
+def update_port_xml(vnicXML, port_isolated):
+    if port_isolated is None:
+        try:
+            port = vmxml.find_first(vnicXML, 'port')
+        except vmxml.NotFound:
+            pass
+        else:
+            vnicXML.remove(port)
+    else:
+        try:
+            port = vmxml.find_first(vnicXML, 'port')
+        except vmxml.NotFound:
+            port = vnicXML.appendChildWithArgs('port')
+        vmxml.set_attr(port, 'isolated', str(port_isolated))
 
 
 def update_bandwidth_xml(iface, vnicXML, specParams=None):
@@ -511,6 +505,30 @@ def update_bandwidth_xml(iface, vnicXML, specParams=None):
         if oldBandwidth is not None:
             vmxml.remove_child(vnicXML, oldBandwidth)
         vmxml.append_child(vnicXML, newBandwidth)
+
+
+def update_filterref_xml(vnicXML, filterType, filterParameters):
+    try:
+        filterXML = vmxml.find_first(vnicXML, 'filterref')
+    except vmxml.NotFound:
+        pass
+    else:
+        vnicXML.remove(filterXML)
+
+    if filterType:
+        filterXML = vnicXML.appendChildWithArgs('filterref', filter=filterType)
+        _set_parameters_filter(filterXML, filterParameters)
+
+
+def _set_parameters_filter(filter, filterParameters):
+    for name, value in _filter_parameter_map(filterParameters):
+        filter.appendChildWithArgs('parameter', name=name, value=value)
+
+
+def _filter_parameter_map(filterParameters):
+    for parameter in filterParameters:
+        if 'name' in parameter and 'value' in parameter:
+            yield parameter['name'], parameter['value']
 
 
 def _update_port_mirroring(params, meta):

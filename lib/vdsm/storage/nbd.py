@@ -27,10 +27,12 @@ from __future__ import division
 
 import collections
 import errno
+import json
 import logging
 import os
 import time
 
+from vdsm.common import cmdutils
 from vdsm.common import constants
 from vdsm.common import properties
 from vdsm.common import supervdsm
@@ -42,10 +44,16 @@ from vdsm.common.time import monotonic_time
 from . import constants as sc
 from . import exception as se
 from . import fileUtils
+from . import qemuimg
+from . import transientdisk
 from . sdc import sdCache
 
-QEMU_NBD = "/usr/bin/qemu-nbd"
+DEFAULT_SOCKET_MODE = 0o660
 RUN_DIR = os.path.join(constants.P_VDSM_RUN, "nbd")
+OVERLAY = "overlay"
+
+QEMU_NBD = cmdutils.CommandPath(
+    "qemu-nbd", "/usr/local/bin/qemu-nbd", "/usr/bin/qemu-nbd")
 
 log = logging.getLogger("storage.nbd")
 
@@ -69,6 +77,9 @@ class ServerConfig(properties.Owner):
     vol_id = properties.UUID(required=True)
     readonly = properties.Boolean(default=False)
     discard = properties.Boolean(default=False)
+    detect_zeroes = properties.Boolean(default=False)
+    backing_chain = properties.Boolean(default=True)
+    bitmap = properties.UUID()
 
     def __init__(self, config):
         self.sd_id = config.get("sd_id")
@@ -76,10 +87,28 @@ class ServerConfig(properties.Owner):
         self.vol_id = config.get("vol_id")
         self.readonly = config.get("readonly")
         self.discard = config.get("discard")
+        self.detect_zeroes = config.get("detect_zeroes")
+
+        # Setting to None overrides the default value.
+        # See https://bugzilla.redhat.com/1892403
+        self.backing_chain = config.get("backing_chain", True)
+
+        self.bitmap = config.get("bitmap")
+
+        if not self.backing_chain and self.bitmap:
+            # When exporting a bitmap we always export the entire chain.
+            raise se.UnsupportedOperation(
+                "Cannot export bitmap with backing_chain=False")
+
+        if self.bitmap and not self.readonly:
+            # Exporting bitmaps makes sense only for incremental backup.
+            raise se.UnsupportedOperation(
+                "Cannot export bitmap for writing")
 
 
 QemuNBDConfig = collections.namedtuple(
-    "QemuNBDConfig", "format,readonly,discard,path")
+    "QemuNBDConfig",
+    "format,readonly,discard,detect_zeroes,path,backing_chain,is_block,bitmap")
 
 
 def start_server(server_id, config):
@@ -90,25 +119,64 @@ def start_server(server_id, config):
     if vol.isShared() and not cfg.readonly:
         raise se.SharedVolumeNonWritable(vol)
 
+    if cfg.bitmap:
+        if vol.getFormat() != sc.COW_FORMAT:
+            raise se.UnsupportedOperation(
+                "Cannot export bitmap from RAW volume")
+
+        # The bitmap must exist in the volume, and may exist in the
+        # backing chain.
+        bitmap_chain = _find_bitmap(vol.volumePath, cfg.bitmap)
+        if not bitmap_chain:
+            raise se.BitmapDoesNotExist(
+                reason=f"Bitmap does not exist in {vol.volumePath}",
+                bitmap=cfg.bitmap)
+
     _create_rundir()
 
-    sock = _socket_path(server_id)
+    # If the bitmap exists in the volume backing chain, we need to
+    # create an overlay exporting the bitmap from the entire chain.
+    using_overlay = cfg.bitmap and len(bitmap_chain) > 1
 
-    log.info("Starting transient service %s, serving volume %s/%s via unix "
-             "socket %s",
-             _service_name(server_id), cfg.sd_id, cfg.vol_id, sock)
+    if using_overlay:
+        path = _create_overlay(
+            server_id, vol.volumePath, cfg.bitmap, bitmap_chain)
+        format = "qcow2"
+        is_block = False
+    else:
+        path = vol.volumePath
+        format = sc.fmt2str(vol.getFormat())
+        is_block = vol.is_block()
+    try:
+        sock = _socket_path(server_id)
 
-    qemu_nbd_config = QemuNBDConfig(
-        format=sc.fmt2str(vol.getFormat()),
-        readonly=cfg.readonly,
-        discard=cfg.discard,
-        path=vol.getVolumePath())
+        log.info(
+            "Starting transient service %s, serving %s via unix socket %s",
+            _service_name(server_id), path, sock)
 
-    start_transient_service(server_id, qemu_nbd_config)
+        qemu_nbd_config = QemuNBDConfig(
+            format=format,
+            readonly=cfg.readonly,
+            discard=cfg.discard,
+            detect_zeroes=cfg.detect_zeroes,
+            path=path,
+            backing_chain=cfg.backing_chain,
+            is_block=is_block,
+            bitmap=cfg.bitmap)
 
-    if not _wait_for_socket(sock, 1.0):
-        raise Timeout("Timeout starting NBD server {}: {}"
-                      .format(server_id, config))
+        start_transient_service(server_id, qemu_nbd_config)
+
+        if not _wait_for_socket(sock, 10.0):
+            raise Timeout("Timeout starting NBD server {}: {}"
+                          .format(server_id, config))
+    finally:
+        if using_overlay:
+            # When qemu-nbd is ready it has an open file descriptor, and it
+            # does not need the overlay. Removing the overlay now simplifies
+            # cleanup when stopping the service.
+            _remove_overlay(server_id)
+
+    os.chmod(sock, DEFAULT_SOCKET_MODE)
     unix_address = nbdutils.UnixAddress(sock)
     return unix_address.url()
 
@@ -130,6 +198,241 @@ def stop_server(server_id):
     systemctl.stop(service)
 
 
+def _create_overlay(server_id, backing, bitmap, bitmap_chain):
+    """
+    To export bitmaps from entire chain, we need to create an overlay, and
+    merge all bitmaps from the chain into the overlay.
+    """
+    overlay = transientdisk.create_disk(
+        server_id,
+        OVERLAY,
+        backing=backing,
+        backing_format="qcow2")["path"]
+    try:
+        # Merge bitmap from filenames into overlay.
+        qemuimg.bitmap_add(overlay, bitmap).run()
+        for src_img in bitmap_chain:
+            qemuimg.bitmap_merge(
+                src_img, bitmap, "qcow2", overlay, bitmap).run()
+    except:
+        try:
+            transientdisk.remove_disk(server_id, OVERLAY)
+        except Exception:
+            log.exception("Error removing overlay: %s", overlay)
+        raise
+
+    return overlay
+
+
+def _remove_overlay(server_id):
+    """
+    Remove the overlay created by _create_overlay().
+    """
+    transientdisk.remove_disk(server_id, OVERLAY)
+
+
+def _find_bitmap(path, bitmap):
+    """
+    Return filenames in backing chain containing bitmap.
+
+    An example of normal case. "bitmap1" was create after we took a snapshot
+    and added "/file2". Then we took another snapshot and added /file3".
+
+    [
+      {
+        "filename": "/file3"
+        "bitmaps":
+          [
+             {
+               "name": "bitmap1",
+               "flags": ["auto"]
+             }
+          ]
+      },
+      {
+        "filename": "/file2"
+        "bitmaps":
+          [
+             {
+               "name": "bitmap1",
+               "flags": ["auto"]
+             }
+          ]
+      },
+      {
+        "filename": "/file1"
+      }
+    ]
+
+    In this case we return the filenames:
+
+      ["/file3", "/file2"]
+
+    The caller can merge the contents of "bitmap1" from these files to create a
+    new bitmap referencing all the data written to the disk since "bitmap1" was
+    created.
+
+    We have several cases when the bitmap chain is invalid, and cannot be used
+    to create incremental backup.
+
+    Case 1: The bitmap is inconsistent ("in-use" flag) in one of the nodes.
+    We cannot trust the data in this bitmap.
+
+    [
+      {
+        "filename": "/file2"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": ["in-use", "auto"]
+            }
+          ]
+      },
+      {
+        "filename": "/file1"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": ["auto"]
+            }
+          ]
+      }
+    ]
+
+    Case 2: The bitmap is disabled (no "auto" flag) on one of the nodes. This
+    bitmap may be missing data added while the bitmap was disabled.
+
+    [
+      {
+        "filename": "/file2"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": ["auto"]
+            }
+          ]
+      },
+      {
+        "filename": "/file1"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": []
+            }
+          ]
+      }
+    ]
+
+    Case 3: The bitmap is missing in in one node, but exists on the next node.
+    Data from the node may be missing from the backup.
+
+    Here the bitmap is missing in the top node:
+
+    [
+      {
+        "filename": "/file2"
+      },
+      {
+        "filename": "/file1"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": ["auto"]
+            }
+          ]
+      }
+    ]
+
+    Here the bitmap is missing in the middle node:
+
+    [
+      {
+        "filename": "/file3"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": ["auto"]
+            }
+          ]
+      },
+      {
+        "filename": "/file2"
+      },
+      {
+        "filename": "/file1"
+        "bitmaps":
+          [
+            {
+              "name": "bitmap1",
+              "flags": ["auto"]
+            }
+          ]
+      }
+    ]
+
+    Case 4: Bitmap does not exist on any node. This is a caller error, or maybe
+    someone deleted the bitmaps manually from the chain.
+
+    [
+      {
+        "filename": "/file2"
+      },
+      {
+        "filename": "/file1"
+      }
+    ]
+
+    Raises se.InvalidBitmapChain if bitmap is invalid or missing in one of the
+    backing chain nodes.
+    """
+    filenames = []
+    missing = []
+
+    for node in qemuimg.info(path, format="qcow2", backing_chain=True):
+        if node["format"] != "qcow2":
+            break
+
+        node_bitmaps = node["format-specific"]["data"].get("bitmaps", [])
+
+        for bitmap_info in node_bitmaps:
+            if bitmap_info["name"] != bitmap:
+                continue
+
+            if "in-use" in bitmap_info["flags"]:
+                raise se.InvalidBitmapChain(
+                    reason="Bitmap in use",
+                    bitmap=bitmap_info,
+                    filename=node["filename"])
+
+            if "auto" not in bitmap_info["flags"]:
+                raise se.InvalidBitmapChain(
+                    reason="Bitmap is disabled",
+                    bitmap=bitmap_info,
+                    filename=node["filename"])
+
+            if missing:
+                # This bitmap was not found in previous nodes - a hole.
+                raise se.InvalidBitmapChain(
+                    reason="Bitmap is missing in {}".format(missing),
+                    bitmap=bitmap)
+
+            # Found a valid bitmap in this node.
+            filenames.append(node["filename"])
+            break
+        else:
+            # Bitmap is not in this node. Continue to search next nodes to
+            # detect holes.
+            missing.append(node["filename"])
+
+    return filenames
+
+
 def start_transient_service(server_id, config):
     if os.geteuid() != 0:
         return supervdsm.getProxy().nbd_start_transient_service(
@@ -138,10 +441,15 @@ def start_transient_service(server_id, config):
     _verify_path(config.path)
 
     cmd = [
-        QEMU_NBD,
+        str(QEMU_NBD),
         "--socket", _socket_path(server_id),
-        "--format", config.format,
         "--persistent",
+
+        # Allow up to 8 clients to share the device. Safe for readers, but for
+        # now, consistency is not guaranteed between multiple writers.  Eric
+        # Blake says it should be safe if clients write to distinct areas.
+        # https://patchwork.kernel.org/patch/11096321/
+        "--shared=8",
 
         # Use empty export name for nicer url: "nbd:unix:/path" instead of
         # "nbd:unix:/path:exportname=name".
@@ -151,12 +459,31 @@ def start_transient_service(server_id, config):
         "--aio=native",
     ]
 
+    if config.format != "raw":
+        # Enable detection of unallocated extents in qcow2 images. Required for
+        # downloading single volume with backing_chain=False. Always enable it
+        # so NBD client can inspect image allocation.
+        # For raw images allocation depth is not useful, and also triggers a
+        # bug in qemu-nbd 6.2 breaking extents reporting in some cases.
+        # See https://bugzilla.redhat.com/2041480.
+        cmd.append("--allocation-depth")
+
     if config.readonly:
         cmd.append("--read-only")
-    elif config.discard:
-        cmd.append("--discard=unmap")
+    else:
+        if config.discard:
+            cmd.append("--discard=unmap")
 
-    cmd.append(config.path)
+        if config.detect_zeroes:
+            # "on" convert zero write to fallocate(WRITE_ZEROES).
+            # "unmap" convert zero write to fallocate(PUNCH_HOLE).
+            detect_mode = "unmap" if config.discard else "on"
+            cmd.append("--detect-zeroes={}".format(detect_mode))
+
+    if config.bitmap:
+        cmd.append("--bitmap={}".format(config.bitmap))
+
+    cmd.append(json_uri(config))
 
     systemd.run(
         cmd,
@@ -165,14 +492,33 @@ def start_transient_service(server_id, config):
         gid=fileUtils.resolveGid(constants.VDSM_GROUP))
 
 
+def json_uri(config):
+    image = {
+        "driver": config.format,
+        "file": {
+            "driver": "host_device" if config.is_block else "file",
+            "filename": config.path,
+        }
+    }
+
+    if config.format == "qcow2" and not config.backing_chain:
+        image["backing"] = None
+
+    return "json:" + json.dumps(image)
+
+
 def _verify_path(path):
     """
     Anyone running as vdsm can invoke nbd_start_transient_service() with
-    arbitrary path. Verify the path is in the storage repository.
+    arbitrary path. Verify the path is in the storage repository, or path is a
+    transient disk with a backing file in the storage repository.
     """
-    norm_path = os.path.normpath(path)
+    path = os.path.normpath(path)
 
-    if not norm_path.startswith(sc.REPO_MOUNT_DIR):
+    if path.startswith(transientdisk.P_TRANSIENT_DISKS):
+        path = qemuimg.info(path, format="qcow2")["backing-filename"]
+
+    if not path.startswith(sc.REPO_MOUNT_DIR):
         raise InvalidPath(
             "Path {!r} is outside storage repository {!r}"
             .format(path, sc.REPO_MOUNT_DIR))

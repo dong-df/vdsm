@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2019 Red Hat, Inc.
+# Copyright 2008-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,11 +22,13 @@ from __future__ import absolute_import
 from __future__ import division
 
 # stdlib imports
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from contextlib import contextmanager
 import json
 import logging
 import os
+import base64
+import math
 import tempfile
 import threading
 import time
@@ -35,18 +37,37 @@ import xml.etree.ElementTree as ET
 
 # 3rd party libs imports
 import libvirt
+#
+# As [1] says:
+#
+#   Libvirt does not guarantee any support of direct use of the guest agent. If
+#   you don't mind using libvirt-qemu.so, you can use the
+#   virDomainQemuAgentCommand API (exposed by virsh qemu-agent-command); but be
+#   aware that this is unsupported, and any changes you make to the agent that
+#   change state behind libvirt's back may cause libvirt to misbehave.
+#
+# So let's be careful and use the interface only to gather information and not
+# to change state of the guest.
+#
+# [1] https://wiki.libvirt.org/page/Qemu_guest_agent
+import libvirt_qemu
 import six
 
 # vdsm imports
+from vdsm import taskset
 from vdsm.common import api
 from vdsm.common import cpuarch
 from vdsm.common import exception
 from vdsm.common import libvirtconnection
 from vdsm.common import logutils
+from vdsm.common import password
 from vdsm.common import response
 import vdsm.common.time
-from vdsm import constants
+import vdsm.virt.jobs
+from vdsm.virt.livemerge import DriveMerger
 from vdsm import hugepages
+from vdsm import jobs
+from vdsm import numa
 from vdsm import utils
 from vdsm.config import config
 from vdsm.common import concurrent
@@ -54,27 +75,27 @@ from vdsm.common import conv
 from vdsm.common import hooks
 from vdsm.common import supervdsm
 from vdsm.common import xmlutils
-from vdsm.common.compat import pickle
-from vdsm.common.define import ERROR, NORMAL, doneCode, errCode
+from vdsm.common.define import ERROR, NORMAL, doneCode
 from vdsm.common.hostutils import host_in_shutdown
-from vdsm.common.logutils import SimpleLogAdapter, volume_chain_to_str
+from vdsm.common.logutils import SimpleLogAdapter, Suppressed
 from vdsm.network import api as net_api
 
 # TODO: remove these imports, code using this should use storage apis.
-from vdsm.storage import outOfProcess as oop
 from vdsm.storage import qemuimg
-from vdsm.storage import sd
 from vdsm.storage import sdc
 
 from vdsm.virt import backup
+from vdsm.virt import blockjob
+from vdsm.virt import cpumanagement
 from vdsm.virt import domxml_preprocess
-from vdsm.virt import drivemonitor
+from vdsm.virt import errors
 from vdsm.virt import guestagent
 from vdsm.virt import libvirtxml
 from vdsm.virt import metadata
 from vdsm.virt import migration
 from vdsm.virt import sampling
 from vdsm.virt import saslpasswd2
+from vdsm.virt import thinp
 from vdsm.virt import vmchannels
 from vdsm.virt import vmexitreason
 from vdsm.virt import virdomain
@@ -85,6 +106,9 @@ from vdsm.virt import vmxml
 from vdsm.virt import xmlconstants
 from vdsm.virt.domain_descriptor import DomainDescriptor
 from vdsm.virt.domain_descriptor import MutableDomainDescriptor
+from vdsm.virt.domain_descriptor import XmlSource
+from vdsm.virt.jobs import snapshot
+from vdsm.virt.externaldata import ExternalData, ExternalDataKind
 from vdsm.virt import vmdevices
 from vdsm.virt.vmdevices import drivename
 from vdsm.virt.vmdevices import lookup
@@ -92,15 +116,15 @@ from vdsm.virt.vmdevices import hwclass
 from vdsm.virt.vmdevices import storagexml
 from vdsm.virt.vmdevices.common import get_metadata
 from vdsm.virt.vmdevices.common import identify_from_xml_elem
-from vdsm.virt.vmdevices.storage import DISK_TYPE, VolumeNotFound
-from vdsm.virt.vmdevices.storage import BLOCK_THRESHOLD
+from vdsm.virt.vmdevices.storage import DISK_TYPE
 from vdsm.virt.vmdevices.storagexml import change_disk
 from vdsm.virt.vmpowerdown import VmShutdown, VmReboot
 from vdsm.virt.utils import isVdsmImage, cleanup_guest_socket
 from vdsm.virt.utils import extract_cluster_version
 from vdsm.virt.utils import TimedAcquireLock
+from vdsm.virt.utils import vm_kill_paused_timeout
+from vdsm.virt.utils import VolumeSize
 from six.moves import range
-from six.moves import zip
 
 
 # A libvirt constant for undefined cpu quota
@@ -117,20 +141,6 @@ class VolumeError(RuntimeError):
 
 class DoubleDownError(RuntimeError):
     pass
-
-
-class BlockJobExistsError(Exception):
-    pass
-
-
-class BlockCopyActiveError(Exception):
-    msg = "Block copy job {self.job_id} is not ready for commit"
-
-    def __init__(self, job_id):
-        self.job_id = job_id
-
-    def __str__(self):
-        return self.msg.format(self=self)
 
 
 VALID_STATES = (vmstatus.DOWN, vmstatus.MIGRATION_DESTINATION,
@@ -174,6 +184,11 @@ def _not_migrating(vm, *args, **kwargs):
         raise exception.MigrationInProgress(vmId=vm.id)
 
 
+def _not_paused_on_io_error(vm, *args, **kwargs):
+    if vm.lastStatus == vmstatus.PAUSED and vm.pause_code == 'EIO':
+        raise MigrationError("VM paused due to I/O error cannot migrate")
+
+
 def eventToString(event):
     try:
         return _EVENT_STRINGS[event]
@@ -189,15 +204,7 @@ class UpdatePortMirroringError(Exception):
     pass
 
 
-VolumeSize = namedtuple("VolumeSize",
-                        ["apparentsize", "truesize"])
-
-
 class MigrationError(Exception):
-    pass
-
-
-class StorageUnavailableError(Exception):
     pass
 
 
@@ -259,6 +266,22 @@ class _AlteredState(object):
     __nonzero__ = __bool__
 
 
+def _undefine_vm_flags():
+    flags = libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
+
+    # If incremental backup is supported by libvirt we should add
+    # VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA flag to make sure
+    # all checkpoint metadata will be removed also. If the VM doesn't
+    # have any backups with checkpoint this flag shouldn't have
+    # any effect.
+    #
+    # TODO: Remove check when we require libvirt 6.0 on all distros.
+    if hasattr(libvirt, "VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA"):
+        flags |= libvirt.VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA
+
+    return flags
+
+
 def _undefine_stale_domain(vm, connection):
     doms_to_remove = []
     try:
@@ -279,7 +302,8 @@ def _undefine_stale_domain(vm, connection):
         try:
             state, reason = dom.state(0)
             if state in vmstatus.LIBVIRT_DOWN_STATES:
-                dom.undefineFlags(libvirt.VIR_DOMAIN_UNDEFINE_NVRAM)
+                flags = _undefine_vm_flags()
+                dom.undefineFlags(flags)
                 vm.log.debug("Stale domain removed: %s", (vm.id,))
             else:
                 raise exception.VMExists("VM %s is already running: %s" %
@@ -303,10 +327,10 @@ class Vm(object):
     _ongoingCreations = threading.BoundedSemaphore(4)
 
     def _makeChannelPath(self, device_name):
-        for name, path in self._domain.all_channels():
+        for name, path, _ in self._domain.all_channels():
             if name == device_name:
                 return path
-        return constants.P_LIBVIRT_VMCHANNELS + self.id + '.' + device_name
+        return None
 
     def __init__(self, cif, params, recover=False):
         """
@@ -341,16 +365,20 @@ class Vm(object):
         self.arch = cpuarch.effective()
         self._src_domain_xml = params.get('_srcDomXML')
         if self._src_domain_xml is not None:
-            self._domain = DomainDescriptor(self._src_domain_xml)
+            self._domain = DomainDescriptor(
+                self._src_domain_xml, xml_source=XmlSource.MIGRATION_SOURCE)
         else:
-            self._domain = DomainDescriptor(params['xml'])
+            self._domain = DomainDescriptor(
+                params['xml'], xml_source=XmlSource.INITIAL)
         self.id = self._domain.id
         if self._src_domain_xml is not None:
             if self._altered_state.from_snapshot:
                 self._src_domain_xml = \
                     self._correct_disk_volumes_from_xml(
                         self._src_domain_xml, params['xml'])
-                self._domain = DomainDescriptor(self._src_domain_xml)
+                self._domain = DomainDescriptor(
+                    self._src_domain_xml,
+                    xml_source=XmlSource.MIGRATION_SOURCE)
             self.conf['xml'] = self._src_domain_xml
         self.log = SimpleLogAdapter(self.log, {"vmId": self.id})
         self._dom = virdomain.Disconnected(self.id)
@@ -362,19 +390,22 @@ class Vm(object):
         self._guest_agent_api_version = None
         self._balloon_minimum = None
         self._balloon_target = None
-        self._blockJobs = {}
+        self._ballooning_enabled = True
+        self._drive_merger = DriveMerger(self)
         self._md_desc = metadata.Descriptor.from_xml(self.conf['xml'])
         self._init_from_metadata()
         self._destroy_requested = threading.Event()
         self._monitorResponse = 0
         self._post_copy = migration.PostCopyPhase.NONE
         self._consoleDisconnectAction = ConsoleDisconnectAction.LOCK_SCREEN
+        self._console_disconnect_action_delay = 0
+        self._user_console_reconnect = threading.Event()
+        self._desktop_disconnect_action_thread = None
         self._confLock = threading.Lock()
-        self._jobsLock = threading.Lock()
         self._statusLock = threading.Lock()
         self._creationThread = concurrent.thread(self._startUnderlyingVm,
                                                  name="vm/" + self.id[:8])
-        self._incomingMigrationFinished = threading.Event()
+        self._incoming_migration_finished = threading.Event()
         self._incoming_migration_vm_running = threading.Event()
         self._volPrepareLock = threading.Lock()
         self._initTimePauseCode = None
@@ -403,8 +434,9 @@ class Vm(object):
         self.stopped_migrated_event_processed = threading.Event()
         self._incoming_migration_prepared = threading.Event()
         self._devices = vmdevices.common.empty_dev_map()
+        self._hotunplugged_devices = {}  # { alias: device_object }
 
-        self.drive_monitor = drivemonitor.DriveMonitor(
+        self.volume_monitor = thinp.VolumeMonitor(
             self, self.log, enabled=False)
         self._connection = libvirtconnection.get(cif)
         if (recover and
@@ -424,14 +456,13 @@ class Vm(object):
         self.guestAgent = guestagent.GuestAgent(
             self._guestSocketFile, self.cif.channelListener, self.log,
             self._onGuestStatusChange,
-            lambda: self.cif.qga_poller.get_caps(self.id),
             lambda: self.cif.qga_poller.get_guest_info(self.id),
             self._guest_agent_api_version)
+        self._qga_lock = threading.Lock()
         self._released = threading.Event()
         self._releaseLock = threading.Lock()
         self._watchdogEvent = {}
         self._powerDownEvent = threading.Event()
-        self._liveMergeCleanupThreads = {}
         self._shutdownLock = threading.Lock()
         self._shutdownReason = None
         self._vcpuLimit = None
@@ -446,6 +477,21 @@ class Vm(object):
         self._migration_downtime = None
         self._pause_code = None
         self._last_disk_mapping_hash = None
+        self._external_data = {}
+        self._init_external_data(
+            ExternalDataKind.TPM,
+            params.get('_X_tpmdata'),
+            self._check_tpm_devices,
+            self._read_tpm_data,
+            self._write_tpm_data)
+        self._init_external_data(
+            ExternalDataKind.NVRAM,
+            params.get('_X_nvramdata'),
+            lambda: self._domain.nvram is not None,
+            self._read_nvram_data,
+            self._write_nvram_data)
+        self._last_disk_hotplug = None
+        self._resume_postponed = False
 
     @property
     def _hugepages_shared(self):
@@ -506,7 +552,7 @@ class Vm(object):
     @property
     def _agent_channel_name(self):
         name = vmchannels.LEGACY_DEVICE_NAME
-        for channel_name, _path in self._domain.all_channels():
+        for channel_name, _path, _ in self._domain.all_channels():
             if channel_name == 'ovirt-guest-agent.0':
                 name = channel_name
         return name
@@ -535,13 +581,22 @@ class Vm(object):
             else:
                 # if this is missing, let's try using what we may have saved
                 self._mem_guaranteed_size_mb = md.get('memGuaranteedSize', 0)
-            self._blockJobs = json.loads(md.get('block_jobs', '{}'))
+            self._drive_merger.load_jobs(json.loads(md.get('jobs', '{}')))
             self._cluster_version = extract_cluster_version(md)
             self._launch_paused = conv.tobool(md.get('launchPaused', False))
             self._resume_behavior = md.get('resumeBehavior',
                                            ResumeBehavior.AUTO_RESUME)
+            self._snapshot_job = json.loads(md.get('snapshot_job', '{}'))
             self._pause_time = md.get('pauseTime')
             self._balloon_target = md.get('balloonTarget')
+            self._ballooning_enabled = conv.tobool(
+                md.get('ballooningEnabled', True))
+            # Store CPU policy related information
+            self._cpu_policy = md.get('cpuPolicy', None)
+            self._manually_pinned_cpus = None
+            pinned = md.get('manuallyPinedCPUs', None)
+            if pinned is not None:
+                self._manually_pinned_cpus = taskset.cpulist_parse(pinned)
 
     def min_cluster_version(self, major, minor):
         """
@@ -559,6 +614,86 @@ class Vm(object):
         cluster_major, cluster_minor = self._cluster_version
         return (cluster_major > major or
                 cluster_major == major and cluster_minor >= minor)
+
+    def _init_external_data(self, kind, initial_data, check_function,
+                            read_function, write_function):
+        """
+        Initialize internal structures for retrieving external data of some
+        kind and populate it with initial data.
+
+        :param kind: Kind of external data to initialize
+        :type kind: ExternalDataKind value
+        :param initial_data: Initial data to write or None
+        :type initial_data: ProtectedPassword
+        :param check_function: function taking zero arguments and returning
+          True or False based on the presence of device in domain XML
+        :type check_function: function
+        :param read_function: function to use for reading data during VM
+          lifetime; to be passed as data retriever to filedata.Monitor(); it
+          takes one argument (last_timestamp) and returns a tuple
+          (data, timestamp)
+        :type read_function: function
+        :param write_function: function to use for initializing the data; it
+          takes a single argumet with initial data
+        :type write_function: function
+        """
+        if not check_function():
+            return
+        if initial_data is None:
+            # This is normal in newly created VMs or incoming live migrations
+            if self.lastStatus != vmstatus.MIGRATION_DESTINATION:
+                self.log.info("Device present but no data provided for %s",
+                              kind)
+            engine_hash = ''
+        else:
+            initial_data = password.unprotect(initial_data)
+            error = None
+            self.log.debug("Writing initial data for %s", kind)
+            try:
+                write_function(initial_data)
+            except Exception as e:
+                self.log.error("Failed to initialize external data %s: %s",
+                               kind, e)
+                if isinstance(e, exception.ExternalDataFailed):
+                    raise
+                else:
+                    # Let's not leak data from the exception
+                    error = e
+            if error is not None:
+                raise exception.ExternalDataFailed(
+                    reason="Failed to write initial data",
+                    kind=kind,
+                    exception=error
+                )
+            engine_hash = ExternalData.secure_hash(initial_data)
+        self._external_data[kind] = ExternalData(
+            kind, self.log, read_function, initial_data, engine_hash)
+        self.log.debug("Initialized external data monitor for %s", kind)
+
+    def _check_tpm_devices(self):
+        for tpm in self._domain.get_device_elements('tpm'):
+            if tpm.find("backend[@type='emulator']") is not None:
+                return True
+        else:
+            return False
+
+    def _read_tpm_data(self, last_modified):
+        proxy = supervdsm.getProxy()
+        data, timestamp = proxy.read_tpm_data(self.id, last_modified)
+        return password.unprotect(data), timestamp
+
+    def _write_tpm_data(self, tpm_data):
+        protected_data = password.ProtectedPassword(tpm_data)
+        supervdsm.getProxy().write_tpm_data(self.id, protected_data)
+
+    def _read_nvram_data(self, last_modified):
+        proxy = supervdsm.getProxy()
+        data, timestamp = proxy.read_nvram_data(self.id, last_modified)
+        return password.unprotect(data), timestamp
+
+    def _write_nvram_data(self, nvram_data):
+        protected_data = password.ProtectedPassword(nvram_data)
+        supervdsm.getProxy().write_nvram_data(self.id, protected_data)
 
     def _get_lastStatus(self):
         # Note that we don't use _statusLock here due to potential risk of
@@ -622,7 +757,7 @@ class Vm(object):
         Value provided by this method is used to order messages
         containing changed status on the engine side.
         """
-        return str(int(vdsm.common.time.monotonic_time() * 1000))
+        return str(vdsm.common.time.event_time())
 
     lastStatus = property(_get_lastStatus, set_last_status)
 
@@ -639,8 +774,11 @@ class Vm(object):
             drv['device'] = 'disk'
 
         if drv['device'] == 'disk':
-            volsize = self._getVolumeSize(drv['domainID'], drv['poolID'],
-                                          drv['imageID'], drv['volumeID'])
+            volsize = self.getVolumeSize(
+                drv['domainID'],
+                drv['poolID'],
+                drv['imageID'],
+                drv['volumeID'])
             drv['truesize'] = str(volsize.truesize)
             drv['apparentsize'] = str(volsize.apparentsize)
         else:
@@ -662,7 +800,7 @@ class Vm(object):
             if isVdsmImage(drv):
                 try:
                     self._normalizeVdsmImg(drv)
-                except StorageUnavailableError:
+                except errors.StorageUnavailableError:
                     # storage unavailable is not fatal on recovery;
                     # the storage subsystem monitors the devices
                     # and will notify when they come up later.
@@ -733,10 +871,40 @@ class Vm(object):
         if mem_size_mb is None:
             self._updateDomainDescriptor()
             mem_size_mb = self._domain.get_memory_size(current=current)
+        if not current:
+            # When using value from <memory> we need to subtract all NVDIMMs
+            mem_size_mb = self._mem_subtract_nvdimms(mem_size_mb)
+        return mem_size_mb
+
+    def _mem_subtract_nvdimms(self, mem_size_mb):
+        if self._domain.xml_source == XmlSource.INITIAL:
+            # In the initial domain XML from Engine the memory size is without
+            # NVDIMMs
+            return mem_size_mb
+        nvdimms = 0
+        for nvdimm in self._domain.get_device_elements_with_attrs(
+                'memory', model='nvdimm'):
+            size_element = nvdimm.find('target/size')
+            if size_element is None:
+                self.log.error('Cannot find NVDIMM size in memory element')
+                continue
+            try:
+                size = int(size_element.text)
+            except ValueError:
+                self.log.exception(
+                    'Failed to parse NVDIMM size: %r',
+                    size_element.text)
+                continue
+            nvdimms += size
+        nvdimms = nvdimms // 1024
+        if nvdimms >= mem_size_mb:
+            self.log.error('Size of NVDIMMs greater than memory size')
+        else:
+            mem_size_mb -= nvdimms
         return mem_size_mb
 
     def hibernate(self, dst):
-        hooks.before_vm_hibernate(self._dom.XMLDesc(0), self._custom)
+        hooks.before_vm_hibernate(self._dom.XMLDesc(), self._custom)
         fname = self.cif.prepareVolumePath(dst)
         try:
             self._dom.save(fname)
@@ -747,7 +915,7 @@ class Vm(object):
         for dev in self._customDevices():
             hooks.before_device_migrate_source(
                 dev._deviceXML, self._custom, dev.custom)
-        hooks.before_vm_migrate_source(self._dom.XMLDesc(0), self._custom)
+        hooks.before_vm_migrate_source(self._dom.XMLDesc(), self._custom)
 
     def _startUnderlyingVm(self):
         self.log.debug("Start")
@@ -773,7 +941,7 @@ class Vm(object):
                     # not even on recovery, to avoid state desync or worse
                     # split-brain scenarios.
                     raise
-                except Exception as e:
+                except Exception:
                     if not self.recovering:
                         raise
                     else:
@@ -795,6 +963,10 @@ class Vm(object):
                     if self._lastStatus == vmstatus.MIGRATION_DESTINATION:
                         self._wait_for_incoming_postcopy_migration()
                         self.lastStatus = vmstatus.UP
+                    if self._snapshot_job:
+                        self.snapshot(None, None, None,
+                                      job_uuid=self._snapshot_job['jobUUID'],
+                                      recovery=True)
             else:
                 self.lastStatus = vmstatus.UP
             if self._initTimePauseCode:
@@ -807,6 +979,9 @@ class Vm(object):
             else:
                 self._pause_code = None
                 self._pause_time = None
+
+            if self.recovering:
+                self._recover_cdroms()
 
             self.recovering = False
             if self._dom.connected:
@@ -854,8 +1029,17 @@ class Vm(object):
                 self._initTimePauseCode = 'POSTCOPY'
                 self._post_copy = migration.PostCopyPhase.RUNNING
             elif reason == libvirt.VIR_DOMAIN_PAUSED_MIGRATION:
-                self.set_last_status(vmstatus.MIGRATION_SOURCE,
-                                     vmstatus.WAIT_FOR_LAUNCH)
+                if self._recovering_migration(self._dom):
+                    new_status = vmstatus.MIGRATION_SOURCE
+                else:
+                    # If we are actually on the source and the
+                    # migration job finishes before we examine it, then:
+                    # - If the job succeeded, the VM will get DOWN soon.
+                    # - If the job failed, the VM may remain in an
+                    #   incorrect state until the next Vdsm restart.
+                    #   But this is a very unlikely corner case.
+                    new_status = vmstatus.MIGRATION_DESTINATION
+                self.set_last_status(new_status, vmstatus.WAIT_FOR_LAUNCH)
             elif reason == libvirt.VIR_DOMAIN_PAUSED_POSTCOPY_FAILED:
                 self.log.warning("VM is after post-copy failure, "
                                  "destroying it: %s" % (self.id,))
@@ -903,7 +1087,7 @@ class Vm(object):
         # We must wait for a contingent post-copy migration to finish
         # in VM initialization before we can run libvirt jobs such as
         # write metadata or run periodic operations.
-        self._incomingMigrationFinished.wait(
+        self._incoming_migration_finished.wait(
             config.getint('vars', 'migration_destination_timeout'))
         # Wait a bit to increase the chance that downtime is reported
         # from the source before we report that the VM is UP on the
@@ -942,7 +1126,7 @@ class Vm(object):
                     drive.update(modified)
         else:
             # Now we got all the resources we needed
-            self.drive_monitor.enable()
+            self.volume_monitor.enable()
 
     def _prepareTransientDisks(self, drives):
         for drive in drives:
@@ -952,26 +1136,15 @@ class Vm(object):
         return [drive for drive in self._devices[hwclass.DISK]
                 if vmdevices.storage.is_payload_drive(drive)]
 
-    def _getShutdownReason(self, stopped_shutdown):
+    def _getShutdownReason(self):
         exit_code = NORMAL
         with self._shutdownLock:
             reason = self._shutdownReason
-        if stopped_shutdown:
-            # do not overwrite admin shutdown, if present
-            if reason is None:
-                # seen_shutdown is used to detect VMs that have been
-                # stopped by sending them SIG_TERM (e.g. system shutdown).
-                # In that case libvirt and qemu report a user initiated
-                # shutdown that is not correct.
-                # BZ on libvirt: https://bugzilla.redhat.com/1384007
-                seen_shutdown = not self.guestAgent or \
-                    self.guestAgent.has_seen_shutdown()
-                if seen_shutdown and not host_in_shutdown():
-                    reason = vmexitreason.USER_SHUTDOWN
-                else:
-                    reason = vmexitreason.HOST_SHUTDOWN
-                    exit_code = ERROR
-        if reason == vmexitreason.DESTROYED_ON_PAUSE_TIMEOUT:
+        # There are more shutdown reasons that are errors,
+        # but in those cases the code should not reach this method,
+        # so only two of them are handled here
+        if reason in (vmexitreason.DESTROYED_ON_PAUSE_TIMEOUT,
+                      vmexitreason.HOST_SHUTDOWN):
             exit_code = ERROR
         self.log.debug('shutdown reason: %s', reason)
         return exit_code, reason
@@ -1014,12 +1187,21 @@ class Vm(object):
             # this always triggers onStatusChange event, which
             # also sends back status event to Engine.
             self.guestAgent.onReboot()
+            # Invalidate qemu-ga capabilities
+            self.cif.qga_poller.update_caps(self.id, None)
             if self._destroy_on_reboot:
                 self.doDestroy(reason=vmexitreason.DESTROYED_ON_REBOOT)
         except Exception:
             self.log.exception("Reboot event failed")
 
     def onConnect(self, clientIp='', clientPort=''):
+        # Cancel shutting down the VM if user reconnected
+        # within the time limit set by console_disconnect_action_delay
+        self._user_console_reconnect.set()
+        if self._desktop_disconnect_action_thread is not None:
+            self._desktop_disconnect_action_thread.cancel()
+            self._desktop_disconnect_action_thread = None
+
         if clientIp:
             self._clientIp = clientIp
             self._clientPort = clientPort
@@ -1035,7 +1217,13 @@ class Vm(object):
         # This is not a definite fix, we're aware that there is still the
         # possibility of a race condition, however this covers more cases
         # than before and a quick gain
-        if not self._clientIp and not self._destroy_requested.is_set():
+        #
+        # This timer is supposed to delay the call to lock the desktop of the
+        # guest. And only lock it, if it there was no new connect.
+        # This is detected by the clientIp being set or not.
+        _DESKTOP_LOCK_TIMEOUT = 2
+        stop = self._user_console_reconnect.wait(timeout=_DESKTOP_LOCK_TIMEOUT)
+        if not (self._clientIp or self._destroy_requested.is_set() or stop):
             delay = config.get('vars', 'user_shutdown_timeout')
             timeout = config.getint('vars', 'sys_shutdown_timeout')
             CDA = ConsoleDisconnectAction
@@ -1048,9 +1236,20 @@ class Vm(object):
                               message='Scheduled reboot on disconnect',
                               force=True)
             elif self._consoleDisconnectAction == CDA.SHUTDOWN:
-                self.shutdown(delay=delay, reboot=False, timeout=timeout,
-                              message='Scheduled shutdown on disconnect',
-                              force=True)
+                if self._desktop_disconnect_action_thread is not None:
+                    self._desktop_disconnect_action_thread.cancel()
+                    if self._guestEvent == vmstatus.POWERING_DOWN:
+                        return
+                self._desktop_disconnect_action_thread = concurrent.Timer(
+                    interval=self._console_disconnect_action_delay * 60,
+                    function=self.shutdown,
+                    kwargs={'delay': delay,
+                            'reboot': False,
+                            'timeout': timeout,
+                            'message': 'Scheduled shutdown on disconnect',
+                            'force': True},
+                    name='vmShutdown')
+                self._desktop_disconnect_action_thread.start()
 
     def onDisconnect(self, detail=None, clientIp='', clientPort=''):
         if self._clientIp != clientIp:
@@ -1067,275 +1266,167 @@ class Vm(object):
         # to a secure channel. However as a result of this we're getting events
         # of false positive disconnects and we need to ensure that we're really
         # having a disconnected client
-        # This timer is supposed to delay the call to lock the desktop of the
-        # guest. And only lock it, if it there was no new connect.
-        # This is detected by the clientIp being set or not.
         #
         # Multiple desktopLock calls won't matter if we're really disconnected
         # It is not harmful. And the threads will exit after 2 seconds anyway.
-        _DESKTOP_LOCK_TIMEOUT = 2
-        timer = threading.Timer(_DESKTOP_LOCK_TIMEOUT, self._timedDesktopLock)
-        timer.start()
+        self._user_console_reconnect.clear()
+        thread = concurrent.thread(self._timedDesktopLock, name="desktoplock")
+        thread.start()
 
     def onRTCUpdate(self, timeOffset):
         newTimeOffset = str(self._initTimeRTC + int(timeOffset))
         self.log.debug('new rtc offset %s', newTimeOffset)
         self._timeOffset = newTimeOffset
 
-    def getChunkedDrives(self):
+    def query_block_stats(self):
         """
-        Return list of writable chunked drives, or writable non-chunked
-        drives replicating to chunked replica drive.
+        Return stats for all block nodes.
+
+        The result includes:
+        - the active volume ("vda")
+        - volume in the active volume backing chain
+        - blockCopy destination volume
+        - backup scratch disk (since rhel 8.6)
+
+        Return the raw stats from libvirt - mapping from "block.{n}.{key}" to
+        value.
         """
-        return [drive for drive in self._devices[hwclass.DISK]
-                if (drive.chunked or drive.replicaChunked) and not
-                drive.readonly]
+        res = self._connection.domainListGetStats(
+            [self._dom.dom],
+            stats=libvirt.VIR_DOMAIN_STATS_BLOCK,
+            flags=libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_BACKING)
+        _, raw_stats = res[0]
+        return raw_stats
 
-    def _getExtendInfo(self, drive):
+    def monitor_volumes(self):
         """
-        Return extension info for a chunked drive or drive replicating to
-        chunked replica volume.
+        Return True if at least one volume is being extended, False otherwise.
         """
-        capacity, alloc, physical = self._dom.blockInfo(drive.path, 0)
+        return self.volume_monitor.monitor_volumes()
 
-        # Libvirt reports watermarks only for the source drive, but for
-        # file-based drives it reports the same alloc and physical, which
-        # breaks our extend logic. Since drive is chunked, we must have a
-        # disk-based replica, so we get the physical size from the replica.
-
-        if not drive.chunked:
-            replica = drive.diskReplicate
-            volsize = self._getVolumeSize(replica["domainID"],
-                                          replica["poolID"],
-                                          replica["imageID"],
-                                          replica["volumeID"])
-            physical = volsize.apparentsize
-
-        blockinfo = vmdevices.storage.BlockInfo(capacity, alloc, physical)
-
-        if blockinfo != drive.blockinfo:
-            drive.blockinfo = blockinfo
-            self.log.debug("Extension info for drive %s volume %s: %s",
-                           drive.name, drive.volumeID, blockinfo)
-
-        return blockinfo
-
-    def monitor_drives(self):
-        """
-        Return True if at least one drive is being extended, False otherwise.
-        """
-        extended = False
-
-        try:
-            for drive in self.drive_monitor.monitored_drives():
-                if self.extend_drive_if_needed(drive):
-                    extended = True
-        except drivemonitor.ImprobableResizeRequestError:
-            return False
-
-        return extended
-
-    def extend_drive_if_needed(self, drive):
-        """
-        Check if a drive should be extended, and start extension flow if
-        needed.
-
-        When libvirt BLOCK_THRESHOLD event handling is enabled (
-        irs.enable_block_threshold_event == True), this method acts according
-        the drive.threshold_state:
-
-        - UNSET: the drive needs to register for a new block threshold,
-                 so try to set it. We set the threshold both for chunked
-                 drives and non-chunked drives replicating to chunked
-                 drives.
-        - EXCEEDED: the drive needs extension, try to extend it.
-        - SET: this method should never receive a drive in this state,
-               emit warning and exit.
-
-        Return True if started an extension flow, False otherwise.
-        """
-
-        if drive.threshold_state == BLOCK_THRESHOLD.SET:
-            self.log.warning(
-                "Unexpected state for drive %s: threshold_state SET",
-                drive.name)
-            return
-
-        try:
-            capacity, alloc, physical = self._getExtendInfo(drive)
-        except libvirt.libvirtError as e:
-            self.log.error("Unable to get watermarks for drive %s: %s",
-                           drive.name, e)
-            return False
-
-        if drive.threshold_state == BLOCK_THRESHOLD.UNSET:
-            self.drive_monitor.set_threshold(drive, physical)
-
-        if not self.drive_monitor.should_extend_volume(
-                drive, drive.volumeID, capacity, alloc, physical):
-            return False
-
-        # TODO: if the threshold is wrongly set below the current allocation,
-        # for example because of delays in handling the event, or if the VM
-        # writes too fast, we will never receive an event.
-        # We need to set the drive threshold to EXCEEDED both if we receive
-        # one event or if we found that the threshold was exceeded during
-        # the drivemonitor.should_extend_volume check.
-        self.drive_monitor.update_threshold_state_exceeded(drive)
-
-        self.log.info(
-            "Requesting extension for volume %s on domain %s (apparent: "
-            "%s, capacity: %s, allocated: %s, physical: %s "
-            "threshold_state: %s)",
-            drive.volumeID, drive.domainID, drive.apparentsize, capacity,
-            alloc, physical, drive.threshold_state)
-
-        self.extendDriveVolume(drive, drive.volumeID, physical, capacity)
-        return True
-
-    def extendDriveVolume(self, vmDrive, volumeID, curSize, capacity):
+    def extend_volume(self, vmDrive, volumeID, curSize, capacity,
+                      callback=None):
         """
         Extend drive volume and its replica volume during replication.
 
         Must be called only when the drive or its replica are chunked.
+
+        If callback is specified, it will be invoked when the extend operation
+        completes. If extension fails, the callback is called with an exception
+        object. The callback signature is:
+
+            def callback(error=None):
+
+        If the extend completes successfully, extend_volume_completed() will be
+        called.
         """
-        newSize = vmDrive.getNextVolumeSize(curSize, capacity)
+        self.volume_monitor.extend_volume(
+            vmDrive, volumeID, curSize, capacity, callback=callback)
 
-        # If drive is replicated to a block device, we extend first the
-        # replica, and handle drive later in __afterReplicaExtension.
+    def should_refresh_destination_volume(self):
+        """
+        If we extend disk during migration, we have to refresh disk on the
+        destination first. The disk has to be refreshed before VM is resumed on
+        the destination and as the migration is controlled by libvirt, we need
+        to refresh destination before source to be sure that the disk on the
+        destination won't be corrupted by resumed VM. We need to call it only
+        from the source VM.
 
-        # Used to measure the total extend time for the drive and the replica.
-        # Note that the volume is extended after the replica is extended, so
-        # the total extend time includes the time to extend the replica.
-        clock = vdsm.common.time.Clock()
-        clock.start("total")
+        Returns True if aforementioned situation happens and the disk on the
+        destination has to be refreshed.
+        """
+        return self._migrationSourceThread.needs_disk_refresh()
 
-        if vmDrive.replicaChunked:
-            self.__extendDriveReplica(vmDrive, newSize, clock)
-        else:
-            self.__extendDriveVolume(vmDrive, volumeID, newSize, clock)
+    def refresh_destination_volume(self, volInfo):
+        """
+        If the disk is extended during migration, the change is not visible on
+        the destination host and the disk drive has to be refreshed also there,
+        otherwise it becomes corrupted.
 
-    def __refreshDriveVolume(self, volInfo):
+        See https://bugzilla.redhat.com/1883399
+        """
+        self.log.info(
+            "Volume %s (domainID: %s, volumeID: %s) was extended during "
+            "migration, refreshing it on destination host.",
+            volInfo["name"], volInfo["domainID"], volInfo["volumeID"])
+
+        # volInfo can contain fields which are not serializable, so we have to
+        # create a dict which conforms with API specification.
+        vol = {
+            "device": hwclass.DISK,
+            "poolID": volInfo["poolID"],
+            "domainID": volInfo["domainID"],
+            "imageID": volInfo["imageID"],
+            "volumeID": volInfo["volumeID"],
+        }
+
+        vol_size = self._migrationSourceThread.refresh_destination_disk(vol)
+
+        if vol_size.apparentsize < volInfo['newSize']:
+            raise exception.CannotRefreshDisk(
+                "Failed to refresh drive on the destination host: actual "
+                "size {} < expected size {}"
+                .format(vol_size.apparentsize, volInfo["newSize"]))
+
+    def refresh_disk(self, vol_pdiv):
+        """
+        Refresh VM drive volume.
+        """
+        try:
+            drive = self.findDriveByUUIDs(vol_pdiv)
+            self.log.info(
+                "Refreshing volume for drive %s (domainID: %s, volumeID: %s)",
+                drive["name"], drive["domainID"], drive["volumeID"])
+            self.refresh_volume(drive)
+            vol_size = self.getVolumeSize(
+                drive.domainID,
+                drive.poolID,
+                drive.imageID,
+                drive.volumeID)
+            try:
+                self.volume_monitor.update_drive_volume_size(drive, vol_size)
+            except virdomain.NotConnectedError:
+                # During migration or after the vm was stopped we cannot set a
+                # block threshold. This is not an issue since we will set the
+                # block threshold when the VM starts.
+                self.log.debug("VM not running, skipping volume size update")
+        except Exception as e:
+            raise exception.DriveRefreshError(
+                reason=str(e),
+                vm_id=self.id,
+                domain_id=vol_pdiv["domainID"],
+                volume_id=vol_pdiv["volumeID"])
+        return dict(result=dict(
+            apparentsize=str(vol_size.apparentsize),
+            truesize=str(vol_size.truesize)))
+
+    def refresh_volume(self, volInfo):
         self.log.debug("Refreshing drive volume for %s (domainID: %s, "
                        "volumeID: %s)", volInfo['name'], volInfo['domainID'],
                        volInfo['volumeID'])
-        self.cif.irs.refreshVolume(volInfo['domainID'], volInfo['poolID'],
-                                   volInfo['imageID'], volInfo['volumeID'])
+        res = self.cif.irs.refreshVolume(
+            volInfo['domainID'],
+            volInfo['poolID'],
+            volInfo['imageID'],
+            volInfo['volumeID'])
+        if response.is_error(res):
+            raise errors.StorageUnavailableError(
+                "Unable to refresh volume for drive {} (domain {}, volume {}):"
+                " {}".format(volInfo['name'], volInfo['domainID'],
+                             volInfo['volumeID'], res['status']['message']))
 
-    def __verifyVolumeExtension(self, volInfo):
-        volSize = self._getVolumeSize(volInfo['domainID'], volInfo['poolID'],
-                                      volInfo['imageID'], volInfo['volumeID'])
+    def extend_volume_completed(self):
+        """
+        Called when extending a thin volume completed successfully.
 
-        self.log.debug("Verifying extension for volume %s, requested size %s, "
-                       "current size %s", volInfo['volumeID'],
-                       volInfo['newSize'], volSize.apparentsize)
-
-        if volSize.apparentsize < volInfo['newSize']:
-            raise RuntimeError(
-                "Volume extension failed for %s (domainID: %s, volumeID: %s)" %
-                (volInfo['name'], volInfo['domainID'], volInfo['volumeID']))
-
-        return volSize
-
-    def __afterReplicaExtension(self, volInfo):
-        clock = volInfo["clock"]
-        clock.stop("extend-replica")
-
-        with clock.run("refresh-replica"):
-            self.__refreshDriveVolume(volInfo)
-
-        self.__verifyVolumeExtension(volInfo)
-        vmDrive = lookup.drive_by_name(
-            self.getDiskDevices()[:], volInfo['name'])
-        if not vmDrive.chunked:
-            # This was a replica only extension, we are done.
-            clock.stop("total")
-            self.log.info("Extend replica %s completed %s",
-                          volInfo["volumeID"], clock)
+        If a guest writes data too fast, the VM may pause with ENOSPC before
+        the volume extension is completed. If the VM is paused, we try to
+        resume it in case it was paused during the volume extension.
+        """
+        if not self._can_resume():
+            self._resume_postponed = True
             return
 
-        self.log.debug("Requesting extension for the original drive: %s "
-                       "(domainID: %s, volumeID: %s)",
-                       vmDrive.name, vmDrive.domainID, vmDrive.volumeID)
-        self.__extendDriveVolume(vmDrive, vmDrive.volumeID,
-                                 volInfo['newSize'], clock)
-
-    def __extendDriveVolume(self, vmDrive, volumeID, newSize, clock):
-        clock.start("extend-volume")
-        volInfo = {
-            'domainID': vmDrive.domainID,
-            'imageID': vmDrive.imageID,
-            'internal': vmDrive.volumeID != volumeID,
-            'name': vmDrive.name,
-            'newSize': newSize,
-            'poolID': vmDrive.poolID,
-            'volumeID': volumeID,
-            'clock': clock,
-        }
-        self.log.debug("Requesting an extension for the volume: %s", volInfo)
-        self.cif.irs.sendExtendMsg(
-            vmDrive.poolID,
-            volInfo,
-            newSize,
-            self.__afterVolumeExtension)
-
-    def __extendDriveReplica(self, drive, newSize, clock):
-        clock.start("extend-replica")
-        volInfo = {
-            'domainID': drive.diskReplicate['domainID'],
-            'imageID': drive.diskReplicate['imageID'],
-            'name': drive.name,
-            'newSize': newSize,
-            'poolID': drive.diskReplicate['poolID'],
-            'volumeID': drive.diskReplicate['volumeID'],
-            'clock': clock,
-        }
-        self.log.debug("Requesting an extension for the volume "
-                       "replication: %s", volInfo)
-        self.cif.irs.sendExtendMsg(drive.poolID,
-                                   volInfo,
-                                   newSize,
-                                   self.__afterReplicaExtension)
-
-    def __afterVolumeExtension(self, volInfo):
-        clock = volInfo["clock"]
-        clock.stop("extend-volume")
-
-        with clock.run("refresh-volume"):
-            self.__refreshDriveVolume(volInfo)
-
-        # Check if the extension succeeded.  On failure an exception is raised
-        # TODO: Report failure to the engine.
-        volSize = self.__verifyVolumeExtension(volInfo)
-
-        # This was a volume extension or replica and volume extension.
-        clock.stop("total")
-        self.log.info("Extend volume %s completed %s",
-                      volInfo["volumeID"], clock)
-
-        # Only update apparentsize and truesize if we've resized the leaf
-        if not volInfo['internal']:
-            drive = lookup.drive_by_name(
-                self.getDiskDevices()[:], volInfo['name'])
-            self._update_drive_volume_size(drive, volSize)
-
-        self._resume_if_needed()
-
-    def _update_drive_volume_size(self, drive, volsize):
-        """
-        Updates drive's apparentsize and truesize, and set a new block
-        threshold based on the new size.
-
-        Arguments:
-            drive (virt.vmdevices.storage.Drive): The drive object using the
-                resized volume.
-            volsize (virt.vm.VolumeSize): new volume size tuple
-        """
-        drive.apparentsize = volsize.apparentsize
-        drive.truesize = volsize.truesize
-        self.drive_monitor.set_threshold(drive, volsize.apparentsize)
-
-    def _resume_if_needed(self):
         try:
             self.cont()
         except libvirt.libvirtError as e:
@@ -1376,6 +1467,13 @@ class Vm(object):
             raise Exception("Unsupported resume behavior value: %s",
                             (resume_behavior,))
 
+    def _paused_long_enough_to_kill(self):
+        pause_time = self._pause_time
+        if pause_time is None:
+            return False
+        paused_time = vdsm.common.time.monotonic_time() - pause_time
+        return paused_time > vm_kill_paused_timeout()
+
     def maybe_kill_paused(self):
         self.log.debug("Considering to kill a paused VM")
         if self._resume_behavior != ResumeBehavior.KILL:
@@ -1386,11 +1484,7 @@ class Vm(object):
         # unaware about what's happening and may trigger concurrent operations
         # (such as resume, migration, destroy, ...) on the VM while we check
         # its status and possibly destroy it.
-        pause_time = self._pause_time
-        now = vdsm.common.time.monotonic_time()
-        if pause_time is not None and \
-           now - pause_time > \
-           config.getint('vars', 'vm_kill_paused_time'):
+        if self._paused_long_enough_to_kill():
             self.log.info("VM paused for too long, will be destroyed")
             self.destroy(gracefulAttempts=0,
                          reason=vmexitreason.DESTROYED_ON_PAUSE_TIMEOUT)
@@ -1404,41 +1498,54 @@ class Vm(object):
             config.getint('vars', 'vm_command_timeout'))
         self._guestCpuLock.acquire(timeout, flow)
 
+    def _can_resume(self):
+        """
+        Return True if it's fine to resume the VM, False if the VM is in the
+        state listed below and the VM should not be resumed.
+
+        - vmstatus.MIGRATION_SOURCE
+            Migration is in progress, VM status should not be changed till the
+            migration finishes. An exception is when the VM is paused due to
+            an I/O error: Such VMs cannot migrate so it is safe to resume them,
+            which is important to do in order not to keep them paused
+            unnecessarily while they wait on ongoingMigrations lock.
+
+        - vmstatus.SAVING_STATE
+            Hibernation is in progress, VM status should not be changed till
+            the hibernation finishes.
+
+        - vmstatus.DOWN
+            VM is down, continuing is not possible from this state.
+        """
+        if self.lastStatus in (vmstatus.SAVING_STATE, vmstatus.DOWN):
+            return False
+        if self.lastStatus == vmstatus.MIGRATION_SOURCE:
+            return self.paused_on_io_error()
+        return True
+
     def cont(self, afterState=vmstatus.UP, guestCpuLocked=False,
              ignoreStatus=False, guestTimeSync=False):
         """
-        Continue execution of the VM.
+        Continue execution of the VM. Log an error if the VM cannot be
+        resumed. To check if the VM can be resumed use _can_resume().
 
         :param ignoreStatus: True, if the operation must be performed
                              regardless of the VM's status, False otherwise.
                              Default: False
 
-                             By default, cont() returns error if the VM is in
-                             one of the following states:
-
-                             vmstatus.MIGRATION_SOURCE
-                                 Migration is in progress, VM status should not
-                                 be changed till the migration finishes.
-
-                             vmstatus.SAVING_STATE
-                                 Hibernation is in progress, VM status should
-                                 not be changed till the hibernation finishes.
-
-                             vmstatus.DOWN
-                                 VM is down, continuing is not possible from
-                                 this state.
+                             By default, cont() returns error if
+                             Vm._can_resume() returns False.
         """
         if not guestCpuLocked:
             self._acquireCpuLockWithTimeout(flow='cont')
         try:
-            if (not ignoreStatus and
-                    self.lastStatus in (vmstatus.MIGRATION_SOURCE,
-                                        vmstatus.SAVING_STATE,
-                                        vmstatus.DOWN)):
+            if not ignoreStatus and not self._can_resume():
                 self.log.error('cannot cont while %s', self.lastStatus)
+                self._resume_postponed = True
                 return response.error('unexpected')
+            self._resume_postponed = False
             self._underlyingCont()
-            self._setGuestCpuRunning(self._isDomainRunning(),
+            self._setGuestCpuRunning(self.isDomainRunning(),
                                      guestCpuLocked=True)
             self._logGuestCpuStatus('continue')
             self._lastStatus = afterState
@@ -1446,7 +1553,7 @@ class Vm(object):
             self._pause_time = None
             if guestTimeSync or \
                config.getboolean('vars', 'time_sync_cont_enable'):
-                self._syncGuestTime()
+                self.syncGuestTime()
         finally:
             if not guestCpuLocked:
                 self._guestCpuLock.release()
@@ -1457,12 +1564,13 @@ class Vm(object):
 
     def pause(self, afterState=vmstatus.PAUSED, guestCpuLocked=False,
               pauseCode='NOERR'):
+        self._resume_postponed = False
         if not guestCpuLocked:
             self._acquireCpuLockWithTimeout(flow='pause')
         self._pause_code = pauseCode
         try:
             self._underlyingPause()
-            self._setGuestCpuRunning(self._isDomainRunning(),
+            self._setGuestCpuRunning(self.isDomainRunning(),
                                      guestCpuLocked=True)
             self._logGuestCpuStatus('pause')
             self._lastStatus = afterState
@@ -1480,6 +1588,24 @@ class Vm(object):
     def pause_code(self):
         return self._pause_code
 
+    @property
+    def resume_postponed(self):
+        return self._resume_postponed
+
+    def reset(self):
+        if self.lastStatus == vmstatus.DOWN:
+            raise exception.NoSuchVM()
+
+        self._guestEventTime = time.time()
+        self._guestEvent = vmstatus.REBOOT_IN_PROGRESS
+
+        try:
+            self._dom.reset(0)
+        except libvirt.libvirtError:
+            raise exception.ResetFailed
+
+        return response.success()
+
     def _setGuestCpuRunning(self, isRunning, guestCpuLocked=False, flow=None):
         """
         here we want to synchronize the access to guestCpuRunning
@@ -1494,7 +1620,7 @@ class Vm(object):
             if not guestCpuLocked:
                 self._guestCpuLock.release()
 
-    def _syncGuestTime(self):
+    def syncGuestTime(self):
         """
         Try to set VM time to the current value.  This is typically useful when
         clock wasn't running on the VM for some time (e.g. during suspension or
@@ -1508,7 +1634,13 @@ class Vm(object):
         seconds = int(t)
         nseconds = int((t - seconds) * 10**9)
         try:
-            self._dom.setTime(time={'seconds': seconds, 'nseconds': nseconds})
+            with self.qga_context():
+                self._dom.setTime(
+                    time={'seconds': seconds, 'nseconds': nseconds})
+        except exception.NonResponsiveGuestAgent:
+            self.log.warning(
+                "Failed to set time: QEMU agent unresponsive during "
+                "guest time synchronization")
         except libvirt.libvirtError as e:
             template = "Failed to set time: %s"
             code = e.get_error_code()
@@ -1734,8 +1866,18 @@ class Vm(object):
             stats.update(vmstats.translate(decStats))
 
         stats.update(self._getGraphicsStats())
-        stats['hash'] = str(hash((self._domain.devices_hash,
-                                  self.guestAgent.diskMappingHash)))
+        devices_hash = self._domain.devices_hash
+        if devices_hash is not None:
+            stats['hash'] = str(hash((devices_hash,
+                                      self.guestAgent.diskMappingHash)))
+        for kind, attribute in [
+            (ExternalDataKind.NVRAM, 'nvramHash'),
+            (ExternalDataKind.TPM, 'tpmHash'),
+        ]:
+            if kind in self._external_data:
+                stats[attribute] = \
+                    self._external_data[kind].data.engine_hash
+
         if self._watchdogEvent:
             stats['watchdogEvent'] = self._watchdogEvent
         if self._vcpuLimit:
@@ -1789,12 +1931,26 @@ class Vm(object):
         def _getVmStatusFromGuest():
             GUEST_WAIT_TIMEOUT = 60
             now = time.time()
+            self.log.debug(
+                "VM status from guest: event=%s event_time=%s now=%s diff=%s",
+                self._guestEvent, self._guestEventTime, now,
+                now - self._guestEventTime
+            )
             if now - self._guestEventTime < 5 * GUEST_WAIT_TIMEOUT and \
                     self._guestEvent == vmstatus.POWERING_DOWN:
                 return self._guestEvent
-            if self.guestAgent and self.guestAgent.isResponsive() and \
+            if self.guestAgent and (
+                    self.guestAgent.isResponsive() or
+                    self.cif.qga_poller.is_active(self.id)) and \
                     self.guestAgent.getStatus():
-                return self.guestAgent.getStatus()
+                agent_status = self.guestAgent.getStatus()
+                if self._guestEvent == vmstatus.POWERING_UP and \
+                        agent_status == vmstatus.UP:
+                    # Remember that the VM is already UP just for the case we
+                    # lose the agent before the GUEST_WAIT_TIMEOUT runs out
+                    self._guestEvent = vmstatus.UP
+                    self._guestEventTime = now
+                return agent_status
             if now - self._guestEventTime < GUEST_WAIT_TIMEOUT:
                 return self._guestEvent
             return vmstatus.UP
@@ -1820,9 +1976,59 @@ class Vm(object):
         else:
             return self.lastStatus
 
+    def getExternalData(self, kind, last_hash, force_update):
+        """
+        Return requested data, stored in the local file system.
+        """
+        try:
+            kind_key = ExternalDataKind(kind)
+        except ValueError:
+            raise exception.ExternalDataFailed(
+                reason="Unsupported data kind", kind=kind
+            )
+        if kind_key not in self._external_data:
+            raise exception.ExternalDataFailed(
+                reason="No such device available", kind=kind
+            )
+        if force_update:
+            data, hash_ = self._external_data[kind_key].update(force=True)
+        else:
+            stored_data = self._external_data[kind_key].data
+            data = stored_data.stable_data
+            hash_ = stored_data.engine_hash
+        result = {'hash': hash_}
+        if data and last_hash != hash_:
+            result['_X_data'] = data
+            result = Suppressed(result)
+        return response.success(data=result)
+
+    def update_external_data(self, kind, force=False):
+        """
+        Update and return external data and its hash.
+
+        The returned data is the last known stable data (None if there is no
+        such data yet), unless `force` is true, in which case the most recent
+        data is considered being stable and returned.
+
+        :param kind: for which device to update the data
+        :type kind: one of ExternalDataKind constants
+        :param force: iff true then force data update even if the data seems
+          to be unchanged and always return fresh data, even if it is not
+          known to be stable
+        :type force: boolean
+        :returns: pair (DATA, HASH) where DATA is the DATA itself or None if
+          there is no data yet and HASH is its cryptographic hash or None if
+          there is no data yet; if there is no such device in the VM then None
+          is returned
+        :rtype: pair (string or None, string or None) or None
+        """
+        if kind not in self._external_data:
+            return None
+        return self._external_data[kind].update(force=force)
+
     def migration_parameters(self):
         return {
-            '_srcDomXML': self._dom.XMLDesc(0),
+            '_srcDomXML': self._dom.XMLDesc(),
             'vmId': self.id,
             'xml': self._domain.xml,
             'elapsedTimeOffset': (
@@ -1838,7 +2044,7 @@ class Vm(object):
         modified by libvirt and will not be rejected by the migration
         end.
         """
-        return self._dom.XMLDesc(libvirt.VIR_DOMAIN_XML_MIGRATABLE)
+        return self._dom.XMLDesc(flags=libvirt.VIR_DOMAIN_XML_MIGRATABLE)
 
     def _get_vm_migration_progress(self):
         return self.migrateStatus()['progress']
@@ -1871,7 +2077,7 @@ class Vm(object):
                 self._md_desc, disk_devices, guest_disk_mapping, self.log
             )
         try:
-            self._sync_metadata()
+            self.sync_metadata()
             self._updateDomainDescriptor()
         except (libvirt.libvirtError, virdomain.NotConnectedError) as e:
             self.log.warning("Couldn't update metadata: %s", e)
@@ -1896,8 +2102,37 @@ class Vm(object):
                 return True
         return False
 
+    def _process_migration_cpusets(self, cpusets):
+        xml_cpusets = []
+        if len(cpusets) != self.get_number_of_cpus():
+            raise exception.InvalidParameter(
+                "length of cpusets (%d) must match"
+                " number of CPUs (%d)" % (
+                    len(cpusets), self.get_number_of_cpus()))
+        for vcpu, cpuset in enumerate(cpusets):
+            if cpuset is None:
+                continue
+            vcpupin = ET.Element('vcpupin')
+            # Try parsing the content to validate it
+            try:
+                taskset.cpulist_parse(cpuset)
+            except ValueError:
+                raise exception.InvalidParameter(
+                    "One or more invalid cpuset list descriptions in: %r" %
+                    cpusets)
+            vcpupin.set('vcpu', str(vcpu))
+            vcpupin.set('cpuset', str(cpuset))
+            xml_cpusets.append(vcpupin)
+        return xml_cpusets
+
     @api.guard(_not_migrating)
+    @api.guard(_not_paused_on_io_error)
     def migrate(self, params):
+        if params.get('cpusets') is not None:
+            # Validate content and turn it into <vcpupin> elements here to
+            # avoid failures later during migration
+            params['cpusets'] = self._process_migration_cpusets(
+                params['cpusets'])
         self._acquireCpuLockWithTimeout(flow='migrate')
         try:
             # It is unlikely, but we could receive migrate()
@@ -2152,14 +2387,6 @@ class Vm(object):
                 self.log.exception('Failed to tear down device %s, device in '
                                    'inconsistent state', device.device)
 
-        for device in self._domain.get_device_elements('graphics'):
-            try:
-                vmdevices.graphics.Graphics(device, self.id).teardown()
-            except Exception:
-                self.log.exception('Failed to tear down device %s, device in '
-                                   'inconsistent state',
-                                   xmlutils.tostring(device, pretty=True))
-
     def _undefine_domain(self):
         if self._external:
             # This is a grey area, see rhbz#1610917;
@@ -2172,7 +2399,8 @@ class Vm(object):
             return
 
         try:
-            self._dom.undefineFlags(libvirt.VIR_DOMAIN_UNDEFINE_NVRAM)
+            flags = _undefine_vm_flags()
+            self._dom.undefineFlags(flags)
         except libvirt.libvirtError as e:
             self.log.warning("Failed to undefine VM '%s' (error=%i)",
                              self.id, e.get_error_code())
@@ -2185,7 +2413,7 @@ class Vm(object):
         except KeyError:
             self.log.warning('timestamp already removed from stats cache')
 
-    def _isDomainRunning(self):
+    def isDomainRunning(self):
         try:
             status = self._dom.info()
         except virdomain.NotConnectedError:
@@ -2218,8 +2446,31 @@ class Vm(object):
 
         sampling.stats_cache.add(self.id)
         self._monitorable = config.getboolean('sampling', 'enable')
-
+        self._initCpuManagement()
         self._vmDependentInit()
+
+    def _initCpuManagement(self):
+        if self._cpu_policy is None:
+            self._cpu_policy = self._implied_cpu_policy()
+            with self._md_desc.values() as md:
+                md['cpuPolicy'] = self._cpu_policy
+            self.sync_metadata()
+            self.log.debug('Inferred CPU policy: %r', self._cpu_policy)
+        else:
+            self.log.debug('Operating with CPU policy: %r', self._cpu_policy)
+        if self._manually_pinned_cpus is None:
+            if self._cpu_policy == cpumanagement.CPU_POLICY_MANUAL:
+                self._manually_pinned_cpus = frozenset(
+                    self.pinned_cpus().keys())
+                with self._md_desc.values() as md:
+                    md['manuallyPinedCPUs'] = ','.join(
+                        map(str, self._manually_pinned_cpus))
+                self.sync_metadata()
+                self.log.debug(
+                    'Manually pinned CPUs: %r', self._manually_pinned_cpus)
+            else:
+                self._manually_pinned_cpus = frozenset()
+        cpumanagement.on_vm_create(self)
 
     def _vmDependentInit(self):
         """
@@ -2244,7 +2495,7 @@ class Vm(object):
             vmdevices.common.save_device_metadata(
                 self._md_desc, self._devices, self.log)
             self.save_custom_properties()
-            self._sync_metadata()
+            self.sync_metadata()
 
         try:
             self.guestAgent.start()
@@ -2271,7 +2522,7 @@ class Vm(object):
         for con in self._domain.get_device_elements('console'):
             vmdevices.core.prepare_console(con, self.id)
 
-        self._guestCpuRunning = self._isDomainRunning()
+        self._guestCpuRunning = self.isDomainRunning()
         self._logGuestCpuStatus('domain initialization')
         if self.lastStatus not in (vmstatus.MIGRATION_DESTINATION,
                                    vmstatus.RESTORING_STATE):
@@ -2301,7 +2552,7 @@ class Vm(object):
                 "hotplugged device %s", dev_obj)
         else:
             self._set_device_metadata(attrs, data)
-            self._sync_metadata()
+            self.sync_metadata()
 
     def _hotunplug_device_metadata(self, dev_class, dev_obj):
         attrs, _ = get_metadata(dev_class, dev_obj)
@@ -2311,7 +2562,7 @@ class Vm(object):
                 "hotunplugged device %s", dev_obj)
         else:
             self._clear_device_metadata(attrs)
-            self._sync_metadata()
+            self.sync_metadata()
 
     def _set_device_metadata(self, attrs, dev_conf):
         """
@@ -2338,6 +2589,11 @@ class Vm(object):
     def _tracked_devices(self):
         for dom in self._domain.get_device_elements('graphics'):
             yield vmdevices.graphics.Graphics(dom, self.id)
+        for dom in self._domain.get_device_elements('hostdev'):
+            meta = vmdevices.common.dev_meta_from_elem(
+                dom, self.id, self._md_desc
+            )
+            yield vmdevices.hostdevice.HostDevice(dom, meta, self.log)
         for dev_objects in self._devices.values():
             for dev_object in dev_objects[:]:
                 yield dev_object
@@ -2504,8 +2760,6 @@ class Vm(object):
                 self._dom = virdomain.Defined(self.id, dom)
                 return
             self._dom = virdomain.Notifying(dom, self._timeoutExperienced)
-            for dev in self._devices[hwclass.NIC]:
-                dev.recover()
         elif self._altered_state.origin == _MIGRATION_ORIGIN:
             self._incoming_migration_prepared.set()
             # self._dom will be disconnected until migration ends.
@@ -2584,7 +2838,7 @@ class Vm(object):
                 self._update_metadata()
                 dom.createWithFlags(flags)
                 self._dom = virdomain.Notifying(dom, self._timeoutExperienced)
-                hooks.after_vm_start(self._dom.XMLDesc(0), self._custom)
+                hooks.after_vm_start(self._dom.XMLDesc(), self._custom)
                 for dev in self._customDevices():
                     hooks.after_device_create(dev._deviceXML, self._custom,
                                               dev.custom)
@@ -2612,6 +2866,7 @@ class Vm(object):
         for element in domain.get_device_elements('disk'):
             if vmxml.attr(element, 'device') == 'disk':
                 change_disk(element, devices, self.log)
+                self._remove_backingstore_configuration(element)
 
         return domain.xml
 
@@ -2625,7 +2880,8 @@ class Vm(object):
         or revert to snapshot.
         """
         domain = MutableDomainDescriptor(srcDomXML)
-        engine_domain = DomainDescriptor(engine_xml)
+        engine_domain = DomainDescriptor(engine_xml,
+                                         xml_source=XmlSource.INITIAL)
         engine_md = metadata.Descriptor.from_xml(engine_xml)
         params = vmdevices.common.storage_device_params_from_domain_xml(
             self.id, engine_domain, engine_md, self.log)
@@ -2635,6 +2891,7 @@ class Vm(object):
             for element in domain.get_device_elements('disk'):
                 if vmxml.attr(element, 'device') == 'disk':
                     change_disk(element, devices, self.log)
+                    self._remove_backingstore_configuration(element)
 
                     _, dev_class = identify_from_xml_elem(element)
                     attrs = dev_class.get_identifying_attrs(element)
@@ -2648,6 +2905,28 @@ class Vm(object):
 
         return domain.xml
 
+    def volume_exists(self, vol):
+        """
+        Checks if the volume ID exists in the domain XML.
+
+        :param vol: The volume ID we are seeking.
+        :type vol: string
+        :return: True if the volume with the given ID exists.
+        :rtype boolean
+        """
+        for disk_element in self._domain.get_device_elements('disk'):
+            if vmxml.attr(disk_element, 'device') == 'disk':
+                source = vmxml.find_first(disk_element, 'source', None)
+                if source is not None:
+                    path = (vmxml.attr(source, 'file') or
+                            vmxml.attr(source, 'dev') or
+                            vmxml.attr(source, 'name'))
+                else:
+                    path = ''
+                if os.path.basename(path) == vol:
+                    return True
+                return False
+
     def _correctGraphicsConfiguration(self, domXML):
         """
         Fix the configuration of graphics device after resume.
@@ -2658,6 +2937,26 @@ class Vm(object):
         for devXml in domObj.findall('.//devices/graphics'):
             vmdevices.graphics.reset_password(devXml)
         return xmlutils.tostring(domObj)
+
+    def _remove_backingstore_configuration(self, element):
+        """
+        Fix the configuration of disk device after resume.
+        Removes the backingStore element.
+        """
+        # When restoring from snapshot memory, it may contain wrong
+        # backingStore. We can remove this element, letting libvirt reset it.
+        # In older versions (< 4.4) we didn't have this element saved in the VM
+        # metadata. This change is due to VIR_DOMAIN_XML_MIGRATABLE flag output
+        # in libvirt >= 6 which is used to produce memory dump configuration
+        # file, and since the backing chain is now kept stable, it is now part
+        # of the output when this flag is used.
+        # https://bugzilla.redhat.com/1840609
+        try:
+            vmxml.remove_child(element,
+                               vmxml.find_first(element, 'backingStore'))
+            self.log.debug("backingStore removed from disk")
+        except vmxml.NotFound:
+            pass
 
     @api.guard(_not_migrating)
     def hotplugNic(self, params):
@@ -2746,87 +3045,48 @@ class Vm(object):
     # This hot plug must be able to take multiple devices so that
     # IOMMU placeholders and/or different devices in shared groups can
     # be added.
-    def hostdevHotplug(self, dev_specs):
-        dev_objects = []
-        for dev_spec in dev_specs:
-            dev_object = vmdevices.hostdevice.HostDevice(self.log, **dev_spec)
-            dev_objects.append(dev_object)
+    def hotplugHostdev(self, device_xmls):
+        for xml in device_xmls:
+            _cls, dom, meta = vmdevices.common.dev_elems_from_xml(self, xml)
             try:
-                dev_object.setup()
+                vmdevices.hostdevice.setup_device(dom, meta, self.log)
             except libvirt.libvirtError:
                 # We couldn't detach one of the devices. Halt.
                 # No cleanup needed, detaching a detached device is noop.
-                self.log.exception('Could not detach a device from a host.')
+                self.log.exception('Could not detach a device from a host: %s',
+                                   xml)
                 return response.error('hostdevDetachErr')
-
         assigned_devices = []
-
-        # Hard part is done, we have detached all devices without errors.
-        # We now have to add devices to the VM while ignoring placeholders.
-        for dev_spec, dev_object in zip(dev_specs, dev_objects):
-            try:
-                dev_xml = xmlutils.tostring(dev_object.getXML())
-            except vmdevices.core.SkipDevice:
-                self.log.info('Skipping device %s.', dev_object.device)
-                continue
-
-            dev_object._deviceXML = dev_xml
-            self.log.info("Hotplug hostdev xml: %s", dev_xml)
-
+        for xml in device_xmls:
+            self.log.info("Hotplug hostdev xml: %s", xml)
+            _cls, dom, _meta = vmdevices.common.dev_elems_from_xml(self, xml)
+            dev_xml = xmlutils.tostring(dom)
             try:
                 self._dom.attachDevice(dev_xml)
             except libvirt.libvirtError:
-                self.log.exception('Skipping device %s.', dev_object.device)
+                self.log.exception('Skipping device %s.', dev_xml)
                 continue
-
-            assigned_devices.append(dev_object.device)
-
-            self._devices[hwclass.HOSTDEV].append(dev_object)
-
             self._updateDomainDescriptor()
-            vmdevices.hostdevice.HostDevice.update_device_info(
-                self, self._devices[hwclass.HOSTDEV])
-
+            assigned_devices.append(xml)
         return response.success(assignedDevices=assigned_devices)
 
     @api.guard(_not_migrating)
-    def hostdevHotunplug(self, dev_names):
-        device_objects = []
+    def hotunplugHostdev(self, device_xmls):
         unplugged_devices = []
-
-        for dev_name in dev_names:
-            dev_object = None
-            for dev in self._devices[hwclass.HOSTDEV][:]:
-                if dev.device == dev_name:
-                    dev_object = dev
-                    device_objects.append(dev)
-                    break
-
-            if dev_object:
-                device_xml = xmlutils.tostring(dev_object.getXML())
-                self.log.debug('Hotunplug hostdev xml: %s', device_xml)
-            else:
-                self.log.error('Hotunplug hostdev failed (continuing) - '
-                               'device not found: %s', dev_name)
-                continue
-
+        # TODO: Hot unplug the devices concurrently?
+        for xml in device_xmls:
+            cls, dom, meta = vmdevices.common.dev_elems_from_xml(self, xml)
+            alias = vmdevices.core.find_device_alias(dom)
+            dev_object = cls(dom, meta, self.log)
+            if alias:
+                self._hotunplugged_devices[alias] = dev_object
+            dev_xml = xmlutils.tostring(dom)
             try:
-                self._hotunplug_device(device_xml, dev_object,
-                                       hwclass.HOSTDEV)
-            except HotunplugTimeout:
-                self._hostdev_hotunplug_restore(dev_object)
+                self._hotunplug_device(dev_xml, dev_object, hwclass.HOSTDEV)
+            except (HotunplugTimeout, libvirt.libvirtError):
                 continue
-            except libvirt.libvirtError:
-                self._hostdev_hotunplug_restore(dev_object)
-                continue
-
-            unplugged_devices.append(dev_name)
-
+            unplugged_devices.append(xml)
         return response.success(unpluggedDevices=unplugged_devices)
-
-    def _hostdev_hotunplug_restore(self, dev_object):
-        self._devices[hwclass.HOSTDEV].append(dev_object)
-        self._updateDomainDescriptor()
 
     def _lookupDeviceByPath(self, path):
         for dev in self._devices[hwclass.DISK][:]:
@@ -2849,13 +3109,19 @@ class Vm(object):
             if network == '':
                 network = net_api.DUMMY_BRIDGE
                 linkValue = 'down'
-            custom = params.get('custom', {})
-            specParams = params.get('specParams')
-            MTU = params.get('mtu', netDev.mtu)
             netsToMirror = params.get('portMirroring', netDev.portMirroring)
 
-            with self.setLinkAndNetwork(netDev, linkValue, network,
-                                        custom, specParams, MTU):
+            with self.setLinkAndNetwork(
+                    netDev,
+                    linkValue,
+                    network,
+                    custom=params.get('custom', {}),
+                    specParams=params.get('specParams'),
+                    MTU=params.get('mtu', netDev.mtu),
+                    port_isolated=params.get('port_isolated'),
+                    filter=params.get('filter'),
+                    filterParameters=params.get('filterParameters')
+            ):
                 with self.updatePortMirroring(netDev, netsToMirror):
                     self._hotplug_device_metadata(hwclass.NIC, netDev)
                     return {'vmList': {}}
@@ -2866,7 +3132,8 @@ class Vm(object):
 
     @contextmanager
     def setLinkAndNetwork(self, dev, linkValue, networkValue, custom,
-                          specParams=None, MTU=None):
+                          specParams=None, MTU=None, port_isolated=None,
+                          filter=None, filterParameters=None):
         vnicXML = dev.getXML()
         source = vmxml.find_first(vnicXML, 'source')
         vmxml.set_attr(source, 'bridge', networkValue)
@@ -2881,7 +3148,10 @@ class Vm(object):
             except vmxml.NotFound:
                 mtu = vnicXML.appendChildWithArgs('mtu')
             vmxml.set_attr(mtu, 'size', str(MTU))
+        vmdevices.network.update_port_xml(vnicXML, port_isolated)
         vmdevices.network.update_bandwidth_xml(dev, vnicXML, specParams)
+        vmdevices.network.update_filterref_xml(vnicXML, filter,
+                                               filterParameters)
         vnicStrXML = xmlutils.tostring(vnicXML, pretty=True)
         try:
             try:
@@ -2913,6 +3183,7 @@ class Vm(object):
             dev.linkActive = linkValue == 'up'
             dev.custom = custom
             dev.mtu = MTU
+            dev.port_isolated = port_isolated
 
     @contextmanager
     def updatePortMirroring(self, nic, networks):
@@ -2958,6 +3229,7 @@ class Vm(object):
             params['ttl'],
             params.get('existingConnAction'),
             params.get('disconnectAction'),
+            params.get('consoleDisconnectActionDelay'),
             params['params']
         )
 
@@ -3069,18 +3341,58 @@ class Vm(object):
             device_xml = vmdevices.core.memory_xml(mem_params)
         self.log.info("Hotunplug memory xml: %s", device_xml)
 
+        alias = vmdevices.core.find_device_alias(
+            xmlutils.fromstring(device_xml)
+        )
+        if alias:
+            self._hotunplugged_devices[alias] = vmdevices.core.Base(self.log)
+
         try:
             self._dom.detachDevice(device_xml)
         except libvirt.libvirtError as e:
+            if alias and alias in self._hotunplugged_devices:
+                self._hotunplugged_devices.pop(alias)
             if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
                 raise exception.NoSuchVM(vmId=self.id)
             raise exception.HotunplugMemFailed(str(e), vmId=self.id)
 
         self._update_mem_guaranteed_size(params)
 
+    def _assignCpusets(self, cpusets):
+        if cpusets is None:
+            return
+        numa.update()
+        cpu_list_length = max(numa.cpu_topology().online_cpus) + 1
+        for vcpu, cpuset in enumerate(cpusets):
+            parsed_cpus = taskset.cpulist_parse(cpuset)
+            try:
+                self.pin_vcpu(vcpu, cpumanagement.libvirt_cpuset_spec(
+                    parsed_cpus, cpu_list_length))
+            except virdomain.NotConnectedError:
+                self.log.warning(
+                    "Cannot reconfigure CPUs, domain not connected.")
+            except libvirt.libvirtError as e:
+                if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
+                    self.log.warning(
+                        "Cannot reconfigure CPUs,"
+                        " domain does not exist anymore.")
+                else:
+                    raise
+
     @api.guard(_not_migrating)
-    def setNumberOfCpus(self, numberOfCpus):
+    def setNumberOfCpus(self, numberOfCpus, cpusets=None):
         self.log.debug("Setting number of cpus to : %s", numberOfCpus)
+        self.log.debug("New cpusets for CPUs: %r", cpusets)
+        if self.cpu_policy() not in (
+                cpumanagement.CPU_POLICY_NONE,
+                cpumanagement.CPU_POLICY_MANUAL) and cpusets is None:
+            raise exception.MissingParameter(
+                "cpusets is required for VM with "
+                " CPU policy '%s'" % self.cpu_policy())
+        if cpusets is not None and len(cpusets) != numberOfCpus:
+            raise exception.InvalidParameter(
+                "length of cpusets (%d) must match"
+                " numberOfCpus (%d)" % (len(cpusets), numberOfCpus))
         hooks.before_set_num_of_cpus()
         try:
             self._dom.setVcpusFlags(numberOfCpus,
@@ -3091,7 +3403,9 @@ class Vm(object):
                 raise exception.NoSuchVM()
             return response.error('setNumberOfCpusErr', str(e))
 
+        self._assignCpusets(cpusets)
         self._updateDomainDescriptor()
+        cpumanagement.on_vm_change(self)
         hooks.after_set_num_of_cpus()
         return {'status': doneCode, 'vmList': {}}
 
@@ -3233,8 +3547,7 @@ class Vm(object):
                 self._dom.setMetadata(libvirt.VIR_DOMAIN_METADATA_ELEMENT,
                                       metadata_xml,
                                       xmlconstants.METADATA_VM_TUNE_PREFIX,
-                                      xmlconstants.METADATA_VM_TUNE_URI,
-                                      0)
+                                      xmlconstants.METADATA_VM_TUNE_URI)
             except libvirt.libvirtError as e:
                 self.log.exception("updateVmPolicy failed")
                 if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
@@ -3283,8 +3596,7 @@ class Vm(object):
                 continue
             if device_name is not None and device.name == device_name:
                 return device
-            if (device_path is not None and
-                    (device.get("path") == device_path)):
+            if device_path is not None and device.path == device_path:
                 return device
 
         raise LookupError(
@@ -3491,6 +3803,7 @@ class Vm(object):
             vmdevices.storage.Drive.update_device_info(self, device_conf)
             hooks.after_disk_hotplug(driveXml, self._custom,
                                      params=drive.custom)
+            self._last_disk_hotplug = vdsm.common.time.monotonic_time()
 
         return {'status': doneCode, 'vmList': {}}
 
@@ -3607,7 +3920,7 @@ class Vm(object):
             # unplug.  See https://bugzilla.redhat.com/1639228.
             time.sleep(sleep_time)
             return not vmdevices.lease.is_attached_to(device,
-                                                      self._dom.XMLDesc(0))
+                                                      self._dom.XMLDesc())
         else:
             return device.hotunplug_event.wait(sleep_time)
 
@@ -3622,11 +3935,7 @@ class Vm(object):
                     raise HotunplugTimeout("Timeout detaching %r" % device)
 
     def _readPauseCode(self):
-        state, reason = self._dom.state(0)
-
-        if (state == libvirt.VIR_DOMAIN_PAUSED and
-           reason == libvirt.VIR_DOMAIN_PAUSED_IOERROR):
-
+        if self.paused_on_io_error():
             diskErrors = self._dom.diskErrors()
             for device, error in six.viewitems(diskErrors):
                 if error == libvirt.VIR_DOMAIN_DISK_ERROR_NO_SPACE:
@@ -3638,8 +3947,20 @@ class Vm(object):
                     return 'EIO'
                 # else error == libvirt.VIR_DOMAIN_DISK_ERROR_NONE
                 # so no worries.
-
         return 'NOERR'
+
+    def paused_on_io_error(self):
+        """Return whether the VM is paused due to an I/O error.
+
+        This check is performed by asking libvirt to be completely reliable
+        (except for possible races).
+
+        :return: True iff the VM is paused due to an I/O error
+        :rtype: bool
+        """
+        state, reason = self._dom.state(0)
+        return (state == libvirt.VIR_DOMAIN_PAUSED and
+                reason == libvirt.VIR_DOMAIN_PAUSED_IOERROR)
 
     def isDomainReadyForCommands(self):
         """
@@ -3677,7 +3998,7 @@ class Vm(object):
             self.cont(guestTimeSync=True)
             fromSnapshot = self._altered_state.from_snapshot
             self._altered_state = _AlteredState()
-            hooks.after_vm_dehibernate(self._dom.XMLDesc(0), self._custom,
+            hooks.after_vm_dehibernate(self._dom.XMLDesc(), self._custom,
                                        {'FROM_SNAPSHOT': fromSnapshot})
         elif self._altered_state.origin == _MIGRATION_ORIGIN:
             finished, timeout = self._waitForUnderlyingMigration()
@@ -3693,7 +4014,7 @@ class Vm(object):
             self._domDependentInit()
             self._altered_state = _AlteredState()
             hooks.after_vm_migrate_destination(
-                self._dom.XMLDesc(0), self._custom)
+                self._dom.XMLDesc(), self._custom)
 
             for dev in self._customDevices():
                 hooks.after_device_migrate_destination(
@@ -3729,7 +4050,7 @@ class Vm(object):
             self._dom = virdomain.Notifying(
                 self._connection.lookupByUUIDString(self.id),
                 self._timeoutExperienced)
-            self._sync_metadata()
+            self.sync_metadata()
 
             if not migrationFinished:
                 state = self._dom.state(0)
@@ -3764,16 +4085,16 @@ class Vm(object):
             # the transient domain.
             self.log.debug("Switching transient VM to persistent")
             try:
-                self._connection.defineXML(self._dom.XMLDesc(0))
+                self._connection.defineXML(self._dom.XMLDesc())
             except libvirt.libvirtError as e:
                 self.log.info("Failed to make VM persistent: %s'", e)
 
     def _underlyingCont(self):
-        hooks.before_vm_cont(self._dom.XMLDesc(0), self._custom)
+        hooks.before_vm_cont(self._dom.XMLDesc(), self._custom)
         self._dom.resume()
 
     def _underlyingPause(self):
-        hooks.before_vm_pause(self._dom.XMLDesc(0), self._custom)
+        hooks.before_vm_pause(self._dom.XMLDesc(), self._custom)
         self._dom.suspend()
 
     def findDriveByUUIDs(self, drive):
@@ -3824,8 +4145,10 @@ class Vm(object):
         if not vmDrive.device == 'disk' or not isVdsmImage(vmDrive):
             return
 
-        volSize = self._getVolumeSize(
-            vmDrive.domainID, vmDrive.poolID, vmDrive.imageID,
+        volSize = self.getVolumeSize(
+            vmDrive.domainID,
+            vmDrive.poolID,
+            vmDrive.imageID,
             vmDrive.volumeID)
 
         vmDrive.truesize = volSize.truesize
@@ -3847,7 +4170,7 @@ class Vm(object):
                         # don't belong to metadata.
                         if k in dev:
                             dev[k] = v
-                self._sync_metadata()
+                self.sync_metadata()
                 break
         else:
             self.log.error("Unable to update the drive object for: %s",
@@ -3864,40 +4187,37 @@ class Vm(object):
                 conf.update(driveParams)
 
     def clear_drive_threshold(self, drive, old_volume_id):
-        # Check that libvirt exposes full volume chain information
-        chains = self._driveGetActualVolumeChain([drive])
-        if drive['alias'] not in chains:
-            self.log.error(
-                "libvirt does not support volume chain "
-                "monitoring.  Unable to update threshold for %s.",
-                drive.name)
-            return
-
-        actual_chain = chains[drive['alias']]
-
         try:
-            target_index = drive.volume_target_index(
-                old_volume_id, actual_chain)
-        except VolumeNotFound as e:
-            self.log.error(
-                "Unable to find the target index for %s: %s", old_volume_id, e)
-            return
+            index = self.query_drive_volume_index(drive, old_volume_id)
+            self.volume_monitor.clear_threshold(drive, index)
+        except Exception as e:
+            self.log.error("Unable to clear drive threshold: %s", e)
 
-        try:
-            self.drive_monitor.clear_threshold(drive, index=target_index)
-        except libvirt.libvirtError as e:
-            self.log.error(
-                "Unable to clear the drive threshold: %s", e)
+    def query_drive_volume_index(self, drive, vol_id):
+        """
+        Return the libvirt node index by volume id.
+        """
+        actual_chain = self.query_drive_volume_chain(drive)
+        if actual_chain is None:
+            raise RuntimeError(
+                "Cannot get drive {} alias {} actual volume chain"
+                .format(drive.name, drive.alias))
+
+        return drive.volume_target_index(vol_id, actual_chain)
 
     def freeze(self):
         """
-        Freeze every mounted filesystems within the guest (hence guest agent
-        may be required depending on hypervisor used).
+        Freeze every mounted filesystems within the guest. This is performed by
+        the QEMU Guest Agent inside the guest.
         """
         self.log.info("Freezing guest filesystems")
 
         try:
-            frozen = self._dom.fsFreeze()
+            with self.qga_context():
+                frozen = self._dom.fsFreeze()
+        except exception.NonResponsiveGuestAgent as e:
+            self.log.warning("Unable to freeze guest filesystems: %s", e)
+            return response.error("nonresp", message=e.msg)
         except libvirt.libvirtError as e:
             self.log.warning("Unable to freeze guest filesystems: %s", e)
             code = e.get_error_code()
@@ -3914,13 +4234,17 @@ class Vm(object):
 
     def thaw(self):
         """
-        Thaw every mounted filesystems within the guest (hence guest agent may
-        be required depending on hypervisor used).
+        Thaw every mounted filesystems within the guest. This is performed
+        by the QEMU Guest Agent inside the guest.
         """
         self.log.info("Thawing guest filesystems")
 
         try:
-            thawed = self._dom.fsThaw()
+            with self.qga_context():
+                thawed = self._dom.fsThaw()
+        except exception.NonResponsiveGuestAgent as e:
+            self.log.warning("Unable to thaw guest filesystems: %s", e)
+            return response.error("nonresp", message=e.msg)
         except libvirt.libvirtError as e:
             self.log.warning("Unable to thaw guest filesystems: %s", e)
             code = e.get_error_code()
@@ -3935,278 +4259,53 @@ class Vm(object):
         self.log.info("%d guest filesystems thawed", thawed)
         return response.success()
 
-    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def start_backup(self, config):
         dom = backup.DomainAdapter(self)
         return backup.start_backup(self, dom, config)
 
-    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def stop_backup(self, backup_id):
         dom = backup.DomainAdapter(self)
         return backup.stop_backup(self, dom, backup_id=backup_id)
 
-    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
-    def backup_info(self, backup_id):
+    def backup_info(self, backup_id, checkpoint_id=None):
         dom = backup.DomainAdapter(self)
-        return backup.backup_info(self, dom, backup_id=backup_id)
+        return backup.backup_info(
+            self, dom, backup_id=backup_id, checkpoint_id=checkpoint_id)
 
-    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def delete_checkpoints(self, checkpoint_ids):
         dom = backup.DomainAdapter(self)
         return backup.delete_checkpoints(
             self, dom, checkpoint_ids=checkpoint_ids)
 
-    @backup.requires_libvirt_support()
     @api.guard(_not_migrating)
     def redefine_checkpoints(self, checkpoints):
         dom = backup.DomainAdapter(self)
         return backup.redefine_checkpoints(
             self, dom, checkpoints=checkpoints)
 
+    def list_checkpoints(self):
+        dom = backup.DomainAdapter(self)
+        return backup.list_checkpoints(self, dom)
+
+    def dump_checkpoint(self, checkpoint_id):
+        dom = backup.DomainAdapter(self)
+        return backup.dump_checkpoint(
+            dom, checkpoint_id=checkpoint_id)
+
     @api.guard(_not_migrating)
-    def snapshot(self, snapDrives, memoryParams, frozen=False):
-        """Live snapshot command"""
-
-        def _normSnapDriveParams(drive):
-            """Normalize snapshot parameters"""
-
-            if "baseVolumeID" in drive:
-                baseDrv = {"device": "disk",
-                           "domainID": drive["domainID"],
-                           "imageID": drive["imageID"],
-                           "volumeID": drive["baseVolumeID"]}
-                tgetDrv = baseDrv.copy()
-                tgetDrv["volumeID"] = drive["volumeID"]
-
-            elif "baseGUID" in drive:
-                baseDrv = {"GUID": drive["baseGUID"]}
-                tgetDrv = {"GUID": drive["GUID"]}
-
-            elif "baseUUID" in drive:
-                baseDrv = {"UUID": drive["baseUUID"]}
-                tgetDrv = {"UUID": drive["UUID"]}
-
-            else:
-                baseDrv, tgetDrv = (None, None)
-
-            return baseDrv, tgetDrv
-
-        def _rollbackDrives(newDrives):
-            """Rollback the prepared volumes for the snapshot"""
-
-            for vmDevName, drive in six.iteritems(newDrives):
-                try:
-                    self.cif.teardownVolumePath(drive)
-                except Exception:
-                    self.log.exception("Unable to teardown drive: %s",
-                                       vmDevName)
-
-        def _memorySnapshot(memoryVolumePath):
-            """Libvirt snapshot XML"""
-
-            return vmxml.Element('memory',
-                                 snapshot='external',
-                                 file=memoryVolumePath)
-
-        def _vmConfForMemorySnapshot():
-            """Returns the needed vm configuration with the memory snapshot"""
-
-            return {'restoreFromSnapshot': True,
-                    '_srcDomXML': self.migratable_domain_xml(),
-                    'elapsedTimeOffset': time.time() - self._startTime}
-
-        def _padMemoryVolume(memoryVolPath, sdUUID):
-            sdType = sd.name2type(
-                self.cif.irs.getStorageDomainInfo(sdUUID)['info']['type'])
-            if sdType in sd.FILE_DOMAIN_TYPES:
-                iop = oop.getProcessPool(sdUUID)
-                iop.fileUtils.padToBlockSize(memoryVolPath)
-
-        snap = vmxml.Element('domainsnapshot')
-        disks = vmxml.Element('disks')
-        newDrives = {}
-        vmDrives = {}
-
-        for drive in snapDrives:
-            baseDrv, tgetDrv = _normSnapDriveParams(drive)
-
-            try:
-                self.findDriveByUUIDs(tgetDrv)
-            except LookupError:
-                # The vm is not already using the requested volume for the
-                # snapshot, continuing.
-                pass
-            else:
-                # The snapshot volume is the current one, skipping
-                self.log.debug("The volume is already in use: %s", tgetDrv)
-                continue  # Next drive
-
-            try:
-                vmDrive = self.findDriveByUUIDs(baseDrv)
-            except LookupError:
-                # The volume we want to snapshot doesn't exist
-                self.log.error("The base volume doesn't exist: %s", baseDrv)
-                return response.error('snapshotErr')
-
-            if vmDrive.hasVolumeLeases:
-                self.log.error('disk %s has volume leases', vmDrive.name)
-                return response.error('noimpl')
-
-            if vmDrive.transientDisk:
-                self.log.error('disk %s is a transient disk', vmDrive.name)
-                return response.error('transientErr')
-
-            vmDevName = vmDrive.name
-
-            newDrives[vmDevName] = tgetDrv.copy()
-            newDrives[vmDevName]["type"] = "disk"
-            newDrives[vmDevName]["diskType"] = vmDrive.diskType
-            newDrives[vmDevName]["poolID"] = vmDrive.poolID
-            newDrives[vmDevName]["name"] = vmDevName
-            newDrives[vmDevName]["format"] = "cow"
-
-            # We need to keep track of the drive object because
-            # it keeps original data and used to generate snapshot element.
-            # We keep the old volume ID so we can clear the block threshold.
-            vmDrives[vmDevName] = (vmDrive, baseDrv["volumeID"])
-
-        preparedDrives = {}
-
-        for vmDevName, vmDevice in six.iteritems(newDrives):
-            # Adding the device before requesting to prepare it as we want
-            # to be sure to teardown it down even when prepareVolumePath
-            # failed for some unknown issue that left the volume active.
-            preparedDrives[vmDevName] = vmDevice
-            try:
-                newDrives[vmDevName]["path"] = \
-                    self.cif.prepareVolumePath(newDrives[vmDevName])
-            except Exception:
-                self.log.exception('unable to prepare the volume path for '
-                                   'disk %s', vmDevName)
-                _rollbackDrives(preparedDrives)
-                return response.error('snapshotErr')
-
-            drive, _ = vmDrives[vmDevName]
-            snapelem = drive.get_snapshot_xml(vmDevice)
-            disks.appendChild(snapelem)
-
-        snap.appendChild(disks)
-
-        snapFlags = (libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_REUSE_EXT |
-                     libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_NO_METADATA)
-
-        if memoryParams:
-            # Save the needed vm configuration
-            # TODO: this, as other places that use pickle.dump
-            # directly to files, should be done with outOfProcess
-            vmConfVol = memoryParams['dstparams']
-            vmConfVolPath = self.cif.prepareVolumePath(vmConfVol)
-            try:
-                with open(vmConfVolPath, "rb+") as f:
-                    vmConf = _vmConfForMemorySnapshot()
-                    # protocol=2 is needed for clusters < 4.4
-                    # (for Python 2 host compatibility)
-                    data = pickle.dumps(vmConf, protocol=2)
-
-                    # Ensure that the volume is aligned; qemu-img may segfault
-                    # when converting unligned images.
-                    # https://bugzilla.redhat.com/1649788
-                    aligned_length = utils.round(len(data), 4096)
-                    data = data.ljust(aligned_length, b"\0")
-
-                    f.write(data)
-                    f.flush()
-                    os.fsync(f.fileno())
-            finally:
-                self.cif.teardownVolumePath(vmConfVol)
-
-            # Adding the memory volume to the snapshot xml
-            memoryVol = memoryParams['dst']
-            memoryVolPath = self.cif.prepareVolumePath(memoryVol)
-            snap.appendChild(_memorySnapshot(memoryVolPath))
-        else:
-            snapFlags |= libvirt.VIR_DOMAIN_SNAPSHOT_CREATE_DISK_ONLY
-
-        # When creating memory snapshot libvirt will pause the vm
-        should_freeze = not (memoryParams or frozen)
-
-        snapxml = xmlutils.tostring(snap)
-        # TODO: this is debug information. For 3.6.x we still need to
-        # see the XML even with 'info' as default level.
-        self.log.info("%s", snapxml)
-
-        # We need to stop the drive monitoring for two reasons, one is to
-        # prevent spurious libvirt errors about missing drive paths (since
-        # we're changing them), and also to prevent to trigger a drive
-        # extension for the new volume with the apparent size of the old one
-        # (the apparentsize is updated as last step in updateDriveParameters)
-        self.drive_monitor.disable()
-
-        try:
-            if should_freeze:
-                freezed = self.freeze()
-            try:
-                self.log.info("Taking a live snapshot (drives=%s, memory=%s)",
-                              ', '.join(drive["name"] for drive in
-                                        newDrives.values()),
-                              memoryParams is not None)
-                self._dom.snapshotCreateXML(snapxml, snapFlags)
-                self.log.info("Completed live snapshot")
-            except libvirt.libvirtError:
-                self.log.exception("Unable to take snapshot")
-                return response.error('snapshotErr')
-            finally:
-                # Must always thaw, even if freeze failed; in case the guest
-                # did freeze the filesystems, but failed to reply in time.
-                # Libvirt is using same logic (see src/qemu/qemu_driver.c).
-                if should_freeze:
-                    self.thaw()
-
-            # We are padding the memory volume with block size of zeroes
-            # because qemu-img truncates files such that their size is
-            # round down to the closest multiple of block size (bz 970559).
-            # This code should be removed once qemu-img will handle files
-            # with size that is not multiple of block size correctly.
-            if memoryParams:
-                _padMemoryVolume(memoryVolPath, memoryVol['domainID'])
-
-            for drive in newDrives.values():  # Update the drive information
-                _, old_volume_id = vmDrives[drive["name"]]
-                try:
-                    self.updateDriveParameters(drive)
-                except Exception:
-                    # Here it's too late to fail, the switch already happened
-                    # and there's nothing we can do, we must to proceed anyway
-                    # to report the live snapshot success.
-                    self.log.exception("Failed to update drive information"
-                                       " for '%s'", drive)
-
-                drive_obj = lookup.drive_by_name(
-                    self.getDiskDevices()[:], drive["name"])
-                self.clear_drive_threshold(drive_obj, old_volume_id)
-
-                try:
-                    self.updateDriveVolume(drive_obj)
-                except StorageUnavailableError as e:
-                    # Will be recovered on the next monitoring cycle
-                    self.log.error("Unable to update drive %r volume size: %s",
-                                   drive["name"], e)
-
-        finally:
-            self.drive_monitor.enable()
-            if memoryParams:
-                self.cif.teardownVolumePath(memoryVol)
-            if config.getboolean('vars', 'time_sync_snapshot_enable'):
-                self._syncGuestTime()
-
-        # Returning quiesce to notify the manager whether the guest agent
-        # froze and flushed the filesystems or not.
-        quiesce = should_freeze and freezed["status"]["code"] == 0
-        return {'status': doneCode, 'quiesce': quiesce}
+    def snapshot(self, snap_drives, memory_params, frozen,
+                 job_uuid, recovery=False, timeout=30, freeze_timeout=8):
+        job_id = job_uuid or str(uuid.uuid4())
+        job = snapshot.Job(self, snap_drives, memory_params,
+                           frozen, job_id, recovery, timeout,
+                           freeze_timeout)
+        jobs.add(job)
+        vdsm.virt.jobs.schedule(job)
+        return {'status': doneCode}
 
     def diskReplicateStart(self, srcDisk, dstDisk):
         try:
@@ -4257,9 +4356,13 @@ class Vm(object):
 
         if drive.chunked or drive.replicaChunked:
             try:
-                capacity, alloc, physical = self._getExtendInfo(drive)
-                self.extendDriveVolume(drive, drive.volumeID, physical,
-                                       capacity)
+                block_info = self.volume_monitor.query_block_info(
+                    drive, drive.volumeID)
+                self.extend_volume(
+                    drive,
+                    drive.volumeID,
+                    block_info.physical,
+                    block_info.capacity)
             except Exception:
                 self.log.exception("Initial extension request failed for %s",
                                    drive.name)
@@ -4290,7 +4393,7 @@ class Vm(object):
                                                      srcDisk=srcDisk)
 
         # Looking for the replication blockJob info (checking its presence)
-        blkJobInfo = self._dom.blockJobInfo(drive.name, 0)
+        blkJobInfo = self._dom.blockJobInfo(drive.name)
 
         if (not isinstance(blkJobInfo, dict) or
                 'cur' not in blkJobInfo or 'end' not in blkJobInfo):
@@ -4332,7 +4435,7 @@ class Vm(object):
             # errors from the stats threads during the switch from the old
             # drive to the new one. This applies only to the case where we
             # actually switch to the destination.
-            self.drive_monitor.disable()
+            self.volume_monitor.disable()
         else:
             self.log.debug("Stopping the disk replication remaining on the "
                            "source drive: %s", dstDisk)
@@ -4341,7 +4444,7 @@ class Vm(object):
 
         try:
             # Stopping the replication
-            self._dom.blockJobAbort(drive.name, blockJobFlags)
+            self._dom.blockJobAbort(drive.name, flags=blockJobFlags)
         except Exception:
             self.log.exception("Unable to stop the replication for"
                                " the drive: %s", drive.name)
@@ -4358,7 +4461,7 @@ class Vm(object):
                 self.updateDriveParameters(dstDiskCopy)
                 try:
                     self.updateDriveVolume(drive)
-                except StorageUnavailableError as e:
+                except errors.StorageUnavailableError as e:
                     # Will be recovered on the next monitoring cycle
                     self.log.error("Unable to update drive %r volume size: "
                                    "%s", drive.name, e)
@@ -4366,7 +4469,7 @@ class Vm(object):
                 self._delDiskReplica(drive)
 
         finally:
-            self.drive_monitor.enable()
+            self.volume_monitor.enable()
 
         return response.success()
 
@@ -4417,7 +4520,7 @@ class Vm(object):
             ) as dev:
                 del dev['diskReplicate']
 
-        self._sync_metadata()
+        self.sync_metadata()
 
     def _persist_drive_replica(self, drive, replica):
         with self._confLock:
@@ -4426,7 +4529,7 @@ class Vm(object):
             ) as dev:
                 dev['diskReplicate'] = replica
 
-        self._sync_metadata()
+        self.sync_metadata()
 
     def _diskSizeExtendCow(self, drive, newSizeBytes):
         try:
@@ -4434,38 +4537,38 @@ class Vm(object):
             # broken for NFS domains when root_squash was enabled.  This has
             # been fixed since libvirt-0.10.2-29
             curVirtualSize = self._dom.blockInfo(drive.name)[0]
-        except libvirt.libvirtError:
-            self.log.exception("An error occurred while getting the current "
-                               "disk size")
+        except libvirt.libvirtError as e:
+            self.log.exception("Cannot get disk %s current size: %s",
+                               drive.name, e)
             return response.error('resizeErr')
 
         if curVirtualSize > newSizeBytes:
             self.log.error(
-                "Requested extension size %s for disk %s is smaller "
-                "than the current size %s", newSizeBytes, drive.name,
-                curVirtualSize)
+                "Requested size %s is smaller than disk %s volume %s size %s",
+                newSizeBytes, drive.name, drive.volumeID, curVirtualSize)
             return response.error('resizeErr')
 
         # Uncommit the current volume size (mark as in transaction)
         self._setVolumeSize(drive.domainID, drive.poolID, drive.imageID,
                             drive.volumeID, 0)
 
+        flags = libvirt.VIR_DOMAIN_BLOCK_RESIZE_BYTES
+        self.log.debug("Calling blockResise drive=%s size=%s flags=%s",
+                       drive.name, newSizeBytes, flags)
         try:
-            self._dom.blockResize(drive.name, newSizeBytes,
-                                  libvirt.VIR_DOMAIN_BLOCK_RESIZE_BYTES)
-        except libvirt.libvirtError:
-            self.log.exception(
-                "An error occurred while trying to extend the disk %s "
-                "to size %s", drive.name, newSizeBytes)
+            self._dom.blockResize(drive.name, newSizeBytes, flags=flags)
+        except libvirt.libvirtError as e:
+            self.log.exception("Cannot resize disk %s to %s: %s",
+                               drive.name, newSizeBytes, e)
             return response.error('updateDevice')
         finally:
             # Note that newVirtualSize may be larger than the requested size
             # because of rounding in qemu.
             try:
                 newVirtualSize = self._dom.blockInfo(drive.name)[0]
-            except libvirt.libvirtError:
-                self.log.exception("An error occurred while getting the "
-                                   "updated disk size")
+            except libvirt.libvirtError as e:
+                self.log.exception("Cannot get disk %s new size: %s",
+                                   drive.name, e)
                 return response.error('resizeErr')
             self._setVolumeSize(drive.domainID, drive.poolID, drive.imageID,
                                 drive.volumeID, newVirtualSize)
@@ -4473,38 +4576,82 @@ class Vm(object):
         return {'status': doneCode, 'size': str(newVirtualSize)}
 
     def _diskSizeExtendRaw(self, drive, newSizeBytes):
-        # Picking up the volume size extension
-        self.__refreshDriveVolume({
-            'domainID': drive.domainID, 'poolID': drive.poolID,
-            'imageID': drive.imageID, 'volumeID': drive.volumeID,
-            'name': drive.name,
-        })
+        # Picking up the drive size extension.
+        if isVdsmImage(drive):
+            self.refresh_volume({
+                'domainID': drive.domainID, 'poolID': drive.poolID,
+                'imageID': drive.imageID, 'volumeID': drive.volumeID,
+                'name': drive.name,
+            })
 
-        volSize = self._getVolumeSize(
-            drive.domainID, drive.poolID, drive.imageID, drive.volumeID)
+            volSize = self.getVolumeSize(
+                drive.domainID, drive.poolID, drive.imageID, drive.volumeID)
 
-        # For the RAW device we use the volumeInfo apparentsize rather
-        # than the (possibly) wrong size provided in the request.
-        if volSize.apparentsize != newSizeBytes:
-            self.log.info(
-                "The requested extension size %s is different from "
-                "the RAW device size %s", newSizeBytes, volSize.apparentsize)
+            # For the RAW device we use the volumeInfo apparentsize rather
+            # than the (possibly) wrong size provided in the request.
+            if volSize.apparentsize != newSizeBytes:
+                self.log.warning(
+                    "Requested size %s does not match disk %s volume %s size "
+                    "%s, using current size",
+                    newSizeBytes, drive.name, drive.volumeID,
+                    volSize.apparentsize)
+
+        elif "GUID" in drive:
+            # getDeviceList with refresh=false for avoiding a storage refresh.
+            device = self._getLUNDevice(drive, refresh=False)
+            device_capacity = int(device['capacity'])
+            #  In case the engine failed to refresh the LUN on 'RefreshLUN',
+            #  another refresh is needed.
+            if device_capacity != newSizeBytes:
+                self.log.warning(
+                    "LUN %s size %s does not match requested size %s, "
+                    "refreshing LUN",
+                    drive.GUID, device_capacity, newSizeBytes)
+                device = self._getLUNDevice(drive, refresh=True)
+                device_capacity = int(device['capacity'])
+
+            volSize = VolumeSize(device_capacity, None)
+            if volSize.apparentsize != newSizeBytes:
+                self.log.warning(
+                    "Requested size %s does not match disk %s LUN %s size "
+                    "%s, using current size",
+                    newSizeBytes, drive.name, drive.GUID, volSize.apparentsize)
+
+        else:
+            raise exception.UnsupportedDriveType(
+                reason="Cannot resize {}".format(drive))
 
         # At the moment here there's no way to fetch the previous size
         # to compare it with the new one. In the future blockInfo will
         # be able to return the value (fetched from qemu).
 
+        flags = libvirt.VIR_DOMAIN_BLOCK_RESIZE_BYTES
+        self.log.debug("Calling blockResise drive=%s size=%s flags=%s",
+                       drive.name, volSize.apparentsize, flags)
         try:
-            self._dom.blockResize(drive.name, volSize.apparentsize,
-                                  libvirt.VIR_DOMAIN_BLOCK_RESIZE_BYTES)
-        except libvirt.libvirtError:
-            self.log.warning(
-                "Libvirt failed to notify the new size %s to the "
-                "running VM, the change will be available at the ",
-                "reboot", volSize.apparentsize, exc_info=True)
+            self._dom.blockResize(
+                drive.name, volSize.apparentsize, flags=flags)
+        except libvirt.libvirtError as e:
+            self.log.exception("Cannot resize disk %s to %s: e",
+                               drive.name, volSize.apparentsize, e)
             return response.error('updateDevice')
 
         return {'status': doneCode, 'size': str(volSize.apparentsize)}
+
+    def _getLUNDevice(self, drive, refresh=True):
+        res = self.cif.irs.getDeviceList(
+            guids=(drive.GUID,), checkStatus=False, refresh=refresh)
+
+        if res['status']['code'] != 0:
+            raise RuntimeError(
+                "Cannot find device {} for drive {}: {}"
+                .format(drive.GUID, drive, res["status"]["message"]))
+
+        if not res['devList']:
+            raise exception.LUNDoesNotExist(
+                reason="LUN device {} does not exist".format(drive.GUID))
+
+        return res["devList"][0]
 
     def diskSizeExtend(self, driveSpecs, newSizeBytes):
         try:
@@ -4522,9 +4669,9 @@ class Vm(object):
                 return self._diskSizeExtendCow(drive, newSizeBytes)
             else:
                 return self._diskSizeExtendRaw(drive, newSizeBytes)
-        except Exception:
-            self.log.exception("Unable to extend disk %s to size %s",
-                               drive.name, newSizeBytes)
+        except Exception as e:
+            self.log.exception("Unable to extend disk %s to size %s: %s",
+                               drive.name, newSizeBytes, e)
             return response.error('updateDevice')
 
     def onWatchdogEvent(self, action):
@@ -4551,16 +4698,259 @@ class Vm(object):
                       "Action: %s", self.name,
                       actionToString(action))
 
+    @api.guard(_not_migrating)
     def changeCD(self, cdromspec):
-        drivespec = cdromspec['path']
         blockdev = drivename.make(
             cdromspec['iface'], cdromspec['index'])
         iface = cdromspec['iface']
-        return self._changeBlockDev('cdrom', blockdev, drivespec, iface,
-                                    force=bool(drivespec))
 
+        if "drive_spec" in cdromspec:
+            drive_spec = cdromspec["drive_spec"]
+            force = True if drive_spec else False
+            self._change_cd(blockdev, drive_spec, iface, force=force)
+        else:
+            # Old way how to change CD. Kept for backward compatibility.
+            drivespec = cdromspec['path']
+            self._changeBlockDev(
+                'cdrom', blockdev, drivespec, iface, force=bool(drivespec))
+
+        return {'vmList': {}}
+
+    @api.guard(_not_migrating)
     def changeFloppy(self, drivespec):
         return self._changeBlockDev('floppy', 'fda', drivespec)
+
+    def _add_cd_change(self, block_dev, drive_spec):
+        """
+        Start change of CD: add `change` element into CDROM metadata.
+        This element contains state of the change (either loading or ejecting)
+        and in case of loading CD also PDIV with information about CD being
+        loaded into CDROM .
+        """
+        if drive_spec:
+            change_dict = {"state": "loading"}
+            for key in ("poolID", "domainID", "imageID", "volumeID"):
+                change_dict[key] = drive_spec[key]
+        else:
+            change_dict = {"state": "ejecting"}
+
+        with self._md_desc.device(devtype=hwclass.DISK, name=block_dev) as dev:
+            dev["change"] = change_dict
+        self.sync_metadata()
+
+    def _apply_cd_change(self, block_dev):
+        """
+        Finish CD change process: replace CDROM PDIV information in metadata
+        with one from `change` element in case of loading or changing CD.
+        After this switch the `change` element is removed from metadata.
+        Eventually also other elements, which are not needed, like
+        `volumeChain` are removed from CDROM metadata.
+        In case of ejecting CD, all the CDROM metadata is removed.
+        """
+        with self._md_desc.device(devtype=hwclass.DISK, name=block_dev) as dev:
+            if "change" not in dev:
+                self.log.warning("No 'change' element in metadata.")
+                return
+
+            change = dev.pop("change")
+            # Remove change element (and also all other unneeded elements like
+            # volumeChain element, if present) related to previous CD.
+            dev.clear()
+
+            # Store new metadata only when we load or change CD. For ejecting
+            # the CD, don't store any metadata.
+            state = change.pop("state", None)
+            if state == "loading":
+                self.log.debug("Loading CD, change=%s", change)
+                dev.update(change)
+            elif state == "ejecting":
+                self.log.debug("Ejecting CD, clearing all CD metadata.")
+            else:
+                self.log.warning(
+                    "Invalid CD change=%s state=%s.", change, state)
+
+        self.sync_metadata()
+
+    def _discard_cd_change(self, block_dev):
+        """
+        Discards CD change: removes `change` element from CDROM metadata.
+        """
+        with self._md_desc.device(devtype=hwclass.DISK, name=block_dev) as dev:
+            dev.pop("change", None)
+        self.sync_metadata()
+
+    def _recover_cdroms(self):
+        """
+        Recover VM CDROMs if needed during the VM startup.
+        """
+        for dev in self._devices[hwclass.DISK]:
+            if dev.device == "cdrom":
+                try:
+                    self._recover_cd(dev.name)
+                except Exception as e:
+                    self.log.error(
+                        "Failed to recover CD %s: %s", dev.name, e)
+
+    def _recover_cd(self, block_dev):
+        """
+        Recover CD metadata and tear down the CD image if it is no longer used.
+        Possible states are:
+            - <change> element is not present in metadata: no recovery is
+                needed.
+            - <change> element is present, <state> is 'loading', but CD to be
+                loaded is not present in the VM: metadata was modified and
+                new CD may or may not be prepared. Discard CD change and tear
+                down image for new CD.
+            - <change> element is present, <state> is 'loading' and CD to be
+                loaded is present in the VM, i.e. VM already switched CDs:
+                apply CD change and tear down image for old CD.
+            - <change> element is present,  <state> is 'ejecting' and old CD is
+                still present in VM: discard the change.
+            - <change> element is present, <state> is 'ejecting' and old CD is
+                not present in VM any more: apply change and tear down old CD.
+        """
+        with self._md_desc.device(devtype=hwclass.DISK, name=block_dev) as dev:
+            current = dev.copy()
+
+        if "change" not in current:
+            # Nothing to recover.
+            self.log.debug("CD %s does not need recovery" % block_dev)
+            return
+
+        change = current.pop("change")
+        state = change.get("state")
+        if state == "loading":
+            self._recover_loading_cd(block_dev, current, change)
+        elif state == "ejecting":
+            self._recover_ejecting_cd(block_dev, current, change)
+        else:
+            self.log.warning(
+                "Invalid CD change state, change=%s state=%s.", change, state)
+
+    def _recover_loading_cd(self, block_dev, current, change):
+        """
+        Recover CD when new CD is being loaded, but failure happens before
+        the process finish.
+        """
+        # Check if the CD was already switched.
+        try:
+            # Metadata hasn't been updated yet and we cannot rely on it,
+            # therefore findDriveByUUIDs() cannot be used. We have to find
+            # device by name and use path provided by libvirt as additional
+            # device parameters like domainID are linked to the device from
+            # oVirt metadata which hasn't been updated.
+            cd = self.find_device_by_name_or_path(device_name=block_dev)
+            changed = cd.path.endswith(change["volumeID"])
+        except LookupError:
+            # If there's no device, there's no metadata or metadata is wrong.
+            # Print a warning and don't do anything.
+            self.log.warning(
+                "Device %s not found, skipping CD recovery", block_dev)
+            return
+
+        if changed:
+            # If VM already has this CD, failure happened after switching CD,
+            # but before the metadata was updated. Finish the change by
+            # applying change also to metadata and tear down old image. If old
+            # image was already torn down, another tear down does nothing.
+
+            if isVdsmImage(current):
+                # There was a CD in CD tray, tear it down.
+                try:
+                    self.cif.teardownVolumePath(current)
+                except Exception:
+                    self.log.exception(
+                        "Tearing down the device %s failed.", current)
+                    # If tear down failed, we will retry again in the next
+                    # call.
+                    return
+
+            # Apply CD change after tearing down the volume.
+            self.log.info(
+                "Applying CD change to metadata, change=%s", change)
+            self._apply_cd_change(block_dev)
+
+        else:
+            # New CD is not present. Discard CD change and tear down new CD.
+            self.log.info("Removing stale change element, change=%s", change)
+            self._discard_cd_change(block_dev)
+            try:
+                self.cif.teardownVolumePath(change)
+            except Exception:
+                self.log.exception(
+                    "Tearing down the device %s failed.", change)
+
+    def _recover_ejecting_cd(self, block_dev, current, change):
+        """
+        Recover the CD when the old CD is being ejected. If the old CD is
+        still present, discard CD change. Otherwise finish the change and tear
+        down the old CD.
+        """
+        # Check if the CD was already ejected.
+        try:
+            cd = self.find_device_by_name_or_path(device_name=block_dev)
+            ejected = cd.path == ""
+        except LookupError:
+            # If there's no device, there's no metadata or metadata is wrong.
+            # Print a warning and don't do anything.
+            self.log.warning(
+                "Device %s not found, skipping CD recovery", block_dev)
+            return
+
+        if ejected:
+            if isVdsmImage(current):
+                # CD was already ejected. Apply CD change and tear down CD
+                # volume.
+                try:
+                    self.cif.teardownVolumePath(current)
+                except Exception:
+                    self.log.exception(
+                        "Tearing down the device %s failed.", change)
+                    # If tear down failed, we will retry again in the next
+                    # call.
+                    return
+
+            # Apply CD change after tearing down the volume.
+            self.log.info(
+                "Applying CD change to metadata, change=%s", change)
+            self._apply_cd_change(block_dev)
+        else:
+            # CD wasn't ejected. Discard CD change.
+            self.log.info(
+                "Removing stale change element, change=%s", change)
+            self._discard_cd_change(block_dev)
+
+    def _create_disk_xml(self, vm_dev, path, device, iface, type):
+        disk_elem = vmxml.Element('disk', type=type, device=vm_dev)
+        if type == DISK_TYPE.BLOCK:
+            disk_elem.appendChildWithArgs('source', dev=path)
+        else:
+            disk_elem.appendChildWithArgs('source', file=path)
+
+        target = {'dev': device}
+        if iface:
+            target['bus'] = iface
+
+        disk_elem.appendChildWithArgs('target', **target)
+        return xmlutils.tostring(disk_elem)
+
+    def _update_disk_device(self, disk_xml, force=True):
+        self.log.info("Updating disk device using XML: %s", disk_xml)
+
+        if not force:
+            try:
+                self._dom.updateDeviceFlags(disk_xml)
+            except libvirt.libvirtError:
+                self.log.info("Regular device flags update failed.")
+            else:
+                return
+
+        try:
+            self._dom.updateDeviceFlags(
+                disk_xml, libvirt.VIR_DOMAIN_DEVICE_MODIFY_FORCE)
+        except libvirt.libvirtError:
+            self.log.exception("Forceful device flags update failed.")
+            raise exception.ChangeDiskFailed()
 
     def _changeBlockDev(self, vmDev, blockdev, drivespec, iface=None,
                         force=True):
@@ -4569,41 +4959,79 @@ class Vm(object):
         except VolumeError:
             raise exception.ImageFileNotFound()
 
-        diskelem = vmxml.Element('disk', type='file', device=vmDev)
-        diskelem.appendChildWithArgs('source', file=path)
-
-        target = {'dev': blockdev}
-        if iface:
-            target['bus'] = iface
-
-        diskelem.appendChildWithArgs('target', **target)
-        diskelem_xml = xmlutils.tostring(diskelem)
-
-        self.log.info("changeBlockDev: using disk XML: %s", diskelem_xml)
-
-        changed = False
-        if not force:
-            try:
-                self._dom.updateDeviceFlags(diskelem_xml)
-            except libvirt.libvirtError:
-                self.log.info("regular updateDeviceFlags failed")
-            else:
-                changed = True
-
-        if not changed:
-            try:
-                self._dom.updateDeviceFlags(
-                    diskelem_xml, libvirt.VIR_DOMAIN_DEVICE_MODIFY_FORCE
-                )
-            except libvirt.libvirtError:
-                self.log.exception("forceful updateDeviceFlags failed")
-                self.cif.teardownVolumePath(drivespec)
-                raise exception.ChangeDiskFailed()
+        disk_xml = self._create_disk_xml(
+            vmDev, path, blockdev, iface, DISK_TYPE.FILE)
+        self._update_disk_device(disk_xml, force=force)
 
         if vmDev in self.conf:
             self.cif.teardownVolumePath(self.conf[vmDev])
 
-        return {'vmList': {}}
+    def _change_cd(self, device, drive_spec, iface=None, force=True):
+        # Store temporary CD metadata.
+        self._add_cd_change(device, drive_spec)
+
+        # Prepare volume to be loaded as new CD if it's valid PDIV.
+        # When ejecting CD, if PDIV is empty and there's no point to call
+        # prepare volume.
+        if drive_spec:
+            try:
+                path = self.cif.prepareVolumePath(drive_spec)
+            except Exception as e:
+                self._discard_cd_change(device)
+                raise exception.CannotPrepareImage(
+                    reason=str(e),
+                    drive_spec=drive_spec)
+        else:
+            # Empty path means eject CD.
+            path = ""
+
+        disk_type = drive_spec["diskType"] if drive_spec else DISK_TYPE.FILE
+        # Prepare XML for new CD, change CD via libvirt and update CD metadata
+        # with new CD drive spec.
+        disk_xml = self._create_disk_xml(
+            "cdrom", path, device, iface, disk_type)
+
+        try:
+            self._update_disk_device(disk_xml, force=force)
+        except exception.ChangeDiskFailed:
+            try:
+                # Tear down the image only when there is one. In case we eject
+                # CD and fail, pdiv is empty and there's no need for tear
+                # down.
+                if drive_spec:
+                    self.cif.teardownVolumePath(drive_spec)
+                self._discard_cd_change(device)
+            except Exception:
+                self.log.exception(
+                    "Tearing down the device %s failed.", device)
+            # If there is any issue, always raise original exception.
+            raise
+
+        # Tear down old CD volume and update CDROM metadata. At this point the
+        # disk was already update and therefore we will return success
+        # regardless there are any failures during tearing down existing volume
+        # or updating metadata.
+
+        # Store original PDIV to tear it down after metadata update.
+        with self._md_desc.device(devtype=hwclass.DISK, name=device) as dev:
+            teardown_device = dev.copy()
+
+        # Update metadata first to have correct metadata.
+        try:
+            self._apply_cd_change(device)
+        except Exception:
+            self.log.exception(
+                "Updating metadata for device %s failed.", device)
+
+        # Tear down old CD if it wasn't empty disk. This is the case when
+        # loading CD into empty CD-ROM. In such case there are no existing
+        # metadata and teardown_device is empty.
+        if teardown_device and isVdsmImage(teardown_device):
+            try:
+                self.cif.teardownVolumePath(teardown_device)
+            except Exception:
+                self.log.exception(
+                    "Tearing down the device %s failed.", device)
 
     def setTicket(self, otp, seconds, connAct, params):
         """
@@ -4616,22 +5044,23 @@ class Vm(object):
             raise exception.SpiceTicketError(
                 'no graphics devices configured')
         return self._setTicketForGraphicDev(
-            graphics, otp, seconds, connAct, None, params)
+            graphics, otp, seconds, connAct, None, None, params)
 
     def _check_fips_params_valid(self, params):
-            if 'fips' in params and \
-               params.get('fips') not in ['true', 'false']:
-                raise exception.MissingParameter(
-                    'fips param should either be "true", '
-                    '"false" or non-existent')
+        if 'fips' in params and \
+           params.get('fips') not in ['true', 'false']:
+            raise exception.MissingParameter(
+                'fips param should either be "true", '
+                '"false" or non-existent')
 
-            fips = conv.tobool(params.get('fips'))
-            if fips and params.get('vncUsername') is None:
-                raise exception.GeneralException(
-                    'FIPS mode requires vncUsername')
+        fips = conv.tobool(params.get('fips'))
+        if fips and params.get('vncUsername') is None:
+            raise exception.GeneralException(
+                'FIPS mode requires vncUsername')
 
     def _setTicketForGraphicDev(self, graphics, otp, seconds, connAct,
-                                disconnectAction, params):
+                                disconnectAction, consoleDisconnectActionDelay,
+                                params):
         if vmxml.attr(graphics, 'type') == 'vnc':
             self._check_fips_params_valid(params)
 
@@ -4640,7 +5069,7 @@ class Vm(object):
 
             if fips:
                 saslpasswd2.set_vnc_password(vnc_username, otp.value)
-            else:
+            elif vnc_username is not None:
                 saslpasswd2.remove_vnc_password(vnc_username)
 
         vmxml.set_attr(graphics, 'passwd', otp.value)
@@ -4655,6 +5084,8 @@ class Vm(object):
             self._dom.updateDeviceFlags(xmlutils.tostring(graphics), 0)
             self._consoleDisconnectAction = disconnectAction or \
                 ConsoleDisconnectAction.LOCK_SCREEN
+            self._console_disconnect_action_delay = \
+                consoleDisconnectActionDelay or 0
         except virdomain.TimeoutError as tmo:
             raise exception.SpiceTicketError(six.text_type(tmo))
 
@@ -4662,7 +5093,7 @@ class Vm(object):
             hooks.after_vm_set_ticket(self._domain.xml, self._custom, params)
             return {}
 
-    def _reviveTicket(self, newlife):
+    def reviveTicket(self, newlife):
         """
         Revive an existing ticket, if it has expired or about to expire.
         Needs to be called only if Vm.hasSpice == True
@@ -4681,7 +5112,7 @@ class Vm(object):
         libvirt (as in 1.2.3) supports only one graphic device per type
         """
         dom_desc = DomainDescriptor(
-            self._dom.XMLDesc(libvirt.VIR_DOMAIN_XML_SECURE))
+            self._dom.XMLDesc(flags=libvirt.VIR_DOMAIN_XML_SECURE))
         try:
             return next(dom_desc.get_device_elements_with_attrs(
                 hwclass.GRAPHICS, type=deviceType))
@@ -4709,8 +5140,8 @@ class Vm(object):
             self._setGuestCpuRunning(False, flow='IOError')
             self._logGuestCpuStatus('onIOError')
             if reason == 'ENOSPC':
-                if not self.monitor_drives():
-                    self.log.info("No VM drives were extended")
+                if not self.monitor_volumes():
+                    self.log.info("No volumes were extended")
 
             self._send_ioerror_status_event(reason, blockDevAlias)
             self._update_metadata()
@@ -4742,12 +5173,28 @@ class Vm(object):
             hwclass.GRAPHICS, type='spice')))
 
     @property
+    def client_ip(self):
+        return self._clientIp
+
+    @property
     def name(self):
         return self._domain.name
 
+    def update_domain_descriptor(self):
+        self._updateDomainDescriptor()
+
     def _updateDomainDescriptor(self, xml=None):
-        domxml = self._dom.XMLDesc(0) if xml is None else xml
-        self._domain = DomainDescriptor(domxml)
+        domxml = self._dom.XMLDesc() if xml is None else xml
+        self._domain = DomainDescriptor(
+            domxml,
+            xml_source=(
+                XmlSource.INITIAL if xml is not None else
+                XmlSource.LIBVIRT))
+        if xml is None:
+            for name, _, state in self._domain.all_channels():
+                if name == vmchannels.QEMU_GA_DEVICE_NAME and \
+                        state is not None:
+                    self.cif.qga_poller.channel_state_hint(self.id, state)
 
     def _updateMetadataDescriptor(self):
         # load will overwrite any existing content, as per doc.
@@ -4769,7 +5216,22 @@ class Vm(object):
             else:
                 vm['pauseTime'] = self._pause_time
             vm.update(self._exit_info)
-        self._sync_metadata()
+            try:
+                if not self._snapshot_job or \
+                        not jobs.get(self._snapshot_job['jobUUID']).active:
+                    try:
+                        del vm['snapshot_job']
+                    except KeyError:
+                        pass
+                else:
+                    vm['snapshot_job'] = json.dumps(self._snapshot_job)
+            except jobs.NoSuchJob:
+                try:
+                    del vm['snapshot_job']
+                except KeyError:
+                    # It been cleared by a different flow on the metadata.
+                    pass
+        self.sync_metadata()
 
     def save_custom_properties(self):
         if self.min_cluster_version(4, 2):
@@ -4779,7 +5241,7 @@ class Vm(object):
         # in the XML metadata.
         self._md_desc.add_custom(self._custom['custom'])
 
-    def _sync_metadata(self):
+    def sync_metadata(self):
         if self._external:
             return
         self._md_desc.dump(self._dom)
@@ -4814,7 +5276,7 @@ class Vm(object):
             # the invariant: if a VM is monitorable, it has a stats cache
             # entry, to avoid false positives when reporting stats too old.
             self._monitorable = False
-            self.lastStatus = vmstatus.POWERING_DOWN
+            self.set_last_status(vmstatus.POWERING_DOWN, vmstatus.UP)
             # Terminate the VM's creation thread.
             self._incoming_migration_vm_running.set()
             self.guestAgent.stop()
@@ -4827,8 +5289,7 @@ class Vm(object):
             # the extremely rare case where a VM is being powered off at the
             # same time as a live merge is being finalized.  These threads
             # finish quickly unless there are storage connection issues.
-            for t in self._liveMergeCleanupThreads.values():
-                t.join()
+            self._drive_merger.wait_for_cleanup()
 
             self._cleanup()
 
@@ -4911,6 +5372,8 @@ class Vm(object):
             return result
         # Clean VM from the system
         self._deleteVm()
+        # Update shared CPU pool
+        cpumanagement.on_vm_destroy(self)
 
         return response.success()
 
@@ -4931,30 +5394,58 @@ class Vm(object):
         with self._shutdownLock:
             self._shutdownReason = vmexitreason.ADMIN_SHUTDOWN
         try:
-            self._dom.shutdownFlags(libvirt.VIR_DOMAIN_SHUTDOWN_GUEST_AGENT)
+            # The flag is not 100% reliable but it is a good hint
+            is_active = self.cif.qga_poller.is_active(self.id)
+            with self.qga_context():
+                self._dom.shutdownFlags(
+                    libvirt.VIR_DOMAIN_SHUTDOWN_GUEST_AGENT)
+        except exception.NonResponsiveGuestAgent as e:
+            self.log.warning(
+                "Unable to perform shut down by guest agent: %s", e)
+            raise exception.NonResponsiveGuestAgent()
         except virdomain.NotConnectedError:
             # the VM was already shut off asynchronously,
             # so ignore error and quickly exit
             self.log.warning('failed to invoke qemuGuestAgentShutdown: '
                              'domain not connected')
             raise exception.VMIsDown()
-        except libvirt.libvirtError:
-            # it's likely QEMU GA is not installed or not responding
-            logging.exception("Shutdown by QEMU Guest Agent failed")
+        except libvirt.libvirtError as e:
+            # It's likely QEMU GA is not installed or not responding. If we
+            # expected this hide the backtrace. Caller will log the error
+            # anyway.
+            if is_active:
+                self.log.exception("Shutdown by QEMU Guest Agent failed")
+            else:
+                self.log.warning(
+                    "Shutdown by QEMU Guest Agent failed"
+                    " (agent probably inactive)")
+                self.log.debug("QEMU Guest Agent exception info: ", exc_info=e)
             raise exception.NonResponsiveGuestAgent()
 
     def qemuGuestAgentReboot(self):
         try:
-            self._dom.reboot(libvirt.VIR_DOMAIN_REBOOT_GUEST_AGENT)
+            # The flag is not 100% reliable but it is a good hint
+            is_active = self.cif.qga_poller.is_active(self.id)
+            with self.qga_context():
+                self._dom.reboot(libvirt.VIR_DOMAIN_REBOOT_GUEST_AGENT)
+        except exception.NonResponsiveGuestAgent as e:
+            self.log.warning("Unable to perform reboot by guest agent: %s", e)
+            raise exception.NonResponsiveGuestAgent()
         except virdomain.NotConnectedError:
             # the VM was already shut off asynchronously,
             # so ignore error and quickly exit
             self.log.warning('failed to invoke qemuGuestAgentReboot: '
                              'domain not connected')
             raise exception.VMIsDown()
-        except libvirt.libvirtError:
-            # it's likely QEMU GA is not installed or not responding
-            logging.exception("Reboot by QEMU Guest Agent failed")
+        except libvirt.libvirtError as e:
+            # It's likely QEMU GA is not installed or not responding. If we
+            # expected this hide the backtrace. Caller will log the error
+            # anyway.
+            if is_active:
+                self.log.exception("Reboot by QEMU Guest Agent failed")
+            else:
+                self.log.debug(
+                    "Reboot by QEMU Guest Agent failed", exc_info=e)
             raise exception.NonResponsiveGuestAgent()
 
     def acpi_enabled(self):
@@ -4990,6 +5481,10 @@ class Vm(object):
         dev = next(self._domain.get_device_elements('memballoon'))
         if dev.attrib.get('model') == 'none':
             return
+        if not self._ballooning_enabled:
+            self.log.debug('Ignoring balloon target change for VM with'
+                           ' disabled ballooning')
+            return
 
         if not self._dom.connected:
             raise exception.BalloonError()
@@ -5012,6 +5507,7 @@ class Vm(object):
             # created, in this case no balloon device is available
             return {}
         return {
+            'enabled': self._ballooning_enabled,
             'target': self._balloon_target,
             'minimum': self._balloon_minimum,
         }
@@ -5083,99 +5579,140 @@ class Vm(object):
         self.log.debug('event %s detail %s opaque %s',
                        eventToString(event), detail, opaque)
         if event == libvirt.VIR_DOMAIN_EVENT_STOPPED:
-            if (detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_MIGRATED and
-                    self.lastStatus == vmstatus.MIGRATION_SOURCE):
-                try:
-                    hooks.after_vm_migrate_source(
-                        self._domain.xml, self._custom)
-                    for dev in self._customDevices():
-                        hooks.after_device_migrate_source(
-                            dev._deviceXML, self._custom, dev.custom)
-                finally:
-                    self.stopped_migrated_event_processed.set()
-            elif (detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_SAVED and
-                    self.lastStatus == vmstatus.SAVING_STATE):
-                hooks.after_vm_hibernate(self._domain.xml, self._custom)
-            else:
-                exit_code, reason = self._getShutdownReason(
-                    detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_SHUTDOWN)
-                self._onQemuDeath(exit_code, reason)
+            self._handle_libvirt_domain_stopped(detail)
         elif event == libvirt.VIR_DOMAIN_EVENT_SUSPENDED:
-            self._setGuestCpuRunning(False, flow='event.suspend')
-            self._logGuestCpuStatus('onSuspend')
-            if detail in (
-                    libvirt.VIR_DOMAIN_EVENT_SUSPENDED_PAUSED,
-                    libvirt.VIR_DOMAIN_EVENT_SUSPENDED_IOERROR,
-            ):
-                if detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_IOERROR:
-                    try:
-                        self._pause_code = self._readPauseCode()
-                    except libvirt.libvirtError as e:
-                        self.log.warning(
-                            "Couldn't retrieve pause code from libvirt: %s", e)
-                # Libvirt sometimes send the SUSPENDED/SUSPENDED_PAUSED event
-                # after RESUMED/RESUMED_MIGRATED (when VM status is PAUSED
-                # when migration completes, see qemuMigrationFinish function).
-                # In this case self._dom is disconnected because the function
-                # _completeIncomingMigration didn't update it yet.
-                try:
-                    domxml = self._dom.XMLDesc(0)
-                except virdomain.NotConnectedError:
-                    pass
-                else:
-                    hooks.after_vm_pause(domxml, self._custom)
-            elif detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_POSTCOPY:
-                self._post_copy = migration.PostCopyPhase.RUNNING
-                self.log.debug("Migration entered post-copy mode")
-                self._pause_code = 'POSTCOPY'
-                self.send_status_event(pauseCode='POSTCOPY')
-            elif detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_POSTCOPY_FAILED:
-                # This event may be received only on the destination.
-                self.handle_failed_post_copy()
-
+            self._handle_libvirt_domain_suspended(detail)
         elif event == libvirt.VIR_DOMAIN_EVENT_RESUMED:
-            self._setGuestCpuRunning(True, flow='event.resume')
-            self._logGuestCpuStatus('onResume')
-            if detail == libvirt.VIR_DOMAIN_EVENT_RESUMED_UNPAUSED:
-                # This is not a real solution however the safest way to handle
-                # this for now. Ultimately we need to change the way how we are
-                # creating self._dom.
-                # The event handler delivers the domain instance in the
-                # callback however we do not use it.
+            self._handle_libvirt_domain_resumed(detail)
+        elif event == libvirt.VIR_DOMAIN_EVENT_SHUTDOWN:
+            self._handle_libvirt_domain_shutdown(detail)
+
+    def _handle_libvirt_domain_stopped(self, detail):
+        if (detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_MIGRATED and
+                self.lastStatus == vmstatus.MIGRATION_SOURCE):
+            try:
+                hooks.after_vm_migrate_source(
+                    self._domain.xml, self._custom)
+                for dev in self._customDevices():
+                    hooks.after_device_migrate_source(
+                        dev._deviceXML, self._custom, dev.custom)
+            finally:
+                self.stopped_migrated_event_processed.set()
+        elif (detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_SAVED and
+              self.lastStatus == vmstatus.SAVING_STATE):
+            hooks.after_vm_hibernate(self._domain.xml, self._custom)
+        else:
+            exit_code, reason = self._getShutdownReason()
+            self._onQemuDeath(exit_code, reason)
+
+    def _handle_libvirt_domain_suspended(self, detail):
+        self._setGuestCpuRunning(False, flow='event.suspend')
+        self._logGuestCpuStatus('onSuspend')
+        if self.lastStatus == vmstatus.MIGRATION_DESTINATION and \
+           detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_PAUSED:
+            self._incoming_migration_completed()
+        elif detail in (
+                libvirt.VIR_DOMAIN_EVENT_SUSPENDED_PAUSED,
+                libvirt.VIR_DOMAIN_EVENT_SUSPENDED_IOERROR,
+        ):
+            if detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_IOERROR:
                 try:
-                    domxml = self._dom.XMLDesc(0)
-                except virdomain.NotConnectedError:
-                    pass
+                    self._pause_code = self._readPauseCode()
+                except libvirt.libvirtError as e:
+                    self.log.warning(
+                        "Couldn't retrieve pause code from libvirt: %s", e)
+            # Libvirt sometimes send the SUSPENDED/SUSPENDED_PAUSED event
+            # after RESUMED/RESUMED_MIGRATED (when VM status is PAUSED
+            # when migration completes, see qemuMigrationFinish function).
+            # In this case self._dom is disconnected because the function
+            # _completeIncomingMigration didn't update it yet.
+            try:
+                domxml = self._dom.XMLDesc()
+            except virdomain.NotConnectedError:
+                pass
+            else:
+                hooks.after_vm_pause(domxml, self._custom)
+        elif detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_POSTCOPY:
+            self._post_copy = migration.PostCopyPhase.RUNNING
+            self.log.debug("Migration entered post-copy mode")
+            self._pause_code = 'POSTCOPY'
+            self.send_status_event(pauseCode='POSTCOPY')
+        elif detail == libvirt.VIR_DOMAIN_EVENT_SUSPENDED_POSTCOPY_FAILED:
+            # This event may be received only on the destination.
+            self.handle_failed_post_copy()
+
+    def _handle_libvirt_domain_resumed(self, detail):
+        self._setGuestCpuRunning(True, flow='event.resume')
+        self._logGuestCpuStatus('onResume')
+        if detail == libvirt.VIR_DOMAIN_EVENT_RESUMED_UNPAUSED:
+            # This is not a real solution however the safest way to handle
+            # this for now. Ultimately we need to change the way how we are
+            # creating self._dom.
+            # The event handler delivers the domain instance in the
+            # callback however we do not use it.
+            try:
+                domxml = self._dom.XMLDesc()
+            except virdomain.NotConnectedError:
+                pass
+            else:
+                hooks.after_vm_cont(domxml, self._custom)
+        elif detail == libvirt.VIR_DOMAIN_EVENT_RESUMED_MIGRATED:
+            if self.lastStatus == vmstatus.MIGRATION_DESTINATION:
+                self._incoming_migration_completed()
+            elif self.lastStatus == vmstatus.MIGRATION_SOURCE:
+                # Failed migration on the source.  This is normally handled
+                # within the source thread after the migrateToURI3 call
+                # finishes.  But if the VM was migrating during recovery,
+                # there is source thread running and there is no
+                # migrateToURI3 call to wait for migration completion.
+                # So we must tell the source thread to check for this
+                # situation and perform migration cleanup if necessary
+                # (most notably setting the VM status to UP).
+                self._migrationSourceThread.recovery_cleanup()
+        elif (self.lastStatus == vmstatus.MIGRATION_DESTINATION and
+              detail == libvirt.VIR_DOMAIN_EVENT_RESUMED_POSTCOPY):
+            # When we enter post-copy mode, the VM starts actually
+            # running on the destination.  But libvirt doesn't
+            # like when we operate the VM as running, since the
+            # migration job is still running.  That prevents us
+            # from running other libvirt jobs, such as metadata
+            # updates, which can time out, fail, and cause (at
+            # least) migration failure.
+            # So let's just log the event here and keep waiting
+            # for migration completion.  Let's also keep the VM
+            # status as incoming migration, which is what Engine
+            # expects while the VM is still migrating.
+            self.log.info("Migration switched to post-copy mode")
+
+    def _handle_libvirt_domain_shutdown(self, detail):
+        if self._shutdownReason is not None:
+            # Do not overwrite existing shutdown reason
+            return
+        host_shutdown_check_needed = False
+        with self._shutdownLock:
+            if self._shutdownReason is None:
+                if detail == libvirt.VIR_DOMAIN_EVENT_SHUTDOWN_HOST:
+                    self._shutdownReason = vmexitreason.HOST_SHUTDOWN
+                elif detail == libvirt.VIR_DOMAIN_EVENT_SHUTDOWN_GUEST:
+                    self._shutdownReason = vmexitreason.USER_SHUTDOWN
+                    # When a VM is gracefully shut down from
+                    # libvirt-guests service, it's
+                    # indistinguishable from a user shutdown in
+                    # libvirt/QEMU.
+                    host_shutdown_check_needed = True
                 else:
-                    hooks.after_vm_cont(domxml, self._custom)
-            elif detail == libvirt.VIR_DOMAIN_EVENT_RESUMED_MIGRATED:
-                if self.lastStatus == vmstatus.MIGRATION_DESTINATION:
-                    self._incoming_migration_vm_running.set()
-                    self._incomingMigrationFinished.set()
-                elif self.lastStatus == vmstatus.MIGRATION_SOURCE:
-                    # Failed migration on the source.  This is normally handled
-                    # within the source thread after the migrateToURI3 call
-                    # finishes.  But if the VM was migrating during recovery,
-                    # there is source thread running and there is no
-                    # migrateToURI3 call to wait for migration completion.
-                    # So we must tell the source thread to check for this
-                    # situation and perform migration cleanup if necessary
-                    # (most notably setting the VM status to UP).
-                    self._migrationSourceThread.recovery_cleanup()
-            elif (self.lastStatus == vmstatus.MIGRATION_DESTINATION and
-                  detail == libvirt.VIR_DOMAIN_EVENT_RESUMED_POSTCOPY):
-                # When we enter post-copy mode, the VM starts actually
-                # running on the destination.  But libvirt doesn't
-                # like when we operate the VM as running, since the
-                # migration job is still running.  That prevents us
-                # from running other libvirt jobs, such as metadata
-                # updates, which can time out, fail, and cause (at
-                # least) migration failure.
-                # So let's just log the event here and keep waiting
-                # for migration completion.  Let's also keep the VM
-                # status as incoming migration, which is what Engine
-                # expects while the VM is still migrating.
-                self.log.info("Migration switched to post-copy mode")
+                    # If an unexpected 'detail' was received,
+                    # warn the user and set the default value.
+                    self.log.warning(
+                        "Unexpected host/user shutdown detail from"
+                        " libvirt: %s. Assuming user shutdown.", detail
+                    )
+                    self._shutdownReason = vmexitreason.USER_SHUTDOWN
+                    host_shutdown_check_needed = True
+        if host_shutdown_check_needed and host_in_shutdown():
+            with self._shutdownLock:
+                if self._shutdownReason == vmexitreason.USER_SHUTDOWN:
+                    self._shutdownReason = vmexitreason.HOST_SHUTDOWN
 
     def _updateDevicesDomxmlCache(self, xml):
         """
@@ -5232,53 +5769,41 @@ class Vm(object):
         hooks.before_vm_migrate_destination(srcDomXML, self._custom)
         return True
 
-    def getBlockJob(self, drive):
-        for job in self._blockJobs.values():
-            if all([bool(drive[x] == job['disk'][x])
-                    for x in ('imageID', 'domainID', 'volumeID')]):
-                return job
-        raise LookupError("No block job found for drive %r" % drive.name)
+    def _incoming_migration_completed(self):
+        self._incoming_migration_vm_running.set()
+        self._incoming_migration_finished.set()
 
-    def trackBlockJob(self, jobID, drive, base, top, strategy):
-        driveSpec = dict((k, drive[k]) for k in
-                         ('poolID', 'domainID', 'imageID', 'volumeID'))
-        with self._confLock:
-            try:
-                job = self.getBlockJob(drive)
-            except LookupError:
-                newJob = {'jobID': jobID, 'disk': driveSpec,
-                          'baseVolume': base, 'topVolume': top,
-                          'strategy': strategy, 'blockJobType': 'commit'}
-                self._blockJobs[jobID] = newJob
-            else:
-                self.log.error("Cannot add block job %s.  A block job with id "
-                               "%s already exists for image %s", jobID,
-                               job['jobID'], drive['imageID'])
-                raise BlockJobExistsError()
-        self._sync_block_job_info()
-        self._sync_metadata()
-        self._updateDomainDescriptor()
+    def screenshot(self):
+        self.log.debug('Entering screenshot with: vm_id: %s', self.id)
+        if not self._dom.connected:
+            raise exception.VMIsDown()
 
-    def untrackBlockJob(self, jobID):
-        with self._confLock:
-            try:
-                del self._blockJobs[jobID]
-            except KeyError:
-                # If there was contention on the confLock, this may have
-                # already been removed
-                return False
+        buf = bytearray()
+        stream = self._connection.newStream()
+        try:
+            mime_type = self._dom.screenshot(stream, 0)
+            while True:
+                data = stream.recv(262120)
+                if not data:
+                    break
+                buf += data
+        finally:
+            stream.finish()
 
-        self._sync_disk_metadata()
-        self._sync_block_job_info()
-        self._sync_metadata()
-        self._updateDomainDescriptor()
-        return True
+        encoded_string = base64.b64encode(buf).decode('ascii')
+        result = {
+            'data': encoded_string,
+            'encoding': 'base64',
+            'mime_type': mime_type
+        }
 
-    def _sync_block_job_info(self):
+        return dict(result=logutils.Suppressed(result))
+
+    def sync_jobs_metadata(self):
         with self._md_desc.values() as vm:
-            vm['block_jobs'] = json.dumps(self._blockJobs)
+            vm['jobs'] = json.dumps(self._drive_merger.dump_jobs())
 
-    def _sync_disk_metadata(self):
+    def sync_disk_metadata(self):
         for drive in self._devices[hwclass.DISK]:
             info = {}
             for key in ('volumeID', 'volumeChain', 'volumeInfo'):
@@ -5314,7 +5839,7 @@ class Vm(object):
             #   See https://bugzilla.redhat.com/1376580
 
             self.log.debug("Checking xml for drive %r", drive.name)
-            root = ET.fromstring(self._dom.XMLDesc(0))
+            root = ET.fromstring(self._dom.XMLDesc())
             disk_xpath = "./devices/disk/target[@dev='%s'].." % drive.name
             disk = root.find(disk_xpath)
             if disk is None:
@@ -5328,285 +5853,80 @@ class Vm(object):
         """
         Return True if there are VM jobs to monitor
         """
-        with self._jobsLock:
-            # we always do a full check the first time we run.
-            # This may be wasteful on normal flow,
-            # but covers pretty nicely the recovering flow.
-            return self._vmJobs is None or bool(self._blockJobs)
+        # we always do a full check the first time we run.
+        # This may be wasteful on normal flow,
+        # but covers pretty nicely the recovering flow.
+        return self._vmJobs is None or self._drive_merger.has_jobs()
 
     def updateVmJobs(self):
         try:
-            self._vmJobs = self.queryBlockJobs()
+            self._vmJobs = self.query_jobs()
         except Exception:
             self.log.exception("Error updating VM jobs")
 
-    def queryBlockJobs(self):
-        def startCleanup(job, drive, needPivot):
-            t = LiveMergeCleanupThread(self, job, drive, needPivot)
-            t.start()
-            self._liveMergeCleanupThreads[job['jobID']] = t
+    def query_jobs(self):
+        return self._drive_merger.query_jobs()
 
-        jobsRet = {}
-        # We need to take the jobs lock here to ensure that we don't race with
-        # another call to merge() where the job has been recorded but not yet
-        # started.
-        with self._jobsLock:
-            for storedJob in list(self._blockJobs.values()):
-                jobID = storedJob['jobID']
-                self.log.debug("Checking job %s", jobID)
-                cleanThread = self._liveMergeCleanupThreads.get(jobID)
-                if cleanThread and cleanThread.isSuccessful():
-                    # Handle successful jobs early because the job just needs
-                    # to be untracked and the stored disk info might be stale
-                    # anyway (ie. after active layer commit).
-                    self.log.info("Cleanup thread %s successfully completed, "
-                                  "untracking job %s (base=%s, top=%s)",
-                                  cleanThread, jobID,
-                                  storedJob["baseVolume"],
-                                  storedJob["topVolume"])
-                    self.untrackBlockJob(jobID)
-                    continue
+    def on_block_job_event(self, drive, job_type, job_status):
+        """
+        Implement virConnectDomainEventBlockJobCallback.
 
-                try:
-                    drive = self.findDriveByUUIDs(storedJob['disk'])
-                except LookupError:
-                    # Drive loopkup may fail only in case of active layer
-                    # merge, and pivot completed.
-                    disk = storedJob['disk']
-                    if disk["volumeID"] != storedJob["topVolume"]:
-                        self.log.error("Cannot find drive for job %s "
-                                       "(disk=%s)",
-                                       jobID, storedJob['disk'])
-                        continue
-                    # Active layer merge, check if pivot completed.
-                    pivoted_drive = dict(disk)
-                    pivoted_drive["volumeID"] = storedJob["baseVolume"]
-                    try:
-                        drive = self.findDriveByUUIDs(pivoted_drive)
-                    except LookupError:
-                        self.log.error("Pivot completed but cannot find drive "
-                                       "for job %s (disk=%s)",
-                                       jobID, pivoted_drive)
-                        continue
-                entry = {'id': jobID, 'jobType': 'block',
-                         'blockJobType': storedJob['blockJobType'],
-                         'bandwidth': 0, 'cur': '0', 'end': '0',
-                         'imgUUID': storedJob['disk']['imageID']}
+        Currently we only log the event; we may want to use this to optimize
+        waiting for completion.
 
-                liveInfo = None
-                if 'gone' not in storedJob:
-                    try:
-                        liveInfo = self._dom.blockJobInfo(drive.name, 0)
-                    except libvirt.libvirtError:
-                        self.log.exception("Error getting block job info")
-                        jobsRet[jobID] = entry
-                        continue
+        For more info see:
+        https://libvirt.org/html/libvirt-libvirt-domain.html#virConnectDomainEventBlockJobCallback
+        """  # NOQA: E501 (long line)
 
-                if liveInfo:
-                    self.log.debug("Job %s live info: %s", jobID, liveInfo)
-                    entry['bandwidth'] = liveInfo['bandwidth']
-                    entry['cur'] = str(liveInfo['cur'])
-                    entry['end'] = str(liveInfo['end'])
-                    doPivot = self._activeLayerCommitReady(liveInfo, drive)
-                else:
-                    # Libvirt has stopped reporting this job so we know it will
-                    # never report it again.
-                    if 'gone' not in storedJob:
-                        self.log.info("Libvirt job %s was terminated", jobID)
-                    storedJob['gone'] = True
-                    doPivot = False
-                if not liveInfo or doPivot:
-                    if not cleanThread:
-                        # There is no cleanup thread so the job must have just
-                        # ended.  Spawn an async cleanup.
-                        self.log.info("Starting cleanup thread for job: %s",
-                                      jobID)
-                        startCleanup(storedJob, drive, doPivot)
-                    elif cleanThread.isAlive():
-                        # Let previously started cleanup thread continue
-                        self.log.debug("Still waiting for block job %s to be "
-                                       "synchronized", jobID)
-                    elif not cleanThread.isSuccessful():
-                        # At this point we know the thread is not alive and the
-                        # cleanup failed.  Retry it with a new thread.
-                        self.log.info("Previous job %s cleanup thread failed, "
-                                      "retrying", jobID)
-                        startCleanup(storedJob, drive, doPivot)
-                jobsRet[jobID] = entry
-        return jobsRet
+        job_id = "(untracked)"
+
+        # Only COMMIT and ACTIVE_COMMIT jobs are tracked.
+        if job_type in (libvirt.VIR_DOMAIN_BLOCK_JOB_TYPE_COMMIT,
+                        libvirt.VIR_DOMAIN_BLOCK_JOB_TYPE_ACTIVE_COMMIT):
+            job_id = self._drive_merger.find_job_id(drive) or job_id
+
+        type_name = blockjob.type_name(job_type)
+
+        if job_status == libvirt.VIR_DOMAIN_BLOCK_JOB_COMPLETED:
+            self.log.info("Block job %s type %s for drive %s has completed",
+                          job_id, type_name, drive)
+        elif job_status == libvirt.VIR_DOMAIN_BLOCK_JOB_FAILED:
+            self.log.error("Block job %s type %s for drive %s has failed",
+                           job_id, type_name, drive)
+        elif job_status == libvirt.VIR_DOMAIN_BLOCK_JOB_CANCELED:
+            self.log.error("Block job %s type %s for drive %s was canceled",
+                           job_id, type_name, drive)
+        elif job_status == libvirt.VIR_DOMAIN_BLOCK_JOB_READY:
+            self.log.info("Block job %s type %s for drive %s is ready",
+                          job_id, type_name, drive)
+        else:
+            self.log.error(
+                "Block job %s type %s for drive %s: unexpected status %s",
+                job_id, type_name, drive, job_status)
 
     def merge(self, driveSpec, baseVolUUID, topVolUUID, bandwidth, jobUUID):
-        bandwidth = int(bandwidth)
-        if jobUUID is None:
-            jobUUID = str(uuid.uuid4())
+        return self._drive_merger.merge(
+            driveSpec, baseVolUUID, topVolUUID, bandwidth, jobUUID)
 
-        try:
-            drive = self.findDriveByUUIDs(driveSpec)
-        except LookupError:
-            return response.error('imageErr')
-
-        # Check that libvirt exposes full volume chain information
-        chains = self._driveGetActualVolumeChain([drive])
-        if drive['alias'] not in chains:
-            self.log.error("merge: libvirt does not support volume chain "
-                           "monitoring.  Unable to perform live merge.")
-            return response.error('mergeErr')
-
-        actual_chain = chains[drive['alias']]
-
-        try:
-            base_target = drive.volume_target(baseVolUUID, actual_chain)
-            top_target = drive.volume_target(topVolUUID, actual_chain)
-        except VolumeNotFound as e:
-            self.log.error("merge: %s", e)
-            return response.error('mergeErr')
-
-        try:
-            baseInfo = self._getVolumeInfo(drive.domainID, drive.poolID,
-                                           drive.imageID, baseVolUUID)
-            topInfo = self._getVolumeInfo(drive.domainID, drive.poolID,
-                                          drive.imageID, topVolUUID)
-        except StorageUnavailableError:
-            self.log.error("Unable to get volume information")
-            return errCode['mergeErr']
-
-        # If base is a shared volume then we cannot allow a merge.  Otherwise
-        # We'd corrupt the shared volume for other users.
-        if baseInfo['voltype'] == 'SHARED':
-            self.log.error("Refusing to merge into a shared volume")
-            return errCode['mergeErr']
-
-        # Indicate that we expect libvirt to maintain the relative paths of
-        # backing files.  This is necessary to ensure that a volume chain is
-        # visible from any host even if the mountpoint is different.
-        flags = libvirt.VIR_DOMAIN_BLOCK_COMMIT_RELATIVE
-
-        if topVolUUID == drive.volumeID:
-            # Pass a flag to libvirt to indicate that we expect a two phase
-            # block job.  In the first phase, data is copied to base.  Once
-            # completed, an event is raised to indicate that the job has
-            # transitioned to the second phase.  We must then tell libvirt to
-            # pivot to the new active layer (baseVolUUID).
-            flags |= libvirt.VIR_DOMAIN_BLOCK_COMMIT_ACTIVE
-
-        # Make sure we can merge into the base in case the drive was enlarged.
-        if not self._can_merge_into(drive, baseInfo, topInfo):
-            return errCode['destVolumeTooSmall']
-
-        # If the base volume format is RAW and its size is smaller than its
-        # capacity (this could happen because the engine extended the base
-        # volume), we have to refresh the volume to cause lvm to get current lv
-        # size from storage, and update the kernel so the lv reflects the real
-        # size on storage. Not refreshing the volume may fail live merge.
-        # This could happen if disk extended after taking a snapshot but before
-        # performing the live merge.  See https://bugzilla.redhat.com/1367281
-        if (drive.chunked and
-                baseInfo['format'] == 'RAW' and
-                int(baseInfo['apparentsize']) < int(baseInfo['capacity'])):
-            self.log.info("Refreshing raw volume %r (apparentsize=%s, "
-                          "capacity=%s)",
-                          baseVolUUID, baseInfo['apparentsize'],
-                          baseInfo['capacity'])
-            self.__refreshDriveVolume({
-                'domainID': drive.domainID, 'poolID': drive.poolID,
-                'imageID': drive.imageID, 'volumeID': baseVolUUID,
-                'name': drive.name,
-            })
-
-        # Take the jobs lock here to protect the new job we are tracking from
-        # being cleaned up by queryBlockJobs() since it won't exist right away
-        with self._jobsLock:
-            try:
-                self.trackBlockJob(jobUUID, drive, baseVolUUID, topVolUUID,
-                                   'commit')
-            except BlockJobExistsError:
-                self.log.error("A block job is already active on this disk")
-                return response.error('mergeErr')
-
-            orig_chain = [entry.uuid for entry in chains[drive['alias']]]
-            chain_str = volume_chain_to_str(orig_chain)
-            self.log.info("Starting merge with jobUUID=%r, original chain=%s, "
-                          "disk=%r, base=%r, top=%r, bandwidth=%d, flags=%d",
-                          jobUUID, chain_str, drive.name, base_target,
-                          top_target, bandwidth, flags)
-
-            try:
-                self._dom.blockCommit(drive.name, base_target, top_target,
-                                      bandwidth, flags)
-            except libvirt.libvirtError:
-                self.log.exception("Live merge failed (job: %s)", jobUUID)
-                self.untrackBlockJob(jobUUID)
-                return response.error('mergeErr')
-
-        # blockCommit will cause data to be written into the base volume.
-        # Perform an initial extension to ensure there is enough space to
-        # copy all the required data.  Normally we'd use monitoring to extend
-        # the volume on-demand but internal watermark information is not being
-        # reported by libvirt so we must do the full extension up front.  In
-        # the worst case, the allocated size of 'base' should be increased by
-        # the allocated size of 'top' plus one additional chunk to accomodate
-        # additional writes to 'top' during the live merge operation.
-        if drive.chunked and baseInfo['format'] == 'COW':
-            capacity, alloc, physical = self._getExtendInfo(drive)
-            baseSize = int(baseInfo['apparentsize'])
-            topSize = int(topInfo['apparentsize'])
-            maxAlloc = baseSize + topSize
-            self.extendDriveVolume(drive, baseVolUUID, maxAlloc, capacity)
-
-        # Trigger the collection of stats before returning so that callers
-        # of getVmStats after this returns will see the new job
-        self.updateVmJobs()
-
-        return {'status': doneCode}
-
-    def _can_merge_into(self, drive, base_info, top_info):
-        # If the drive was resized the top volume could be larger than the
-        # base volume.  Libvirt can handle this situation for file-based
-        # volumes and block qcow volumes (where extension happens dynamically).
-        # Raw block volumes cannot be extended by libvirt so we require ovirt
-        # engine to extend them before calling merge.  Check here.
-        if drive.diskType != DISK_TYPE.BLOCK or base_info['format'] != 'RAW':
-            return True
-
-        if int(base_info['capacity']) < int(top_info['capacity']):
-            self.log.warning("The base volume is undersized and cannot be "
-                             "extended (base capacity: %s, top capacity: %s)",
-                             base_info['capacity'], top_info['capacity'])
-            return False
-        return True
-
-    def _driveGetActualVolumeChain(self, drives):
-        def lookupDeviceXMLByAlias(domXML, targetAlias):
-            for deviceXML in vmxml.children(DomainDescriptor(domXML).devices):
-                alias = vmdevices.core.find_device_alias(deviceXML)
-                if alias and alias == targetAlias:
-                    return deviceXML
-            raise LookupError("Unable to find matching XML for device %r" %
-                              targetAlias)
-
-        ret = {}
+    def query_drive_volume_chain(self, drive):
         self._updateDomainDescriptor()
-        for drive in drives:
-            alias = drive['alias']
-            diskXML = lookupDeviceXMLByAlias(self._domain.xml, alias)
-            volChain = drive.parse_volume_chain(diskXML)
-            if volChain:
-                ret[alias] = volChain
-        return ret
+        disk_xml = vmdevices.lookup.xml_device_by_alias(
+            self._domain.devices, drive.alias)
+        return drive.parse_volume_chain(disk_xml)
 
-    def _syncVolumeChain(self, drive):
+    def sync_volume_chain(self, drive):
         if not isVdsmImage(drive):
             self.log.debug("Skipping drive '%s' which is not a vdsm image",
                            drive.name)
             return
 
         curVols = [x['volumeID'] for x in drive.volumeChain]
-        chains = self._driveGetActualVolumeChain([drive])
-        try:
-            chain = chains[drive['alias']]
-        except KeyError:
-            self.log.debug("Unable to determine volume chain. Skipping volume "
-                           "chain synchronization for drive %s", drive.name)
+        chain = self.query_drive_volume_chain(drive)
+        if chain is None:
+            self.log.debug(
+                "Cannot get actual volume chain for drive %s alias %s, "
+                "skipping chain synchronization",
+                drive.name, drive.alias)
             return
 
         volumes = [entry.uuid for entry in chain]
@@ -5614,11 +5934,8 @@ class Vm(object):
         self.log.debug("vdsm chain: %s, libvirt chain: %s", curVols, volumes)
 
         # Ask the storage to sync metadata according to the new chain
-        res = self.cif.irs.imageSyncVolumeChain(drive.domainID, drive.imageID,
-                                                drive['volumeID'], volumes)
-        if res['status']['code'] != 0:
-            self.log.error("Unable to synchronize volume chain to storage")
-            raise StorageUnavailableError()
+        self.imageSyncVolumeChain(
+            drive.domainID, drive.imageID, drive['volumeID'], volumes)
 
         if (set(curVols) == set(volumes)):
             return
@@ -5659,6 +5976,15 @@ class Vm(object):
         dev_conf['volumeChain'] = clean_volume_chain(
             dev_conf['volumeChain'], volumes)
 
+    def imageSyncVolumeChain(self, domainID, imageID, volumeID, newVols):
+        res = self.cif.irs.imageSyncVolumeChain(
+            domainID, imageID, volumeID, newVols)
+        if res['status']['code'] != 0:
+            raise errors.StorageUnavailableError(
+                "Unable to sync volume chain for image %s in domain %s volume "
+                "%s requested chain %s: %s",
+                imageID, domainID, volumeID, newVols, res["status"]["message"])
+
     def getDiskDevices(self):
         return self._devices[hwclass.DISK]
 
@@ -5696,47 +6022,43 @@ class Vm(object):
     def onDeviceRemoved(self, device_alias):
         self.log.info("Device removal reported: %s", device_alias)
         try:
-            device, device_hwclass = \
-                vmdevices.lookup.hotpluggable_device_by_alias(
-                    self._devices, device_alias)
-        except LookupError:
-            self.log.warning("Removed device not found in devices: %s",
-                             device_alias)
-            return
-        self._devices[device_hwclass].remove(device)
+            device = self._hotunplugged_devices.pop(device_alias)
+        except KeyError:
+            try:
+                device, device_hwclass = \
+                    vmdevices.lookup.hotpluggable_device_by_alias(
+                        self._devices, device_alias)
+            except LookupError:
+                # This may also happen if Vdsm is restarted between hot unplug
+                # initiation and this event; device cleanup is not performed in
+                # such a case.
+                self.log.warning("Removed device not found in devices: %s",
+                                 device_alias)
+                self._updateDomainDescriptor()
+                return
+            else:
+                self._devices[device_hwclass].remove(device)
         try:
             device.teardown()
-        except libvirt.libvirtError as e:
-            # TODO: This is workaround for https://bugzilla.redhat.com/1655276.
-            # Remove this once https://bugzilla.redhat.com/1658198 is fixed.
-            # libvirt removal event may come before the device is released
-            # from QEMU; let's wait a bit and retry in such a case.
-            if e.get_error_code() == libvirt.VIR_ERR_OPERATION_INVALID:
-                self.log.info("Failed to tear down device %s, retrying",
-                              device_alias)
-                time.sleep(1)
-                device.teardown()
-            else:
-                raise
         finally:
             device.hotunplug_event.set()
         self._updateDomainDescriptor()
 
     # Accessing storage
 
-    def _getVolumeSize(self, domainID, poolID, imageID, volumeID):
+    def getVolumeSize(self, domainID, poolID, imageID, volumeID):
         """ Return volume size info by accessing storage """
         res = self.cif.irs.getVolumeSize(domainID, poolID, imageID, volumeID)
         if res['status']['code'] != 0:
-            raise StorageUnavailableError(
+            raise errors.StorageUnavailableError(
                 "Unable to get volume size for domain %s volume %s" %
                 (domainID, volumeID))
         return VolumeSize(int(res['apparentsize']), int(res['truesize']))
 
-    def _getVolumeInfo(self, domainID, poolID, imageID, volumeID):
+    def getVolumeInfo(self, domainID, poolID, imageID, volumeID):
         res = self.cif.irs.getVolumeInfo(domainID, poolID, imageID, volumeID)
         if res['status']['code'] != 0:
-            raise StorageUnavailableError(
+            raise errors.StorageUnavailableError(
                 "Unable to get volume info for domain %s volume %s" %
                 (domainID, volumeID))
         return res['info']
@@ -5745,156 +6067,165 @@ class Vm(object):
         res = self.cif.irs.setVolumeSize(domainID, poolID, imageID, volumeID,
                                          size)
         if res['status']['code'] != 0:
-            raise StorageUnavailableError(
+            raise errors.StorageUnavailableError(
                 "Unable to set volume size to %s for domain %s volume %s" %
                 (size, domainID, volumeID))
 
+    def run_dom_snapshot(self, snapxml, snap_flags):
+        self._dom.snapshotCreateXML(snapxml, snap_flags)
 
-class LiveMergeCleanupThread(object):
-    def __init__(self, vm, job, drive, doPivot):
-        self.vm = vm
-        self.job = job
-        self.drive = drive
-        self.doPivot = doPivot
-        self.success = False
-        self._thread = concurrent.thread(self.run, name="merge/" + vm.id[:8])
+    def job_stats(self):
+        return self._dom.jobStats()
 
-    def start(self):
-        self._thread.start()
+    def update_snapshot_metadata(self, data):
+        self._snapshot_job = data
+        self._update_metadata()
 
-    def join(self):
-        self._thread.join()
+    def snapshot_metadata(self):
+        return self._snapshot_job
 
-    def isAlive(self):
-        return self._thread.is_alive()
+    def abort_domjob(self):
+        self._dom.abortJob()
 
-    def tryPivot(self):
-        # We call imageSyncVolumeChain which will mark the current leaf
-        # ILLEGAL.  We do this before requesting a pivot so that we can
-        # properly recover the VM in case we crash.  At this point the
-        # active layer contains the same data as its parent so the ILLEGAL
-        # flag indicates that the VM should be restarted using the parent.
-        newVols = [vol['volumeID'] for vol in self.drive.volumeChain
-                   if vol['volumeID'] != self.drive.volumeID]
-        self.vm.cif.irs.imageSyncVolumeChain(self.drive.domainID,
-                                             self.drive.imageID,
-                                             self.drive['volumeID'], newVols)
+    def qemu_agent_command(self, command, timeout, flags):
+        # BEWARE: This interface has to be used only to gather information and
+        # not to change state of the guest! Always prefer libvirt API if
+        # it is available. See libvirt_qemu import above for further
+        # explanation.
+        return libvirt_qemu.qemuAgentCommand(
+            self._dom, command, timeout, flags)
 
-        # A pivot changes the top volume being used for the VM Disk.  Until
-        # we can correct our metadata following the pivot we should not
-        # attempt to monitor drives.
-        # TODO: Stop monitoring only for the live merge disk
-        self.vm.drive_monitor.disable()
+    @contextmanager
+    def qga_context(self,
+                    timeout=libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK):
+        """
+        Invoke QEMU Guest Agent context and set the timeout for the command.
+        The timeout is only valid for the duration of the context. To prevent
+        any unexpected results the timeout is reset to `default` before exiting
+        the context. Libvirt exceptions are not handled and are responsibility
+        of the caller.
 
-        self.vm.log.info("Requesting pivot to complete active layer commit "
-                         "(job %s)", self.job['jobID'])
+        The valid values for timeout are same as for
+        virDomainAgentSetResponseTimeout() call:
+
+        VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK: meaning to block forever
+            waiting for a result.
+        VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_DEFAULT: use default timeout value.
+        VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_NOWAIT: does not wait.
+        positive value: wait for timeout seconds
+
+        Raises NonResponsiveGuestAgent if timeout is reached before acquiring
+        the agent lock.
+
+        The blocking behavior waits 5 seconds for guest-sync command and then
+        blocks for the execution of the requested command. This means that even
+        with blocking behavior one should also be prepared to handle timeouts
+        and non-responsive agent.
+
+        The `default` timeout means that libvirt waits for 5 seconds for
+        guest-sync command then another 5 seconds for the execution of the
+        requested command. We wait for the internal lock also for 5 seconds.
+        This way, if the agent is blocked on a command, we time out after 5
+        seconds just like libvirt would. However, in certain unlikely cases
+        (agent blocked on command and unresponsive guest) this could lead to
+        situations where it would take 10 seconds before timing out (or
+        executing the command). In situations where this unclear behavior (5
+        vs. 10 seconds timeout) may be a problem one should always specify a
+        numeric timeout value instead of relying on default.
+        """
+        # The agent cannot handle multiple simultaneous connections so having a
+        # lock here does not cause any additional bottleneck.
+        start = vdsm.common.time.monotonic_time()
+        acquired = False
         try:
-            flags = libvirt.VIR_DOMAIN_BLOCK_JOB_ABORT_PIVOT
-            self.vm._dom.blockJobAbort(self.drive.name, flags)
-        except libvirt.libvirtError as e:
-            self.vm.drive_monitor.enable()
-            if e.get_error_code() != libvirt.VIR_ERR_BLOCK_COPY_ACTIVE:
-                raise
-            raise BlockCopyActiveError(self.job['jobID'])
-        except:
-            self.vm.drive_monitor.enable()
-            raise
-
-        self._waitForXMLUpdate()
-        self.vm.log.info("Pivot completed (job %s)", self.job['jobID'])
-
-    def update_base_size(self):
-        # If the drive size was extended just after creating the snapshot which
-        # we are removing, the size of the top volume might be larger than the
-        # size of the base volume.  In that case libvirt has enlarged the base
-        # volume automatically as part of the blockCommit operation.  Update
-        # our metadata to reflect this change.
-        topVolUUID = self.job['topVolume']
-        baseVolUUID = self.job['baseVolume']
-        topVolInfo = self.vm._getVolumeInfo(self.drive.domainID,
-                                            self.drive.poolID,
-                                            self.drive.imageID, topVolUUID)
-        self.vm._setVolumeSize(self.drive.domainID, self.drive.poolID,
-                               self.drive.imageID, baseVolUUID,
-                               topVolInfo['capacity'])
-
-    def teardown_top_volume(self):
-        # TODO move this method to storage public API
-        sd_manifest = sdc.sdCache.produce_manifest(self.drive.domainID)
-        sd_manifest.teardownVolume(self.drive.imageID,
-                                   self.job['topVolume'])
-
-    @logutils.traceback()
-    def run(self):
-        self.update_base_size()
-        if self.doPivot:
-            try:
-                self.tryPivot()
-            except BlockCopyActiveError as e:
-                self.vm.log.warning("Pivot failed: %s", e)
-                return
-
-        self.vm.log.info("Synchronizing volume chain after live merge "
-                         "(job %s)", self.job['jobID'])
-        self.vm._syncVolumeChain(self.drive)
-        if self.doPivot:
-            self.vm.drive_monitor.enable()
-        chain_after_merge = [vol['volumeID'] for vol in self.drive.volumeChain]
-        if self.job['topVolume'] not in chain_after_merge:
-            self.teardown_top_volume()
-        self.success = True
-        self.vm.log.info("Synchronization completed (job %s)",
-                         self.job['jobID'])
-
-    def isSuccessful(self):
-        """
-        Returns True if this phase completed successfully.
-        """
-        return self.success
-
-    def _waitForXMLUpdate(self):
-        # Libvirt version 1.2.8-16.el7_1.2 introduced a bug where the
-        # synchronous call to blockJobAbort will return before the domain XML
-        # has been updated.  This makes it look like the pivot failed when it
-        # actually succeeded.  This means that vdsm state will not be properly
-        # synchronized and we may start the vm with a stale volume in the
-        # future.  See https://bugzilla.redhat.com/show_bug.cgi?id=1202719 for
-        # more details.
-        # TODO: Remove once we depend on a libvirt with this bug fixed.
-
-        # We expect libvirt to show that the original leaf has been removed
-        # from the active volume chain.
-        origVols = sorted([x['volumeID'] for x in self.drive.volumeChain])
-        expectedVols = origVols[:]
-        expectedVols.remove(self.drive.volumeID)
-
-        alias = self.drive['alias']
-        self.vm.log.info("Waiting for libvirt to update the XML after pivot "
-                         "of drive %s completed", alias)
-        while True:
-            # This operation should complete in either one or two iterations of
-            # this loop.  Until libvirt updates the XML there is nothing to do
-            # but wait.  While we wait we continue to tell engine that the job
-            # is ongoing.  If we are still in this loop when the VM is powered
-            # off, the merge will be resolved manually by engine using the
-            # reconcileVolumeChain verb.
-            chains = self.vm._driveGetActualVolumeChain([self.drive])
-            if alias not in chains.keys():
-                raise RuntimeError("Failed to retrieve volume chain for "
-                                   "drive %s.  Pivot failed.", alias)
-            curVols = sorted([entry.uuid for entry in chains[alias]])
-
-            if curVols == origVols:
-                time.sleep(1)
-            elif curVols == expectedVols:
-                self.vm.log.info("The XML update has been completed")
-                break
+            # For reasons unknown to me linter thinks acquire() returns
+            # None while it in fact returns True/False.
+            # pylint: disable=assignment-from-no-return
+            if timeout == libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK:
+                acquired = self._qga_lock.acquire(blocking=True, timeout=5)
+            elif timeout == libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_DEFAULT:
+                acquired = self._qga_lock.acquire(blocking=True, timeout=5)
+            elif timeout == libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_NOWAIT:
+                acquired = self._qga_lock.acquire(blocking=False)
             else:
-                self.vm.log.error("Bad volume chain found for drive %s. "
-                                  "Previous chain: %s, Expected chain: %s, "
-                                  "Actual chain: %s", alias, origVols,
-                                  expectedVols, curVols)
-                raise RuntimeError("Bad volume chain found")
+                acquired = self._qga_lock.acquire(
+                    blocking=True, timeout=timeout)
+            # pylint: enable=assignment-from-no-return
+            if not acquired:
+                raise exception.NonResponsiveGuestAgent(
+                    "Timed out waiting for access to qemu-ga")
+            # Timeout values lower than or equal 0 correspond to libvirt
+            # constants
+            if timeout > 0:
+                # Subtract time spent waiting for the lock rounded down to
+                # seconds
+                now = vdsm.common.time.monotonic_time()
+                timeout -= math.floor(now - start)
+                if timeout < 0:
+                    # This should never happen, but let's make sure it is
+                    # handled properly if it does
+                    timeout = libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_NOWAIT
+            self._dom.agentSetResponseTimeout(timeout, 0)
+            yield
+        finally:
+            try:
+                if timeout != libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK:
+                    self._dom.agentSetResponseTimeout(
+                        libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK, 0)
+            finally:
+                if acquired:
+                    self._qga_lock.release()
+
+    def last_disk_hotplug(self):
+        return self._last_disk_hotplug
+
+    def _implied_cpu_policy(self):
+        # For backward compatibility we default to shared unless there
+        # is explicit CPU pinning
+        if len(self._domain.pinned_cpus) > 0:
+            return cpumanagement.CPU_POLICY_MANUAL
+        else:
+            return cpumanagement.CPU_POLICY_NONE
+
+    def cpu_policy(self):
+        """
+        :return: CPU policy configured for the VM. It is one of the
+          CPU_POLICY_* string constants.
+        """
+        if self._cpu_policy is None:
+            return self._implied_cpu_policy()
+        return self._cpu_policy
+
+    def pinned_cpus(self):
+        """
+        :return: frozenset with IDs of pCPUs the VM is pinned to. This is a
+          combination for all vCPUs. Empty frozenset is returned if none of
+          the vCPUs has a pinning defined.
+        """
+        return self._domain.pinned_cpus
+
+    def manually_pinned_cpus(self):
+        if self._manually_pinned_cpus is None:
+            return frozenset(self.pinned_cpus().keys())
+        return self._manually_pinned_cpus
+
+    def pin_vcpu(self, vcpu, cpuset):
+        """
+        Pin vCPU to a set of pCPUs.
+
+        :param vcpu: ID of a vCPU for which to configure pinning.
+        :type vcpu: int
+        :param cpuset: Defines which pCPUs to pin to. It is a list of
+          length L, where L is the number of physical CPUs on the host, and
+          each of the list elements is a boolean defining whether to pin to
+          the corresponding physical CPU or not. If Nth element of the list
+          is True then a vCPU should be pinned to pCPU with ID N.
+        :type cpuset: list
+        """
+        self._dom.pinVcpu(vcpu, cpuset)
+
+    def get_number_of_cpus(self):
+        return int(self._domain.get_number_of_cpus())
 
 
 def update_active_path(volume_chain, volumeID, activePath):

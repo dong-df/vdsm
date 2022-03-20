@@ -1,5 +1,5 @@
 #
-# Copyright 2009-2017 Red Hat, Inc.
+# Copyright 2009-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -47,12 +47,11 @@ SANLOCK_USER = '@SNLKUSER@'
 # Libvirt selinux
 LIBVIRT_SELINUX = '@ENABLE_LIBVIRT_SELINUX@' == 'yes'
 
-MEGAB = 2 ** 20  # = 1024 ** 2 = 1 MiB
-GIB = 1024 * MEGAB
-
 #
 # Path definitions
 #
+P_LIBVIRT_NVRAM = '/var/lib/libvirt/qemu/nvram'
+P_LIBVIRT_SWTPM = '/var/lib/libvirt/swtpm'
 P_LIBVIRT_VMCHANNELS = '/var/lib/libvirt/qemu/channels/'
 P_OVIRT_VMCONSOLES = '/var/run/ovirt-vmconsole-console/'
 P_VDSM = '@VDSMDIR@/'  # NOQA: E501 (potentially long line)
@@ -60,6 +59,8 @@ P_VDSM_HOOKS = '@HOOKSDIR@/'  # NOQA: E501 (potentially long line)
 P_VDSM_LIB = '@VDSMLIBDIR@/'  # NOQA: E501 (potentially long line)
 P_VDSM_RUN = '@VDSMRUNDIR@/'  # NOQA: E501 (potentially long line)
 P_VDSM_CONF = '@CONFDIR@/'  # NOQA: E501 (potentially long line)
+P_TRANSIENT_DISKS = '@VDSMTRANSIENTDISKSDIR@/'  # NOQA: E501 (potentially long line)
+P_BACKUP = '@VDSMRUNBACKUPDIR@/'  # NOQA: E501 (potentially long line)
 
 P_VDSM_LOG = '@VDSMLOGDIR@'  # NOQA: E501 (potentially long line)
 
@@ -95,7 +96,6 @@ EXT_MKFS = '@MKFS_PATH@'
 EXT_MKFS_MSDOS = '@MKFS_MSDOS_PATH@'
 EXT_MKISOFS = '@MKISOFS_PATH@'
 EXT_MOUNT = '@MOUNT_PATH@'
-EXT_MULTIPATH = '@MULTIPATH_PATH@'
 
 EXT_NICE = '@NICE_PATH@'
 

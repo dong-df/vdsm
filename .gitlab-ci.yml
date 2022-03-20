@@ -1,0 +1,22 @@
+image: quay.io/ovirt/vdsm-test-centos-8
+
+variables:
+  TRAVIS_CI: 1
+  EXPORT_DIR: "exported-artifacts"
+
+lint:
+  script:
+    - ./automation/lint.sh
+
+tests-storage:
+  script:
+    - ./automation/tests-storage.sh
+
+rpm:
+  script:
+    - ./automation/rpm.sh
+  artifacts:
+    name: "rpm-centos-8"
+    paths:
+      - "$EXPORT_DIR/"
+    expire_in: 1 week

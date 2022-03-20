@@ -1,4 +1,4 @@
-# Copyright 2017-2019 Red Hat, Inc.
+# Copyright 2017-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,24 +23,22 @@ from __future__ import division
 import io
 import os
 
-import pytest
-import six
-
 from vdsm import jobs
 from vdsm import virtsysprep
 from vdsm.common import response
-from vdsm.common.cmdutils import CommandPath
 from vdsm.virt.jobs import seal
+from vdsm.virt import utils
 
 from testlib import make_uuid
 from testlib import namedTemporaryDir
 from testlib import recorded
 from testlib import VdsmTestCase
-from monkeypatch import MonkeyPatch
+from monkeypatch import MonkeyPatch, MonkeyPatchScope
 
 
-FAKE_VIRTSYSPREP = CommandPath('fake-virt-sysprep',
-                               os.path.abspath('fake-virt-sysprep'))
+BLANK_UUID = '00000000-0000-0000-0000-000000000000'
+FAKE_VIRTSYSPREP = utils.LibguestfsCommand(
+    os.path.abspath('fake-virt-sysprep'))
 TEARDOWN_ERROR_IMAGE_ID = make_uuid()
 
 
@@ -87,7 +85,6 @@ class SealJobTest(VdsmTestCase):
     def tearDownClass(cls):
         jobs.stop()
 
-    @pytest.mark.skipif(six.PY2, reason="test no longer supported on Python 2")
     @MonkeyPatch(virtsysprep, '_VIRTSYSPREP', FAKE_VIRTSYSPREP)
     def test_job(self):
         job_id = make_uuid()
@@ -113,19 +110,22 @@ class SealJobTest(VdsmTestCase):
         with namedTemporaryDir() as base:
             irs = FakeIRS(base)
 
-            job = seal.Job(job_id, sp_id, images, irs)
-            job.autodelete = False
-            job.run()
+            with MonkeyPatchScope([
+                (utils, '_COMMANDS_LOG_DIR', base)
+            ]):
+                job = seal.Job(BLANK_UUID, job_id, sp_id, images, irs)
+                job.autodelete = False
+                job.run()
 
-            self.assertEqual(jobs.STATUS.DONE, job.status)
-            self.assertEqual(expected, irs.__calls__)
+            assert jobs.STATUS.DONE == job.status
+            assert expected == irs.__calls__
 
             for image in images:
                 resultpath = _vol_path(base, image['sd_id'], sp_id,
                                        image['img_id'], ext='.res')
                 with open(resultpath) as f:
                     data = f.read()
-                    self.assertEqual(data, 'fake-virt-sysprep was here')
+                    assert data == 'fake-virt-sysprep was here'
 
     @MonkeyPatch(virtsysprep, '_VIRTSYSPREP', FAKE_VIRTSYSPREP)
     def test_teardown_failure(self):
@@ -153,9 +153,12 @@ class SealJobTest(VdsmTestCase):
         with namedTemporaryDir() as base:
             irs = FakeIRS(base)
 
-            job = seal.Job(job_id, sp_id, images, irs)
-            job.autodelete = False
-            job.run()
+            with MonkeyPatchScope([
+                (utils, '_COMMANDS_LOG_DIR', base)
+            ]):
+                job = seal.Job(BLANK_UUID, job_id, sp_id, images, irs)
+                job.autodelete = False
+                job.run()
 
-            self.assertEqual(jobs.STATUS.FAILED, job.status)
-            self.assertEqual(expected, irs.__calls__)
+            assert jobs.STATUS.FAILED == job.status
+            assert expected == irs.__calls__

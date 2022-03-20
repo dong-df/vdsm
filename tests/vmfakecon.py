@@ -184,6 +184,11 @@ class Connection(object):
 
         return ret
 
+    free_pages = {}
+
+    def getFreePages(self, page_sizes, numa_index, cellCount):
+        return {numa_index: self.free_pages}
+
 
 class Secret(object):
 
@@ -265,7 +270,7 @@ class FakeRunningVm(object):
     def state(self, flags):
         return libvirt.VIR_DOMAIN_RUNNING, ''
 
-    def XMLDesc(self, flags):
+    def XMLDesc(self, flags=0):
         return "<domain type='kvm'><uuid>%s</uuid></domain>" % (self.uuid,)
 
 

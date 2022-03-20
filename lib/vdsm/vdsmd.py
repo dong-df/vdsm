@@ -1,5 +1,5 @@
 #
-# Copyright 2009-2018 Red Hat, Inc. and/or its affiliates.
+# Copyright 2009-2021 Red Hat, Inc. and/or its affiliates.
 #
 # Licensed to you under the GNU General Public License as published by
 # the Free Software Foundation; either version 2 of the License, or
@@ -9,15 +9,10 @@
 
 from __future__ import absolute_import
 from __future__ import print_function
-import sys
 
-# When using Python 2, we must monkey patch threading module before importing
-# any other module.
-if sys.version_info[0] == 2:
-    import pthreading  # pylint: disable=import-error
-    pthreading.monkey_patch()
-
+import atexit
 import os
+import os.path
 import signal
 import getpass
 import pwd
@@ -44,10 +39,10 @@ from vdsm.common import libvirtconnection
 from vdsm.common import sigutils
 from vdsm.common import supervdsm
 from vdsm.common import time
-from vdsm.common import zombiereaper
 from vdsm.common.panic import panic
 from vdsm.config import config
 from vdsm.network.initializer import init_unprivileged_network_components
+from vdsm.network.initializer import stop_unprivileged_network_components
 from vdsm.profiling import profile
 from vdsm.storage.hsm import HSM
 from vdsm.storage.dispatcher import Dispatcher
@@ -80,10 +75,13 @@ def serve_clients(log):
             irs.spmStop(
                 irs.getConnectedStoragePoolsList()['poollist'][0])
 
+    def sigalrmHandler(signum, frame):
+        # Used in panic.panic() when shuting down logging, must not log.
+        raise RuntimeError("Alarm timeout")
+
     sigutils.register()
     signal.signal(signal.SIGTERM, sigtermHandler)
     signal.signal(signal.SIGUSR1, sigusr1Handler)
-    zombiereaper.registerSignalHandler()
 
     profile.start()
     metrics.start()
@@ -119,7 +117,10 @@ def serve_clients(log):
                 sigutils.wait_for_signal()
 
             profile.stop()
+            if config.getboolean('devel', 'coverage_enable'):
+                atexit._run_exitfuncs()
         finally:
+            stop_unprivileged_network_components()
             metrics.stop()
             health.stop()
             periodic.stop()
@@ -228,6 +229,13 @@ def __assertVdsmUser():
         raise FatalError("Vdsm user is not in KVM group")
 
 
+def __assertVdsmHome():
+    home = os.path.expanduser("~")
+    if not os.access(home, os.F_OK | os.R_OK | os.W_OK | os.X_OK):
+        raise FatalError("Home directory: '%s' doesn't exist or doesn't "
+                         "have correct permissions" % home)
+
+
 def __assertSudoerPermissions():
     with tempfile.NamedTemporaryFile() as dst:
         # This cmd choice is arbitrary to validate that sudoers.d/50_vdsm file
@@ -279,6 +287,7 @@ def main():
     try:
         __assertSingleInstance()
         __assertVdsmUser()
+        __assertVdsmHome()
         __assertLogPermission()
         __assertSudoerPermissions()
 

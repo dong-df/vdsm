@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2018 Red Hat, Inc.
+# Copyright 2015-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,6 +20,8 @@
 
 from __future__ import absolute_import
 from __future__ import division
+
+import copy
 import six
 
 
@@ -59,10 +61,12 @@ def protect_passwords(obj):
 
 def unprotect_passwords(obj):
     """
-    Replace ProtectedPassword() objects with the actual password value.
+    Return `obj` with `ProtectedPassword` objects replaced by actual values.
 
     Accept a dict, list of dicts or nested structure containing these types.
+    The original `obj` remains unmodified.
     """
+    obj = copy.deepcopy(obj)
     for d, key, value in _walk(obj):
         if isinstance(value, ProtectedPassword):
             d[key] = value.value
@@ -82,7 +86,8 @@ def unprotect(obj):
 def _walk(obj):
     if isinstance(obj, dict):
         for key, value in six.iteritems(obj):
-            if key == "password":
+            if key == "password" or \
+               isinstance(key, str) and key.startswith("_X_"):
                 yield obj, key, value
             elif isinstance(value, (dict, list)):
                 for d, k, v in _walk(value):

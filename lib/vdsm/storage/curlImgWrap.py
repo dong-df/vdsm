@@ -51,6 +51,16 @@ def _headersToOptions(headers):
     return options
 
 
+def _run_curl(cmd, headers=None):
+    if headers:
+        cmd.extend(_headersToOptions(headers))
+
+    try:
+        return commands.run(cmd)
+    except cmdutils.Error as e:
+        raise CurlError(e.rc, e.out, e.err)
+
+
 def parse_headers(out):
     lines = out.decode("iso-8859-1").splitlines(False)
     # Besides headers curl returns also HTTP status as the first line and the
@@ -59,23 +69,25 @@ def parse_headers(out):
     return dict([x.split(": ", 1) for x in headers])
 
 
-def head(url, headers={}):
+def head(url, headers=None):
     # Cannot be moved out because _curl.cmd is lazy-evaluated
     cmd = [_curl.cmd] + CURL_OPTIONS + ["--head", url]
-    cmd.extend(_headersToOptions(headers))
-
-    try:
-        out = commands.run(cmd)
-    except cmdutils.Error as e:
-        raise CurlError(e.rc, e.out, e.err)
-
+    out = _run_curl(cmd, headers)
     # Parse and return headers
     return parse_headers(out)
 
 
-def download(url, path, headers={}):
+def get(url, headers=None):
+    # Cannot be moved out because _curl.cmd is lazy-evaluated
+    cmd = [_curl.cmd] + CURL_OPTIONS + [url]
+    return _run_curl(cmd, headers)
+
+
+def download(url, path, headers=None):
     cmd = [constants.EXT_CURL_IMG_WRAP, "--download"]
-    cmd.extend(_headersToOptions(headers) + [path, url])
+    if headers:
+        cmd.extend(_headersToOptions(headers))
+    cmd.extend([path, url])
 
     rc, out, err = commands.execCmd(cmd)
 
@@ -83,9 +95,11 @@ def download(url, path, headers={}):
         raise CurlError(rc, out, err)
 
 
-def upload(url, path, headers={}):
+def upload(url, path, headers=None):
     cmd = [constants.EXT_CURL_IMG_WRAP, "--upload"]
-    cmd.extend(_headersToOptions(headers) + [path, url])
+    if headers:
+        cmd.extend(_headersToOptions(headers))
+    cmd.extend([path, url])
 
     rc, out, err = commands.execCmd(cmd)
 

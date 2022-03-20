@@ -90,13 +90,11 @@ errCode = {
     'migrateLimit': exception.MigrationLimitExceeded().response(),
     'recovery': exception.RecoveryInProgress().response(),
     'hostdevDetachErr': exception.HostdevDetachFailed().response(),
+    'migOperationErr': exception.MigrationOperationError().response(),
 }
 
 
 doneCode = {'code': 0, 'message': 'Done'}
-
-Kbytes = 1024
-Mbytes = 1024 * Kbytes
 
 # exitCodes
 ERROR = 1

@@ -13,10 +13,11 @@ import struct
 import threading
 import hooking
 
+from vdsm.common.units import GiB
+
 BLKGETSIZE64 = 0x80081272  # Obtain device size in bytes
 FORMAT = 'L'
 TIMEPERGIB = 0.02  # Approximate qemu-img check time (in seconds) to check 1GiB
-GIB = 2 ** 30  # GiB
 
 '''
 checkimages vdsm hook
@@ -31,7 +32,7 @@ Without 'timeout' specified, particular timeout is computed based on
 image size.
 
 syntax:
-    checkimages=true(|,timeout:\d+\.{1}\d+);
+    checkimages=true(|,timeout:\d+\.{1}\d+);  # noqa: W605
 
 example:
     checkimages=true,timeout:1.12     # Use 1.12 seconds as timeout
@@ -69,7 +70,7 @@ def getImageSize(disk_image, driver_type):
         image_bytes = struct.unpack(FORMAT, dev_buffer)[0]
     elif driver_type == 'file':
         image_bytes = os.stat(disk_image).st_size
-    return float(image_bytes / GIB)
+    return float(image_bytes / GiB)
 
 
 def checkImage(path, timeout):

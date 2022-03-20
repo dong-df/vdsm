@@ -1,5 +1,5 @@
 #
-# Copyright 2011-2019 Red Hat, Inc.
+# Copyright 2011-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,7 +28,7 @@ The semantics of the directories and the search order is as follows:
   file if missing, and never touch this file during upgrade.
 - /etc/vdsm/vdsm.conf.d/ - for admin drop-in conf files.
 - /usr/lib/vdsm/vdsm.conf.d/ - for vendor drop-in configuration files.
-- /var/run/vdsm/vdsm.conf.d/ - for admin temporary configuration.
+- @VDSMRUNDIR@/vdsm.conf.d/ - for admin temporary configuration.
 
 Files with a .conf suffix can be placed into any of the vdsm.conf.d drop-in
 directories.
@@ -68,12 +68,6 @@ parameters = [
         ('fake_nics', 'dummy_*,veth_*',
             'Comma-separated list of fnmatch-patterns for dummy hosts nics to '
             'be shown to vdsm.'),
-
-        ('net_persistence', 'unified',
-            'Whether to use "ifcfg" or "unified" persistence for networks.'),
-
-        ('net_nmstate_enabled', 'false',
-            'Control nmstate network backend provider.'),
 
         ('ethtool_opts', '',
             'Which special ethtool options should be applied to NICs after '
@@ -191,9 +185,6 @@ parameters = [
         ('fake_sriov_enable', 'false',
          'Enable reporting of fake SR-IOV devices.'),
 
-        ('dpdk_enable', 'false',
-         'Enable experimental dpdk support'),
-
         ('http_enable', 'true', 'Enable the http server'),
 
         ('enable_lldp', 'true', 'Enable LLDP'),
@@ -253,14 +244,6 @@ parameters = [
             'allow for passing final state from host to engine,'
             'the rest is used to wait when VMs are shutting down.'),
 
-        ('vm_kill_paused_time', '80',
-            'How many seconds to wait before killing VMs paused due to an I/O '
-            'error. Only VMs explicitly marked as killable by Engine will be '
-            'killed, the value does not have any effect on other VMs. '
-            'The value should be close to sanlock kill interval and in any '
-            'case greater than 0 (to tolerate short disturbances) and '
-            'less than 300 (Engine monitoring interval).'),
-
         ('time_sync_snapshot_enable', 'false',
             'Enable guest time synchronization after snapshot.'
             'This flag can be set when creating snapshots of large Virtual '
@@ -284,6 +267,10 @@ parameters = [
             'compatibility and for those users who may not want Guest Time '
             'Synchronization enabled due to concerns pertaining to '
             'performance, etc.'),
+
+        ('nowait_domain_stats', 'true',
+            'Enable incomplete domain stats retrieval rather than blocking '
+            'on stats retrieval when some stats are temporarily unavailable.'),
     ]),
 
     # Section: [rpc]
@@ -304,7 +291,7 @@ parameters = [
 
         ('conf', '@CONFDIR@/mom.conf', 'mom configuration file'),  # NOQA: E501 (potentially long line)
 
-        ('socket_path', '/var/run/vdsm/mom-vdsm.sock',
+        ('socket_path', '@VDSMRUNDIR@/mom-vdsm.sock',
             'path of the UNIX domain socket used to '
             'communicate with MOM'),
 
@@ -328,19 +315,17 @@ parameters = [
 
         ('irsd', '%(images)s/irsd', None),
 
-        ('volume_utilization_percent', '50',
+        ('volume_utilization_percent', '20',
             'Together with volume_utilization_chunk_mb, set the minimal free '
             'space before a thin provisioned block volume is extended. Use '
-            'lower values to extend earlier.'),
+            'lower values to extend earlier. With the default value (20) the'
+            'system will extend the volume when free space is 80% of '
+            'volume_utilization_chunk_mb (2 GiB).'),
 
-        ('volume_utilization_chunk_mb', '1024',
+        ('volume_utilization_chunk_mb', '2560',
             'Size of extension chunk in megabytes, and together with '
             'volume_utilization_percent, set the free space limit. Use higher '
             'values to extend in bigger chunks.'),
-
-        ('enable_block_threshold_event', 'true',
-            'Use events, instead of polling, to check the write threshold '
-            'on thin-provisioned block-based drives.'),
 
         ('vol_size_sample_interval', '60',
             'How often should the volume size be checked (seconds).'),
@@ -421,6 +406,28 @@ parameters = [
             '(supported versions: 0.10, 1.1)'),
     ]),
 
+    # Section: [iscsi]
+    ('iscsi', [
+        ('parallel_logins', '10',
+            'The maximal number of login to iSCSI portals to be run in '
+            'parallel. (default 10)'),
+    ]),
+
+    # Section: [spm]
+    ('spm', [
+
+        ('watchdog_enable', 'true',
+            'If enabled, montior the SPM lease status and panic if the '
+            'lease status is not expected. The SPM host will lose the '
+            'SPM role, and engine will select a new SPM host. '
+            '(default true)'),
+
+        ('watchdog_interval', '20',
+            'Watchdog check internal in seconds. The recommended '
+            'value is sanlock:io_timeout * 2. '
+            '(default 20)'),
+    ]),
+
     # Section: [multipath]
     ('multipath', [
 
@@ -430,6 +437,37 @@ parameters = [
             'multipath devices used by the hypervisor must be configured '
             'to queue I/O when all paths have failed, and vdsm must not '
             'manage them. Example: 36001405472912345,360014054954321'),
+
+        ('wait_timeout', '10',
+            'Maximum time in seconds to wait until multipathd is ready '
+            'after rescan or connecting to a new server (default 10).'),
+    ]),
+
+    # Section: [lvm]
+    ('lvm', [
+
+        ('config_method', 'devices',
+            'Method how to specify devices which LVM can use. Possible values'
+            'are either "filter" or "devices". Filter method will use LVM '
+            'filter, while device will use LVM devices file. The default '
+            'value is "devices".'),
+    ]),
+
+    # Section: [sanlock]
+    ('sanlock', [
+
+        ('io_timeout', '10',
+            'I/O timeout in seconds. All sanlock timeouts are computed '
+            'based on this value. Using larger timeout will make VMs '
+            'more resilient to short storage outage, but increase VM '
+            'failover time and the time to acquire a host id. For more '
+            'info on sanlock timeouts please check sanlock source: '
+            'https://pagure.io/sanlock/raw/master/f/src/timeouts.h. '
+            'If your storage requires larger timeouts, you can increase '
+            'the value to 15 or 20 seconds. If you change this you need '
+            'to update also multipath no_path_retry. For more info on'
+            'configuring multipath please check /etc/multipath.conf.'
+            'oVirt is tested only with the default value (10 seconds)')
     ]),
 
     # Section: [jobs]
@@ -486,6 +524,12 @@ parameters = [
 
         ('external_vm_lookup_interval', '60',
             'Number of seconds between lookups for external VMs.'),
+
+        ('tpm_data_update_interval', '60',
+            'Number of seconds between checking TPM data for changes.'),
+
+        ('nvram_data_update_interval', '60',
+            'Number of seconds between checking NVRAM data for changes.'),
     ]),
 
     # Section: [metrics]
@@ -538,12 +582,6 @@ parameters = [
             'false by default. Use environment file /etc/sysconfig/vdsm to '
             'set COVERAGE_PROCESS_START and COVERAGE_FILE variables.'),
 
-        ('health_monitor_enable', 'false',
-            'Enable Vdsm health monitoring.'),
-
-        ('health_check_interval', '60',
-            'Number of seconds to wait between health checks.'),
-
         ('m2c_debug_enable', 'false',
             'Enable state information about the SSL connections which is by '
             'default logged to stderr.'),
@@ -553,6 +591,15 @@ parameters = [
 
         ('xml_minimal_changes', 'true',
             'Perform minimal updates to the domain XML when starting a VM.'),
+    ]),
+
+    # Section: [health]
+    ('health', [
+        ('monitor_enable', 'true',
+            'Enable Vdsm health monitoring.'),
+
+        ('check_interval', '300',
+            'Number of seconds to wait between health checks.'),
     ]),
 
     # Section: [gluster]
@@ -600,10 +647,10 @@ parameters = [
     ('v2v', [
 
         ('kvm2ovirt_buffer_size', '1048576',
-                'Size of the buffer (in bytes) used by kvm2ovirt when '
-                'transferring data from source libvirt. It may be necessary '
-                'to tweak the size when communicating with old libvirt or '
-                'for performance tuning.'),
+            'Size of the buffer (in bytes) used by kvm2ovirt when '
+            'transferring data from source libvirt. It may be necessary '
+            'to tweak the size when communicating with old libvirt or '
+            'for performance tuning.'),
     ]),
 
     # Section [guest_agent]
@@ -623,23 +670,29 @@ parameters = [
             'Maximum number of worker threads to serve the periodic tasks '
             'at the same time.'),
 
-        ('cleanup_period', '3600',
-            'How often do the household cleaning and free data about VMs'
-            ' that are no longer running.'),
-
-        # WARNING: This should be as small as possible, we cannot wait for
-        # unresponsive agent. When the call is blocked the libvirt domain is
-        # locked and thus lots of other libvirt calls on the domain are blocked
-        # or unavailble!
         ('qga_command_timeout', '1',
             'Time (in sec) to wait for completion of single call to QEMU'
-            ' Guest Agent.'
-            ' This is for internal usage and may change without warning'),
+            ' Guest Agent. The one second timeout is generous enough for'
+            ' average guest (5x-10x more than needed), but if your guests'
+            ' are permanently under heavy load and queries are timing out'
+            ' you may wish to increase the value. Depending on the number'
+            ' of VMs it may be also necessary to increase qga_task_timeout'
+            ' too.'),
 
-        ('qga_task_timeout', '10',
+        ('qga_task_timeout', '30',
             'Time (in sec) to wait for completion of periodic task.'
-            ' After this time the task is stopped and worker is discarded.'
-            ),
+            ' After this time the task is stopped and worker is discarded.'),
+
+        ('qga_polling_period', '5',
+            'Period (in sec) with which to execute the polling worker.'
+            ' All the other qga_*_period options need to be multiples of this'
+            ' value.'),
+
+        ('qga_initial_info_interval', '120',
+            'Initial interval (in sec) after VM starts in which to ignore'
+            ' qga_info_period and try to query the guest agent every'
+            ' qga_polling_period seconds. This allows us to get the'
+            ' information from the agent as soon as possible.'),
 
         ('qga_info_period', '300',
             'Period (in sec) with which to query the information about'

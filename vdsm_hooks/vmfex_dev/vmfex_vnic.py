@@ -70,9 +70,9 @@ def createDirectPool(conn):
 
     # create a new direct-pool
     content = (['<network>', '<name>direct-pool</name>',
-               '<forward mode="passthrough">'] +
-               ['<interface dev="%s"/>' % nic for nic in getUsableNics()] +
-               ['</forward>', '</network>'])
+               '<forward mode="passthrough">']
+               + ['<interface dev="%s"/>' % nic for nic in getUsableNics()]
+               + ['</forward>', '</network>'])
     xmlDefinition = '\n'.join(content)
     conn.networkDefineXML(xmlDefinition)
     directPool = conn.networkLookupByName('direct-pool')
@@ -88,7 +88,7 @@ def qbhInUse(conn):
     for vmid in conn.listDomainsID():
         # FIXME: we have to hold a reference to domobj due to rhbz#1305338
         domobj = conn.lookupByID(vmid)
-        domxml = minidom.parseString(domobj.XMLDesc(0))
+        domxml = minidom.parseString(domobj.XMLDesc())
         for vport in domxml.getElementsByTagName('virtualport'):
             if vport.getAttribute('type') == '802.1Qbh':
                 return True
@@ -99,7 +99,7 @@ def isDirectPoolUpToDate(conn):
     """Returns whether the currently defined direct pool has exactly the same
     devices as are available in the system."""
     directPool = conn.networkLookupByName('direct-pool')
-    directPoolXml = minidom.parseString(directPool.XMLDesc(0))
+    directPoolXml = minidom.parseString(directPool.XMLDesc())
     currentPoolNics = set([dev.getAttribute('dev') for dev in
                            directPoolXml.getElementsByTagName('interface')])
     return currentPoolNics == set(getUsableNics())
@@ -108,7 +108,7 @@ def isDirectPoolUpToDate(conn):
 def handleDirectPool(conn):
     """Takes care that a libvirt network that holds the VFs in a pool to allow
     migration of VMs that use VM-FEX exists or is created."""
-    with open('/var/run/vdsm/hook-vmfex.lock', 'w') as f:
+    with open('/run/vdsm/hook-vmfex.lock', 'w') as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             if 'direct-pool' not in conn.listNetworks():

@@ -26,6 +26,7 @@ import pytest
 
 from vdsm.common import cmdutils
 from vdsm.common import commands
+from vdsm.common.units import MiB
 
 
 @pytest.mark.skipif(
@@ -42,22 +43,23 @@ while n:
 """
     cmd = ["python", "-c", script]
     cmd = cmdutils.prlimit(cmd, cpu_time=1)
-    rc, out, err = commands.execCmd(cmd, raw=True)
-    assert rc == -9
+    with pytest.raises(cmdutils.Error) as e:
+        commands.run(cmd)
+    assert e.value.rc == -9
 
 
 def test_limit_rss():
     # This should fail to allocate about 100 MiB.
     script = "s = 100 * 1024**2 * 'x'"
     cmd = ["python", "-c", script]
-    cmd = cmdutils.prlimit(cmd, address_space=100 * 1024**2)
-    rc, out, err = commands.execCmd(cmd, raw=True)
-    assert rc == 1
-    assert b"MemoryError" in err
+    cmd = cmdutils.prlimit(cmd, address_space=100 * MiB)
+    with pytest.raises(cmdutils.Error) as e:
+        commands.run(cmd)
+    assert e.value.rc == 1
+    assert b"MemoryError" in e.value.err
 
 
 def test_true():
     # true should succeed with these limits.
-    cmd = cmdutils.prlimit(["true"], address_space=100 * 1024**2, cpu_time=1)
-    rc, out, err = commands.execCmd(cmd, raw=True)
-    assert rc == 0
+    cmd = cmdutils.prlimit(["true"], address_space=100 * MiB, cpu_time=1)
+    assert commands.run(cmd) == b''

@@ -1,5 +1,5 @@
 #
-# Copyright 2011-2017 Red Hat, Inc.
+# Copyright 2011-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -30,6 +30,7 @@ from vdsm import hugepages
 from vdsm import machinetype
 from vdsm import numa
 from vdsm import osinfo
+from vdsm import taskset
 from vdsm import utils
 from vdsm.common import cache
 from vdsm.common import commands
@@ -75,6 +76,7 @@ def _getIscsiIniName():
 
 
 def get():
+    numa.update()
     caps = {}
     cpu_topology = numa.cpu_topology()
 
@@ -87,15 +89,30 @@ def get():
 
     caps['cpuThreads'] = str(cpu_topology.threads)
     caps['cpuSockets'] = str(cpu_topology.sockets)
-    caps['onlineCpus'] = ','.join(cpu_topology.online_cpus)
+    caps['onlineCpus'] = ','.join(
+        [str(cpu_id) for cpu_id in cpu_topology.online_cpus]
+    )
+
+    caps['cpuTopology'] = [
+        {
+            'cpu_id': cpu.cpu_id,
+            'numa_cell_id': cpu.numa_cell_id,
+            'socket_id': cpu.socket_id,
+            'die_id': cpu.die_id,
+            'core_id': cpu.core_id,
+        } for cpu in numa.cpu_info()]
+
     caps['cpuSpeed'] = cpuinfo.frequency()
     caps['cpuModel'] = cpuinfo.model()
     caps['cpuFlags'] = ','.join(_getFlagsAndFeatures())
+    caps['vdsmToCpusAffinity'] = list(taskset.get(os.getpid()))
 
-    caps.update(dsaversion.version_info)
+    caps.update(dsaversion.version_info())
 
-    net_caps = supervdsm.getProxy().network_caps()
+    proxy = supervdsm.getProxy()
+    net_caps = proxy.network_caps()
     caps.update(net_caps)
+    caps['ovnConfigured'] = proxy.is_ovn_configured()
 
     try:
         caps['hooks'] = hooks.installed()
@@ -143,8 +160,14 @@ def get():
     caps['hugepages'] = hugepages.supported()
     caps['kernelFeatures'] = osinfo.kernel_features()
     caps['vncEncrypted'] = _isVncEncrypted()
-    caps['backupEnabled'] = False
+    caps['backupEnabled'] = True
+    caps['coldBackupEnabled'] = True
+    caps['clearBitmapsEnabled'] = True
     caps['fipsEnabled'] = _getFipsEnabled()
+    try:
+        caps['boot_uuid'] = osinfo.boot_uuid()
+    except Exception:
+        logging.exception("Can not find boot uuid")
     caps['tscFrequency'] = _getTscFrequency()
     caps['tscScaling'] = _getTscScaling()
 
@@ -159,6 +182,8 @@ def get():
     caps["domain_versions"] = sc.DOMAIN_VERSIONS
 
     caps["supported_block_size"] = backends.supported_block_size()
+    caps["cd_change_pdiv"] = True
+    caps["refresh_disk_supported"] = True
 
     return caps
 
@@ -202,8 +227,7 @@ def _getTscFrequency():
     caps = xmlutils.fromstring(conn.getCapabilities())
     counter = caps.findall("./host/cpu/counter[@name='tsc']")
     if len(counter) > 0:
-        # Libvirt reports frequency in Hz, cut off last six digits to get MHz
-        return counter[0].get('frequency')[:-6]
+        return counter[0].get('frequency')
     logging.debug('No TSC counter returned by Libvirt')
     return ""
 
@@ -249,4 +273,14 @@ def _getFlagsAndFeatures():
     # list -> set -> list to remove duplicates.
     flags_and_features = list(set(cpuinfo.flags() +
                                   machinetype.cpu_features()))
-    return flags_and_features + machinetype.compatible_cpu_models()
+    cpu_models = machinetype.compatible_cpu_models()
+    # Easier to add here than in Engine:
+    # If -IBRS suffix is present in any of the compatible CPU models,
+    # we can assume spec_ctrl feature.
+    for model in cpu_models:
+        if model.endswith('-IBRS'):
+            spec_ctrl = 'spec_ctrl'
+            if spec_ctrl not in flags_and_features:
+                flags_and_features.append(spec_ctrl)
+            break
+    return flags_and_features + cpu_models

@@ -1,6 +1,6 @@
 #
 # Copyright 2017 IBM Corp.
-# Copyright 2012-2019 Red Hat, Inc.
+# Copyright 2012-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -36,10 +36,11 @@ from vdsm.common import cpuarch
 
 class FakeConnection(object):
 
-    def __init__(self, arch):
+    def __init__(self, arch, file_name=None):
         test_path = os.path.realpath(__file__)
         dir_name = os.path.split(test_path)[0]
-        file_name = 'domcaps_libvirt_%s.out' % (arch,)
+        if file_name is None:
+            file_name = 'domcaps_libvirt_%s.out' % (arch,)
         self.domcapspath = os.path.join(dir_name, file_name)
         self.arch = arch
 

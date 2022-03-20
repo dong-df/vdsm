@@ -1,4 +1,4 @@
-# Copyright 2016-2019 Red Hat, Inc.
+# Copyright 2016-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,176 +20,238 @@
 from __future__ import absolute_import
 from __future__ import division
 
-import six
-
 from vdsm.network import errors as ne
-from vdsm.network.configurators import RunningConfig
 from vdsm.network.kernelconfig import KernelConfig
-from vdsm.network.link import dpdk
-from vdsm.network.link.bond import Bond
 from vdsm.network.link.bond import sysfs_options
-from vdsm.network.netinfo.nics import nics
+from vdsm.network.netconfpersistence import RunningConfig
+from vdsm.network.netinfo.cache import NetInfo
 
 
 MAX_NAME_LEN = 15
 ILLEGAL_CHARS = frozenset(':. \t')
 
 
-def validate_southbound_devices_usages(nets, ni):
-    kernel_config = KernelConfig(ni)
+class Validator(object):
+    def __init__(self, nets, bonds, net_info):
+        self._nets = nets
+        self._bonds = bonds
+        self._net_info = NetInfo(net_info)
+        self._desired_config = self._create_desired_config()
+        self._running_config = RunningConfig()
 
-    for requested_net, net_info in six.viewitems(nets):
-        if 'remove' in net_info:
-            kernel_config.removeNetwork(requested_net)
+    def validate_bond(self, name):
+        _BondValidator(
+            name, self._bonds[name], self._desired_config, self._net_info
+        ).validate()
 
-    for requested_net, net_info in six.viewitems(nets):
-        if 'remove' in net_info:
-            continue
-        kernel_config.setNetwork(requested_net, net_info)
+    def validate_net(self, name):
+        _NetValidator(
+            name,
+            self._nets[name],
+            self._desired_config,
+            self._net_info,
+            self._running_config,
+        ).validate()
 
-    underlying_devices = []
-    for net_name, net_attrs in six.viewitems(kernel_config.networks):
-        vlan = net_attrs.get('vlan')
-        if 'bonding' in net_attrs:
-            underlying_devices.append((net_attrs['bonding'], vlan))
-        elif 'nic' in net_attrs:
-            underlying_devices.append((net_attrs['nic'], vlan))
+    def validate_southbound_devices_usages(self):
+        underlying_devices = []
+        for (net_name, net_attrs) in self._desired_config.networks.items():
+            vlan = net_attrs.get('vlan')
+            if 'bonding' in net_attrs:
+                underlying_devices.append((net_attrs['bonding'], vlan))
+            elif 'nic' in net_attrs:
+                underlying_devices.append((net_attrs['nic'], vlan))
+            else:
+                if not net_attrs['bridged']:
+                    raise ne.ConfigNetworkError(
+                        ne.ERR_BAD_PARAMS,
+                        'southbound device not specified for non-bridged '
+                        f'network "{net_name}"',
+                    )
+
+        if len(set(underlying_devices)) < len(underlying_devices):
+            raise ne.ConfigNetworkError(
+                ne.ERR_BAD_PARAMS,
+                'multiple networks/similar vlans cannot be'
+                ' defined on a single underlying device. '
+                f'kernel networks: {self._desired_config.networks}\n'
+                f'requested networks: {self._nets}',
+            )
+
+    def validate_nic_usage(self):
+        used_bond_slaves = set()
+        for bond_attr in self._desired_config.bonds.values():
+            used_bond_slaves |= set(bond_attr['nics'])
+
+        used_net_nics = {
+            net_attr['nic']
+            for net_attr in self._desired_config.networks.values()
+            if net_attr.get('nic')
+        }
+
+        # This should care only about vlans that are not owned by vdsm
+        used_unmanaged_vlan_nics = self._get_unmanaged_vlan_nics()
+
+        shared_by_bond_and_nets = used_bond_slaves & used_net_nics
+        shared_by_vlan_and_bond = used_bond_slaves & used_unmanaged_vlan_nics
+
+        shared_nics = shared_by_vlan_and_bond or shared_by_bond_and_nets
+        if shared_nics:
+            raise ne.ConfigNetworkError(
+                ne.ERR_USED_NIC, f'Nics with multiple usages: {shared_nics}'
+            )
+
+    def _get_unmanaged_vlan_nics(self):
+        southbounds_managed_by_vdsm = {
+            net_attr['southbound']
+            for net_attr in self._net_info.networks.values()
+        }
+        return {
+            vlan_attr['iface']
+            for vlan, vlan_attr in self._net_info.vlans.items()
+            if vlan not in southbounds_managed_by_vdsm
+        }
+
+    def _create_desired_config(self):
+        desired_config = KernelConfig(self._net_info)
+
+        for net_name, net_attr in self._nets.items():
+            if 'remove' in net_attr:
+                desired_config.removeNetwork(net_name)
+            else:
+                desired_config.setNetwork(net_name, net_attr)
+
+        for bond_name, bond_attr in self._bonds.items():
+            if 'remove' in bond_attr:
+                desired_config.removeBonding(bond_name)
+            else:
+                desired_config.setBonding(bond_name, bond_attr)
+        return desired_config
+
+
+class _NetValidator(object):
+    def __init__(self, name, attrs, desired_config, net_info, running_config):
+        self._name = name
+        self._attrs = attrs
+        self._desired_config = desired_config
+        self._net_info = net_info
+        self._running_config = running_config
+
+        self._remove = attrs.get('remove')
+        self._nic = attrs.get('nic')
+        self._bond = attrs.get('bonding')
+        self._vlan = attrs.get('vlan')
+        self._bridged = attrs.get('bridged')
+
+    def validate(self):
+        if self._remove:
+            self._validate_network_remove()
+            self._validate_network_exists()
+            return
+
+        if self._vlan:
+            _validate_vlan_id(self._vlan)
+
+        # Missing nic or bond is fine as we support nicless networks
+        if self._nic:
+            _validate_nic_exists(self._nic, self._net_info.nics)
+        elif self._bond:
+            self._validate_bond_exists()
+
+        if self._bridged:
+            validate_bridge_name(self._name)
+
+    def _validate_network_remove(self):
+        net_attrs_set = set(self._attrs) - {'remove', 'custom'}
+        if net_attrs_set:
+            raise ne.ConfigNetworkError(
+                ne.ERR_BAD_PARAMS,
+                'Cannot specify any attribute when removing (except custom)).',
+            )
+
+    def _validate_network_exists(self):
+        if (
+            self._name not in self._net_info.networks
+            and self._name not in self._running_config.networks
+        ):
+            raise ne.ConfigNetworkError(
+                ne.ERR_BAD_BRIDGE,
+                'Cannot delete '
+                f'network {self._name}: It doesn\'t exist in the system',
+            )
+
+    def _validate_bond_exists(self):
+        if self._bond not in self._desired_config.bonds:
+            raise ne.ConfigNetworkError(
+                ne.ERR_BAD_BONDING, f'Bond {self._bond} does not exist'
+            )
+
+
+class _BondValidator(object):
+    def __init__(self, name, attrs, desired_config, net_info):
+        self._name = name
+        self._desired_config = desired_config
+        self._net_info = net_info
+
+        self._remove = attrs.get('remove')
+        self._nics = attrs.get('nics')
+        self._options = attrs.get('options')
+
+    def validate(self):
+        if self._remove:
+            self._validate_bond_removal()
+            return
+
+        if self._nics:
+            self._validate_bond_addition()
         else:
-            if not net_attrs['bridged']:
-                raise ne.ConfigNetworkError(
-                    ne.ERR_BAD_PARAMS,
-                    'southbound device not specified for non-bridged '
-                    'network "{}"'.format(net_name),
-                )
+            raise ne.ConfigNetworkError(
+                ne.ERR_BAD_NIC, 'Missing nics attribute'
+            )
 
-    if len(set(underlying_devices)) < len(underlying_devices):
-        raise ne.ConfigNetworkError(
-            ne.ERR_BAD_PARAMS,
-            'multiple networks/similar vlans cannot be'
-            ' defined on a single underlying device. '
-            'kernel networks: {}\nrequested networks: {}'.format(
-                kernel_config.networks, nets
-            ),
-        )
+        if self._options:
+            _validate_bond_options(self._options)
 
+    def _validate_bond_removal(self):
+        nets_with_bond = {
+            net
+            for net, attrs in self._desired_config.networks.items()
+            if attrs.get('bonding') == self._name
+        }
 
-def validate_nic_usage(
-    req_nets, req_bonds, kernel_nets_nics, kernel_bonds_slaves
-):
-    request_bonds_slaves = set()
-    for bond_attr in six.itervalues(req_bonds):
-        if 'remove' in bond_attr:
-            continue
-        request_bonds_slaves |= set(bond_attr['nics'])
+        if nets_with_bond:
+            raise ne.ConfigNetworkError(
+                ne.ERR_USED_BOND,
+                'Cannot remove bonding {}: used by network ({}).'.format(
+                    self._name, nets_with_bond
+                ),
+            )
 
-    request_nets_nics = set()
-    for net_attr in six.itervalues(req_nets):
-        if 'remove' in net_attr:
-            continue
-        nic = net_attr.get('nic')
-        if nic:
-            request_nets_nics |= {nic}
-
-    shared_nics = (request_bonds_slaves | kernel_bonds_slaves) & (
-        request_nets_nics | kernel_nets_nics
-    )
-    if shared_nics:
-        raise ne.ConfigNetworkError(
-            ne.ERR_USED_NIC, 'Nics with multiple usages: %s' % shared_nics
-        )
+    def _validate_bond_addition(self):
+        for slave in self._nics:
+            _validate_nic_exists(slave, self._net_info.nics)
 
 
 def validate_network_setup(nets, bonds, net_info):
-    kernel_nics = nics()
-    kernel_bonds = Bond.bonds()
-    current_nets = net_info['networks']
-    for net, attrs in six.iteritems(nets):
-        validate_net_configuration(
-            net,
-            attrs,
-            bonds,
-            kernel_bonds,
-            kernel_nics,
-            current_nets,
-            RunningConfig().networks,
+    validator = Validator(nets, bonds, net_info)
+    validator.validate_southbound_devices_usages()
+    for net in nets.keys():
+        validator.validate_net(net)
+    for bond in bonds.keys():
+        validator.validate_bond(bond)
+    validator.validate_nic_usage()
+
+
+def validate_bridge_name(bridge_name):
+    if (
+        not bridge_name
+        or len(bridge_name) > MAX_NAME_LEN
+        or set(bridge_name) & ILLEGAL_CHARS
+        or bridge_name.startswith('-')
+    ):
+        raise ne.ConfigNetworkError(
+            ne.ERR_BAD_BRIDGE, f'Bridge name isn\'t valid: {bridge_name}'
         )
-    for bond, attrs in six.iteritems(bonds):
-        validate_bond_configuration(
-            bond, attrs, nets, current_nets, kernel_nics
-        )
-    validate_nic_usage(
-        nets,
-        bonds,
-        _get_kernel_nets_nics(current_nets, kernel_bonds, nets),
-        _get_kernel_bonds_slaves(kernel_bonds, bonds),
-    )
-
-
-def validate_net_configuration(
-    net,
-    netattrs,
-    desired_bonds,
-    current_bonds,
-    current_nics,
-    netinfo_networks=None,
-    running_config_networks=None,
-):
-    """Test if network meets logical Vdsm requiremets.
-
-    Bridgeless networks are allowed in order to support Engine requirements.
-
-    Checked by OVS:
-        - only one vlan per tag
-    """
-    _validate_network_remove(
-        net, netattrs, netinfo_networks or {}, running_config_networks or {}
-    )
-    nic = netattrs.get('nic')
-    bond = netattrs.get('bonding')
-    vlan = netattrs.get('vlan')
-    bridged = netattrs.get('bridged')
-
-    if vlan is None:
-        if nic:
-            _validate_nic_exists(nic, current_nics)
-        if bond:
-            _validate_bond_exists(bond, desired_bonds, current_bonds)
-    else:
-        _validate_vlan_id(vlan)
-
-    if bridged:
-        validate_bridge_name(net)
-
-
-def validate_bond_configuration(
-    bond, bondattrs, desired_nets, current_nets, current_nics
-):
-    if 'remove' in bondattrs:
-        _validate_bond_removal(bond, desired_nets, current_nets)
-    elif 'nics' in bondattrs:
-        _validate_bond_addition(bondattrs['nics'], current_nics)
-    else:
-        raise ne.ConfigNetworkError(ne.ERR_BAD_NIC, 'Missing nics attribute')
-
-    if 'options' in bondattrs:
-        _validate_bond_options(bondattrs['options'])
-
-
-def _get_kernel_nets_nics(networks, kernel_bonds, req_nets):
-    return {
-        netattr['southbound']
-        for netname, netattr in networks.items()
-        if netattr['southbound'] not in kernel_bonds
-        and not req_nets.get(netname, {}).get('remove', False)
-    }
-
-
-def _get_kernel_bonds_slaves(kernel_bonds, req_bonds):
-    kernel_bonds_slaves = set()
-    for bond_name in kernel_bonds:
-        if not req_bonds.get(bond_name, {}).get('remove', False):
-            kernel_bonds_slaves |= Bond(bond_name).slaves
-    return kernel_bonds_slaves
 
 
 def _validate_vlan_id(id):
@@ -208,29 +270,6 @@ def _validate_vlan_id(id):
             ne.ERR_BAD_VLAN,
             'VLAN id out of range: %r, must be 0..%s' % (id, MAX_ID),
         )
-
-
-def _validate_network_remove(
-    netname, netattrs, netinfo_networks, running_config_networks
-):
-    netattrs_set = set(netattrs)
-    is_remove = netattrs.get('remove')
-    if is_remove and netattrs_set - set(['remove', 'custom']):
-        raise ne.ConfigNetworkError(
-            ne.ERR_BAD_PARAMS,
-            'Cannot specify any attribute when removing (except custom)).',
-        )
-    if is_remove:
-        if (
-            netname not in netinfo_networks
-            and netname not in running_config_networks
-        ):
-            raise ne.ConfigNetworkError(
-                ne.ERR_BAD_BRIDGE,
-                "Cannot delete "
-                "network %r: It doesn't exist in the "
-                "system" % netname,
-            )
 
 
 def _validate_bond_options(bond_options):
@@ -257,73 +296,8 @@ def _validate_bond_options(bond_options):
             )
 
 
-def _validate_bond_exists(bond, desired_bonds, running_bonds):
-    running_bond = bond in running_bonds
-    bond2setup = bond in desired_bonds and 'remove' not in desired_bonds[bond]
-    if not running_bond and not bond2setup:
-        raise ne.ConfigNetworkError(
-            ne.ERR_BAD_BONDING, 'Bond %s does not exist' % bond
-        )
-
-
-def _validate_bond_addition(nics, current_nics):
-    for nic in nics:
-        _validate_nic_exists(nic, current_nics)
-        if dpdk.is_dpdk(nic):
-            raise ne.ConfigNetworkError(
-                ne.ERR_BAD_NIC,
-                '%s is a dpdk device and not supported as a slave of bond'
-                % nic,
-            )
-
-
-def _validate_bond_removal(bond, desired_nets, current_nets):
-    current_nets_with_bond = {
-        net
-        for net, attrs in six.iteritems(current_nets)
-        if attrs['southbound'] == bond
-    }
-
-    add_nets_with_bond = set()
-    remove_nets_with_bond = set()
-    for net, attrs in six.iteritems(desired_nets):
-        if 'remove' in attrs:
-            if net in current_nets_with_bond:
-                remove_nets_with_bond.add(net)
-        elif net in current_nets:
-            if net in current_nets_with_bond:
-                remove_nets_with_bond.add(net)
-            if attrs.get('bonding') == bond:
-                add_nets_with_bond.add(net)
-        elif attrs.get('bonding') == bond:
-            add_nets_with_bond.add(net)
-
-    nets_with_bond = add_nets_with_bond or (
-        current_nets_with_bond - remove_nets_with_bond
-    )
-    if nets_with_bond:
-        raise ne.ConfigNetworkError(
-            ne.ERR_USED_BOND,
-            'Cannot remove bonding {}: used by network ({}).'.format(
-                bond, nets_with_bond
-            ),
-        )
-
-
 def _validate_nic_exists(nic, current_nics):
     if nic not in current_nics:
         raise ne.ConfigNetworkError(
             ne.ERR_BAD_NIC, 'Nic %s does not exist' % nic
-        )
-
-
-def validate_bridge_name(bridge_name):
-    if (
-        not bridge_name
-        or len(bridge_name) > MAX_NAME_LEN
-        or set(bridge_name) & ILLEGAL_CHARS
-        or bridge_name.startswith('-')
-    ):
-        raise ne.ConfigNetworkError(
-            ne.ERR_BAD_BRIDGE, "Bridge name isn't valid: %r" % bridge_name
         )

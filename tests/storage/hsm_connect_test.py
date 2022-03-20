@@ -26,6 +26,7 @@ import pytest
 
 from storage.storagetestlib import FakeStorageDomainCache
 
+from vdsm.storage import exception as se
 from vdsm.storage import hsm
 from vdsm.storage import sd
 from vdsm.storage import storageServer
@@ -37,14 +38,11 @@ class FakeConnectHSM(hsm.HSM):
         self.prefetched_domains = {}
         pass
 
-    def _connectStorageOverIser(self, conDef, conObj, conTypeId):
-        pass
-
     def _prefetchDomains(self, domType, conObj):
         return self.prefetched_domains
 
 
-class FakeConnection(object):
+class FakeConnection(storageServer.Connection):
     def __init__(self, conInfo):
         self.conInfo = conInfo
         self.connected = False
@@ -62,7 +60,15 @@ class FakeConnection(object):
         self.connected = False
 
 
+class FakeConnectionTypes(dict):
+    def __getitem__(self, key):
+        return FakeConnection
+
+
 class FakeConnectionFactory(object):
+
+    registeredConnectionTypes = FakeConnectionTypes()
+
     def __init__(self):
         self.connections = {}
 
@@ -101,7 +107,7 @@ def test_refresh_storage_once(fake_hsm, conn_type, expected_calls):
     connections = [{'id': '1', 'connection': 'test', 'port': '3660'},
                    {'id': '2', 'connection': 'test2', 'port': '3660'},
                    {'id': '3', 'connection': 'test3', 'port': '3660'}]
-    fake_hsm.connectStorageServer(conn_type, 'SPUID', connections, None)
+    fake_hsm.connectStorageServer(conn_type, 'SPUID', connections)
 
     calls = getattr(hsm.sdCache, "__calls__", [])
     assert calls == expected_calls
@@ -125,7 +131,7 @@ def test_refresh_storage_once(fake_hsm, conn_type, expected_calls):
       {'id': '9', 'connection': 'test2'}]),
 ])
 def test_connect(fake_hsm, conn_type, connections):
-    fake_hsm.connectStorageServer(conn_type, 'SPUID', connections, None)
+    fake_hsm.connectStorageServer(conn_type, 'SPUID', connections)
 
     sc = storageServer.ConnectionFactory.connections
     for con in connections:
@@ -150,8 +156,7 @@ def test_failed_connection(fake_hsm, conn_type):
          'nfsVersion': 'AUTO', 'nfsRetrans': None, 'nfsTimeo': None,
          'iface': None, 'netIfaceName': None, 'port': '3660'}
     ]
-    result = fake_hsm.connectStorageServer(
-        conn_type, 'SPUID', connections, None)
+    result = fake_hsm.connectStorageServer(conn_type, 'SPUID', connections)
     expected = {
         'statuslist':
             [
@@ -175,8 +180,20 @@ def test_cache_update(fake_hsm):
     ]
     assert hsm.sdCache.knownSDs == {}
 
-    fake_hsm.connectStorageServer(sd.NFS_DOMAIN, 'SPUID', connections, None)
+    fake_hsm.connectStorageServer(sd.NFS_DOMAIN, 'SPUID', connections)
 
     sc = storageServer.ConnectionFactory.connections
     assert sc['1'].connected
     assert hsm.sdCache.knownSDs['sd-uuid-1'] == nfs_find_method
+
+
+def test_empty_conn_list_on_connect(fake_hsm):
+    with pytest.raises(se.InvalidParameterException):
+        fake_hsm.connectStorageServer(sd.ISCSI_DOMAIN, "fake-sp-uuid", [])
+
+
+def test_empty_conn_list_on_disconnect(fake_hsm):
+    # If iSCSI target is used by multiple SDs, engine sends empty connection
+    # list and vdsm has to handle empty list on disconnect.
+    # See https://bugzilla.redhat.com/2054745
+    fake_hsm.disconnectStorageServer(sd.ISCSI_DOMAIN, "fake-sp-uuid", [])

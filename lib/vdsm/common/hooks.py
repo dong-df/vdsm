@@ -1,5 +1,5 @@
 #
-# Copyright 2010-2019 Red Hat, Inc.
+# Copyright 2010-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -59,6 +59,7 @@ def _scriptsPerDir(dir_name):
     path = os.path.join(P_VDSM_HOOKS, dir_name, '*')
     return [s for s in glob.glob(path)
             if os.path.isfile(s) and os.access(s, os.X_OK)]
+
 
 _DOMXML_HOOK = 1
 _JSON_HOOK = 2
@@ -131,7 +132,7 @@ def _runHooksDir(data, dir, vmconf={}, raiseError=True, errors=None, params={},
         if errors and raiseError:
             raise exception.HookError(err)
 
-        with open(data_filename) as f:
+        with open(data_filename, encoding='utf-8') as f:
             final_data = f.read()
     finally:
         os.unlink(data_filename)
@@ -429,16 +430,6 @@ def after_get_stats(caps):
                         hookType=_JSON_HOOK)
 
 
-def before_ifcfg_write(hook_dict):
-    return _runHooksDir(hook_dict, 'before_ifcfg_write', raiseError=True,
-                        hookType=_JSON_HOOK)
-
-
-def after_ifcfg_write(hook_dict):
-    return _runHooksDir(hook_dict, 'after_ifcfg_write', raiseError=False,
-                        hookType=_JSON_HOOK)
-
-
 def after_hostdev_list_by_caps(devices):
     return _runHooksDir(devices, 'after_hostdev_list_by_caps',
                         raiseError=False, hookType=_JSON_HOOK)
@@ -491,6 +482,7 @@ def installed():
         if inf:
             res[dir] = inf
     return res
+
 
 if __name__ == '__main__':
     def usage():

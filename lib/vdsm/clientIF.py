@@ -29,6 +29,7 @@ import threading
 from functools import partial
 from weakref import proxy
 from collections import defaultdict
+from typing import Dict
 
 import six
 
@@ -119,7 +120,7 @@ class clientIF(object):
         else:
             self.gluster = None
         try:
-            self.vmContainer = {}
+            self.vmContainer: Dict[str, vm.Vm] = {}
             self.lastRemoteAccess = 0
             self._enabled = True
             self._netConfigDirty = False
@@ -257,7 +258,7 @@ class clientIF(object):
                             pass
 
     @classmethod
-    def getInstance(cls, irs=None, log=None, scheduler=None):
+    def getInstance(cls, irs=None, log=None, scheduler=None) -> 'clientIF':
         with cls._instanceLock:
             if cls._instance is None:
                 if log is None:
@@ -385,6 +386,7 @@ class clientIF(object):
             self._acceptor.stop()
             for binding in self.servers.values():
                 binding.stop()
+            self._reactor.stop()
 
             self._enabled = False
             secret.clear()
@@ -456,23 +458,27 @@ class clientIF(object):
                     raise vm.VolumeError(
                         "Drive %r not visible" % drive["GUID"])
 
-                res = self.irs.appropriateDevice(drive["GUID"], vmId, 'mpath')
-                if res['status']['code']:
-                    raise vm.VolumeError(
-                        "Cannot appropriate drive %r" % drive["GUID"])
+                # Managed drives are prepared in ManagedVolume.attach_volume
+                if drive.get("managed", False):
+                    volPath = '/dev/mapper/' + drive["GUID"]
+                else:
+                    res = self.irs.appropriateDevice(
+                        drive["GUID"], vmId, 'mpath')
+                    if res['status']['code']:
+                        raise vm.VolumeError(
+                            "Cannot appropriate drive %r" % drive["GUID"])
 
-                # Update size for LUN volume
-                drive["truesize"] = res['truesize']
-                drive["apparentsize"] = res['apparentsize']
+                    # Update size for LUN volume
+                    drive["truesize"] = res['truesize']
+                    drive["apparentsize"] = res['apparentsize']
 
-                if 'diskType' not in drive:
-                    drive['diskType'] = DISK_TYPE.BLOCK
+                    if 'diskType' not in drive:
+                        drive['diskType'] = DISK_TYPE.BLOCK
 
-                volPath = res['path']
+                    volPath = res['path']
 
             elif "RBD" in drive:
-                res = self.irs.appropriateDevice(drive["RBD"], vmId, 'rbd')
-                volPath = res['path']
+                volPath = drive["RBD"]
 
             # cdrom and floppy drives
             elif (device in ('cdrom', 'floppy') and 'specParams' in drive):
@@ -695,8 +701,15 @@ class clientIF(object):
                 v.onDeviceRemoved(device_alias)
             elif eventid == libvirt.VIR_DOMAIN_EVENT_ID_BLOCK_THRESHOLD:
                 dev, path, threshold, excess = args[:-1]
-                v.drive_monitor.on_block_threshold(
+                v.volume_monitor.on_block_threshold(
                     dev, path, threshold, excess)
+            elif eventid == libvirt.VIR_DOMAIN_EVENT_ID_BLOCK_JOB_2:
+                drive, job_type, job_status, _ = args
+                v.on_block_job_event(drive, job_type, job_status)
+            elif eventid == libvirt.VIR_DOMAIN_EVENT_ID_AGENT_LIFECYCLE:
+                vmid = dom.UUIDString()
+                state, reason, _ = args
+                self.qga_poller.channel_state_changed(vmid, state, reason)
             else:
                 v.log.debug('unhandled libvirt event (event_name=%s, args=%s)',
                             events.event_name(eventid), args)

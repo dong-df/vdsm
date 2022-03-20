@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2019 Red Hat, Inc.
+# Copyright 2008-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -105,19 +105,6 @@ AS_IF([test "${enable_gluster_mgmt}" = "yes"],
       AC_SUBST([GLUSTER_MGMT], ['0']))
 
 AC_ARG_ENABLE(
-    [ovirt-imageio],
-    [AS_HELP_STRING(
-        [--enable-ovirt-imageio],
-        [enable ovirt-imageio integration @<:@default=yes@:>@]
-    )],
-    ,
-    [enable_ovirt_imageio="yes"]
-)
-AS_IF([test "${enable_ovirt_imageio}" = "yes"],
-      AC_SUBST([OVIRT_IMAGEIO], ['1']),
-      AC_SUBST([OVIRT_IMAGEIO], ['0']))
-
-AC_ARG_ENABLE(
     [ovirt-vmconsole],
     [AS_HELP_STRING(
         [--disable-ovirt-vmconsole],
@@ -152,25 +139,6 @@ AC_ARG_ENABLE(
 )
 AC_SUBST([ENABLE_LIBVIRT_SELINUX], ["${enable_libvirt_selinux}"])
 
-AC_ARG_ENABLE(
-    [openvswitch],
-    [AS_HELP_STRING(
-        [--enable-openvswitch],
-        [enable openvswitch usage @<:@default=yes@:>@]
-    )],
-    ,
-    [enable_openvswitch="yes"]
-)
-AS_IF([test "${enable_openvswitch}" = "yes"],
-      AC_SUBST([OPENVSWITCH], ['1']),
-      AC_SUBST([OPENVSWITCH], ['0']))
-
-AS_IF([test "$host_cpu" = powerpc64le],
-      AC_SUBST([OPENVSWITCH], ['0']),)
-
-AS_IF([test "${enable_openvswitch}" = "yes"],
-      AC_SUBST([OPENVSWITCHSERVICE], ['openvswitch.service']),
-      AC_SUBST([OPENVSWITCHSERVICE], []))
 
 AC_ARG_WITH(
     [qemu-user],
@@ -273,7 +241,7 @@ AS_IF([test "$host_cpu" = powerpc64le],
 AC_SUBST([vdsmdir], ['${datarootdir}/vdsm'])
 AC_SUBST([vdsmconfdir], ['${sysconfdir}/vdsm'])
 AC_SUBST([vdsmlogdir], ['${localstatedir}/log/vdsm'])
-AC_SUBST([vdsmrundir], ['${localstatedir}/run/vdsm'])
+AC_SUBST([vdsmrundir], ['/run/vdsm'])
 AC_SUBST([vdsmlibdir], ['${localstatedir}/lib/vdsm'])
 AC_SUBST([vdsmbackupdir], ['${vdsmlogdir}/backup'])
 AC_SUBST([vdsmexecdir], ['${libexecdir}/vdsm'])
@@ -284,6 +252,9 @@ AC_SUBST([vdsmnetinfodir], ['${vdsmpylibdir}/network/netinfo'])
 AC_SUBST([vdsmtooldir], ['${vdsmpylibdir}/tool'])
 AC_SUBST([configuratorsdir], ['${vdsmtooldir}/configurators'])
 AC_SUBST([vdsmtestsdir], ['${datarootdir}/vdsm/tests'])
+AC_SUBST([vdsmtransientdisksdir], ['${vdsmlibdir}/storage/transient_disks'])
+AC_SUBST([vdsmrunbackupdir], ['${vdsmrundir}/backup'])
+
 
 # VDSM service
 AC_SUBST([SERVICE_STOP_TIMEOUT], ['10'])
@@ -301,12 +272,6 @@ if test "$HOOKS" == "1"; then
 fi
 if test "$GLUSTER_MGMT" == "0"; then
     configure_flags+=" --disable-gluster-mgmt"
-fi
-if test "$OVIRT_IMAGEIO" == "0"; then
-    configure_flags+=" --disable-ovirt-imageio"
-fi
-if test "$OPENVSWITCH" == "0"; then
-    configure_flags+=" --disable-openvswitch"
 fi
 if test "$OVIRT_VMCONSOLE" == "1"; then
     configure_flags+=" --with-ovirt-vmconsole-user=$VMCON_USER\
@@ -347,7 +312,6 @@ AC_PATH_PROG([MKFS_PATH], [mkfs], [/sbin/mkfs])
 AC_PATH_PROG([MKISOFS_PATH], [mkisofs], [/usr/bin/mkisofs])
 AC_PATH_PROG([MOUNTPOINT_PATH], [mountpoint], [/bin/mountpoint])
 AC_PATH_PROG([MOUNT_PATH], [mount], [/bin/mount])
-AC_PATH_PROG([MULTIPATH_PATH], [multipath], [/sbin/multipath])
 AC_PATH_PROG([MV_PATH], [mv], [/bin/mv])
 AC_PATH_PROG([NICE_PATH], [nice], [/bin/nice])
 AC_PATH_PROG([NTPQ_PATH], [ntpq], [/usr/sbin/ntpq])
@@ -390,11 +354,9 @@ AC_OUTPUT([
 	lib/vdsm/host/Makefile
 	lib/vdsm/metrics/Makefile
 	lib/vdsm/network/Makefile
+	lib/vdsm/network/common/Makefile
 	lib/vdsm/network/configurators/Makefile
 	lib/vdsm/network/ip/Makefile
-	lib/vdsm/network/ip/address/Makefile
-	lib/vdsm/network/ip/route/Makefile
-	lib/vdsm/network/ip/rule/Makefile
 	lib/vdsm/network/link/Makefile
 	lib/vdsm/network/link/bond/Makefile
 	lib/vdsm/network/lldp/Makefile
@@ -402,10 +364,8 @@ AC_OUTPUT([
 	lib/vdsm/network/netinfo/Makefile
 	lib/vdsm/network/netlink/Makefile
 	lib/vdsm/network/netswitch/Makefile
-	lib/vdsm/network/nm/Makefile
-	lib/vdsm/network/nm/nmdbus/Makefile
-	lib/vdsm/network/ovs/Makefile
-	lib/vdsm/network/ovs/driver/Makefile
+	lib/vdsm/network/nmstate/Makefile
+	lib/vdsm/network/nmstate/ovs/Makefile
 	lib/vdsm/network/tc/Makefile
 	lib/vdsm/profiling/Makefile
 	lib/vdsm/rpc/Makefile

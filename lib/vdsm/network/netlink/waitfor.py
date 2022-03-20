@@ -1,5 +1,5 @@
 #
-# Copyright 2016 Red Hat, Inc.
+# Copyright 2016-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,13 +28,12 @@ from . import monitor
 from .link import get_link, is_link_up
 
 NEWLINK_STATE_UP = {'event': 'new_link', 'state': 'up'}
-DELLINK_STATE_DOWN = {'event': 'del_link', 'state': 'down'}
 
 
 @contextmanager
 def waitfor_linkup(iface, oper_blocking=True, timeout=10):
     iface_up_check = _is_oper_up if oper_blocking else _is_admin_up
-    with monitor.Monitor(
+    with monitor.object_monitor(
         groups=('link',), timeout=timeout, silent_timeout=True
     ) as mon:
         try:
@@ -83,18 +82,6 @@ def waitfor_ipv6_addr(iface, address=None, timeout=10):
 
 
 @contextmanager
-def waitfor_link_exists(iface, timeout=0.5):
-    """
-    Silently block until a link is created/detected.
-    :param iface: The device name.
-    :param timeout: The maximum time in seconds to wait for the message.
-    """
-    expected_event = {'name': iface, 'event': 'new_link'}
-    with wait_for_link_event(iface, expected_event, timeout):
-        yield
-
-
-@contextmanager
 def wait_for_link_event(
     iface, expected_event, timeout, check_event=lambda event: True
 ):
@@ -107,7 +94,7 @@ def wait_for_link_event(
 def wait_for_event(
     iface, expected_event, groups, timeout, check_event=lambda event: True
 ):
-    with monitor.Monitor(groups=groups, timeout=timeout) as mon:
+    with monitor.object_monitor(groups=groups, timeout=timeout) as mon:
         try:
             yield
         finally:

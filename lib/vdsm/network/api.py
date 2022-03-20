@@ -1,4 +1,4 @@
-# Copyright 2011-2018 Red Hat, Inc.
+# Copyright 2011-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -32,15 +32,18 @@ from vdsm.common import hooks
 from vdsm.network import connectivity
 from vdsm.network import netstats
 from vdsm.network import netswitch
-from vdsm.network import sourceroute
+from vdsm.network import ovn
 from vdsm.network import validator
+from vdsm.network.dhcp_monitor import MonitoredItemPool
 from vdsm.network.ipwrapper import DUMMY_BRIDGE
-from vdsm.network.link import iface as link_iface
 from vdsm.network.link import sriov
 from vdsm.network.lldp import info as lldp_info
+from vdsm.network.nmstate import (
+    add_dynamic_source_route_rules as nmstate_add_dynamic_source_route_rules,
+)
+from vdsm.network.nmstate import update_num_vfs
 
 from . import canonicalize
-from .ip import address as ipaddress
 from .errors import RollbackIncomplete
 from . import netconfpersistence
 
@@ -63,36 +66,15 @@ def network_stats():
     return netstats.report()
 
 
-def change_numvfs(pci_path, numvfs, devname):
+def change_numvfs(numvfs, devname):
     """Change number of virtual functions of a device.
 
     The persistence is stored in the same place as other network persistence is
     stored. A call to setSafeNetworkConfig() will persist it across reboots.
     """
-    logging.info(
-        'Changing number of vfs on device %s -> %s.', pci_path, numvfs
-    )
-    sriov.update_numvfs(pci_path, numvfs)
+    logging.info('Changing number of vfs on device %s -> %s.', devname, numvfs)
+    update_num_vfs(devname, numvfs)
     sriov.persist_numvfs(devname, numvfs)
-
-    link_iface.iface(devname).up()
-
-
-def ip_addrs_info(device):
-    """"
-    Report IP addresses of a device.
-
-    Returning a 4 values: ipv4addr, ipv4netmask, ipv4addrs, ipv6addrs
-    ipv4addrs and ipv6addrs contain (each) a list of addresses.
-    ipv4netmask and ipv4addrs represents the 'primary' ipv4 address of the
-    device, if it exists.
-    """
-    return ipaddress.addrs_info(device)
-
-
-def net2vlan(network_name):
-    """Return the vlan id of the network if exists, None otherwise."""
-    return netswitch.configurator.net2vlan(network_name)
 
 
 def network_northbound(network_name):
@@ -103,17 +85,6 @@ def network_northbound(network_name):
     OVS switch, named as the network.
     """
     return netswitch.configurator.net2northbound(network_name)
-
-
-def ovs_bridge(network_name):
-    """
-    If network_name is an OVS based network, return a dict with OVS (real)
-    bridge name and a boolean indicating if it has dpdk port attached to it.
-    Otherwise, return None.
-
-    This API requires root access.
-    """
-    return netswitch.configurator.ovs_net2bridge(network_name)
 
 
 def _build_setup_hook_dict(req_networks, req_bondings, req_options):
@@ -162,7 +133,7 @@ def _rollback():
             # exception that might have happened on rollback is
             # properly logged and derived from actions to respond to
             # the original exception.
-            six.reraise(roi.exc_type, roi.value, tb)
+            raise roi.value.with_traceback(tb)
 
 
 def setupNetworks(networks, bondings, options):
@@ -226,18 +197,16 @@ def setupNetworks(networks, bondings, options):
         canonicalize.canonicalize_bondings(bondings)
 
         net_info = netswitch.configurator.netinfo()
-
-        validator.validate(networks, bondings, net_info)
-
         running_config = netconfpersistence.RunningConfig()
+
+        validator.validate(networks, bondings, net_info, running_config)
+
         if netswitch.configurator.switch_type_change_needed(
             networks, bondings, running_config
         ):
-            _change_switch_type(
-                networks, bondings, options, running_config, net_info
-            )
+            _change_switch_type(networks, bondings, options, running_config)
         else:
-            _setup_networks(networks, bondings, options, net_info)
+            _setup_networks(networks, bondings, options)
     except:
         # TODO: it might be useful to pass failure description in 'response'
         # field
@@ -256,17 +225,15 @@ def setupNetworks(networks, bondings, options):
         )
 
 
-def _setup_networks(networks, bondings, options, net_info):
+def _setup_networks(networks, bondings, options):
     bondings, networks, options = _apply_hook(bondings, networks, options)
 
     in_rollback = options.get('_inRollback', False)
     with _rollback():
-        netswitch.configurator.setup(
-            networks, bondings, options, net_info, in_rollback
-        )
+        netswitch.configurator.setup(networks, bondings, options, in_rollback)
 
 
-def _change_switch_type(networks, bondings, options, running_config, net_info):
+def _change_switch_type(networks, bondings, options, running_config):
     logging.debug('Applying switch type change')
 
     netswitch.configurator.validate_switch_type_change(
@@ -277,14 +244,13 @@ def _change_switch_type(networks, bondings, options, running_config, net_info):
 
     logging.debug('Removing current switch configuration')
     with _rollback():
-        _remove_nets_and_bonds(networks, bondings, net_info, in_rollback)
+        _remove_nets_and_bonds(networks, bondings, in_rollback)
 
     logging.debug('Setting up requested switch configuration')
     try:
         with _rollback():
-            net_info = netswitch.configurator.netinfo()
             netswitch.configurator.setup(
-                networks, bondings, options, net_info, in_rollback
+                networks, bondings, options, in_rollback
             )
     except:
         logging.exception(
@@ -293,12 +259,10 @@ def _change_switch_type(networks, bondings, options, running_config, net_info):
         )
         diff = running_config.diffFrom(netconfpersistence.RunningConfig())
         try:
-            net_info = netswitch.configurator.netinfo()
             netswitch.configurator.setup(
                 diff.networks,
                 diff.bonds,
                 {'connectivityCheck': False},
-                net_info,
                 in_rollback=True,
             )
         except:
@@ -307,37 +271,17 @@ def _change_switch_type(networks, bondings, options, running_config, net_info):
         raise
 
 
-def _remove_nets_and_bonds(nets, bonds, net_info, in_rollback):
+def _remove_nets_and_bonds(nets, bonds, in_rollback):
     nets_removal = {name: {'remove': True} for name in six.iterkeys(nets)}
     bonds_removal = {name: {'remove': True} for name in six.iterkeys(bonds)}
     netswitch.configurator.setup(
-        nets_removal,
-        bonds_removal,
-        {'connectivityCheck': False},
-        net_info,
-        in_rollback,
+        nets_removal, bonds_removal, {'connectivityCheck': False}, in_rollback
     )
 
 
 def setSafeNetworkConfig():
     """Declare current network configuration as 'safe'"""
     netswitch.configurator.persist()
-
-
-def add_sourceroute(iface, ip, mask, route):
-    sourceroute.add(iface, ip, mask, route)
-
-
-def remove_sourceroute(iface):
-    sourceroute.remove(iface)
-
-
-def add_ovs_vhostuser_port(bridge, port, socket_path):
-    netswitch.configurator.ovs_add_vhostuser_port(bridge, port, socket_path)
-
-
-def remove_ovs_port(bridge, port):
-    netswitch.configurator.ovs_remove_port(bridge, port)
 
 
 def confirm_connectivity():
@@ -351,6 +295,50 @@ def get_lldp_info(filter):
     An empty list is interpreted as no restriction.
     """
     if not filter.get('devices', []):
-        # TODO handle dpdk and OVS nics
+        # TODO OVS nics
         filter['devices'] = netswitch.configurator.netinfo()['nics'].keys()
     return lldp_info.get_info(filter)
+
+
+def is_ovn_configured():
+    """
+    Check if OVN is configured on this host.
+    :return: True if OVN is configured on this host
+    """
+    return ovn.is_ovn_configured()
+
+
+def is_dhcp_ip_monitored(iface, family):
+    """
+    Check if combination of iface and family is configured for DHCP
+    IP monitoring
+    :param iface: Interface name
+    :param family: 4 (IPv4) or 6 (IPv6)
+    :return: True if the combination is monitored for DHCP IP changes
+    """
+    return MonitoredItemPool.instance().is_item_in_pool((iface, family))
+
+
+def add_dynamic_source_route_rules(iface, address, prefixlen):
+    """
+    Delegate creation of dynamic source route rules to supervdsm context
+    :param iface: Interface name
+    :param address: Interface address
+    :param prefixlen: Address prefixlen
+    """
+    nmstate_add_dynamic_source_route_rules(iface, address, prefixlen)
+
+
+def remove_dhcp_monitoring(iface, family):
+    """
+    Remove iface and family combination from DHCP IP monitoring
+    :param iface: Interface name
+    :param family: 4 (IPv4) or 6 (IPv6)
+    """
+    MonitoredItemPool.instance().remove((iface, family))
+
+
+@contextmanager
+def wait_for_pci_link_up(pci_path, timeout):
+    with sriov.wait_for_pci_link_up(pci_path, timeout):
+        yield

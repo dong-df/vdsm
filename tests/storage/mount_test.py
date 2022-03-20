@@ -30,8 +30,9 @@ import time
 
 import pytest
 
+from vdsm.common.units import MiB, GiB
+from vdsm.common import commands
 from vdsm.storage import mount
-from vdsm.storage.misc import execCmd
 
 from nose.plugins.skip import SkipTest
 
@@ -43,7 +44,8 @@ import monkeypatch
 
 from . marks import requires_root
 
-FLOPPY_SIZE = (2 ** 20) * 4
+FLOPPY_SIZE = 4 * MiB
+MKFS_EXEC = '/usr/sbin/mkfs.ext2'
 
 
 @contextmanager
@@ -54,17 +56,12 @@ def createFloppyImage(size):
         f.write('\0')
 
     try:
-        rc, out, err = execCmd(['/sbin/mkfs.ext2', "-F", path])
-    except OSError:
-        try:
-            rc, out, err = execCmd(['/usr/sbin/mkfs.ext2', "-F", path])
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                raise SkipTest("cannot execute mkfs.ext2")
-            raise
+        commands.run([MKFS_EXEC, "-F", path])
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            raise SkipTest("cannot execute " + MKFS_EXEC)
+        raise
 
-    if rc != 0:
-        raise Exception("Could not format image", out, err)
     try:
         yield path
     finally:
@@ -157,11 +154,8 @@ class TestMount(VdsmTestCase):
             link_to_image = os.path.join(root_dir, 'link_to_image')
             mountpoint = os.path.join(root_dir, 'mountpoint')
             with open(backing_image, 'w') as f:
-                os.ftruncate(f.fileno(), 1024 ** 3)
-            rc, out, err = execCmd(['/sbin/mkfs.ext2', "-F", backing_image],
-                                   raw=True)
-            if rc != 0:
-                raise RuntimeError("Error creating filesystem: %s" % err)
+                os.ftruncate(f.fileno(), GiB)
+            commands.run([MKFS_EXEC, "-F", backing_image])
             os.symlink(backing_image, link_to_image)
             os.mkdir(mountpoint)
             m = mount.Mount(link_to_image, mountpoint)

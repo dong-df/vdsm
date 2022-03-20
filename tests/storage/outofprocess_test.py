@@ -34,11 +34,13 @@ from contextlib import contextmanager
 
 import pytest
 
+from vdsm.common.osutils import get_umask
+from vdsm.storage import constants as sc
 from vdsm.storage import outOfProcess as oop
 from vdsm.storage.exception import MiscDirCleanupFailure
 
 from . marks import requires_root, requires_unprivileged_user
-from . storagetestlib import get_umask
+from . storagetestlib import chmod
 
 
 @pytest.fixture
@@ -207,24 +209,121 @@ def test_fileutils_copyusermodetogroup(
     verify_file(path, mode=expected_mode)
 
 
-def test_fileutils_createdir(oop_cleanup, tmpdir):
+def test_fileutils_createdir_default_mode(oop_cleanup, tmpdir):
     iop = oop.getProcessPool("test")
-    d1 = str(tmpdir.join("subdir1"))
-    d2 = str(tmpdir.join("subdir2"))
-
+    path_intermediate = str(tmpdir.join("subdir1"))
+    path_leaf = str(tmpdir.join("subdir1", "subdir2"))
     # The test describes the current behavior of ioprocess.fileUtils.createdir:
     # the default mode is 0o775 (depends on umask).
-    iop.fileUtils.createdir(d1)
-    verify_directory(d1, mode=0o775 & ~get_umask())
+    default_mode = 0o775
+    expected_mode = default_mode & ~get_umask()
 
-    iop.fileUtils.createdir(d2, mode=0o666)
-    verify_directory(d2, mode=0o666 & ~get_umask())
+    # Folder does not exist and is created successfully.
+    iop.fileUtils.createdir(path_leaf)
+    verify_directory(path_intermediate, mode=expected_mode)
+    verify_directory(path_leaf, mode=expected_mode)
+
+
+def test_fileutils_createdir_default_mode_dir_exists(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir"))
+    # The test describes the current behavior of ioprocess.fileUtils.createdir:
+    # the default mode is 0o775 (depends on umask).
+    default_mode = 0o775
+    expected_mode = default_mode & ~get_umask()
+
+    os.mkdir(path)
+
+    # Folder exists, mode matches, operation should do nothing.
+    iop.fileUtils.createdir(path)
+    verify_directory(path, mode=expected_mode)
+
+
+def test_fileutils_createdir_default_mode_file_exists(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+
+    # Path exists and is a file, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.fileUtils.createdir(path)
+    assert e.value.errno == errno.ENOTDIR
+
+
+def test_fileutils_createdir_non_default_mode(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_intermediate = str(tmpdir.join("subdir1"))
+    path_leaf = str(tmpdir.join("subdir1", "subdir2"))
+    mode = 0o766
+    expected_mode = mode & ~get_umask()
+
+    # Folder does not exist and is created successfully.
+    iop.fileUtils.createdir(path_leaf, mode=mode)
+    verify_directory(path_intermediate, mode=expected_mode)
+    verify_directory(path_leaf, mode=expected_mode)
+
+
+def test_fileutils_createdir_non_default_mode_dir_exists_same_mode(
+        oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir"))
+    mode = 0o766
+    expected_mode = mode & ~get_umask()
+
+    os.mkdir(path, mode=mode)
+
+    # Folder exists, mode matches, operation should do nothing.
+    iop.fileUtils.createdir(path, mode=mode)
+    verify_directory(path, mode=expected_mode)
+
+
+def test_fileutils_createdir_non_default_mode_dir_exists_other_mode(
+        oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir"))
+    mode = 0o766
+
+    os.mkdir(path, mode=mode)
+
+    # Folder exists, mode doesn't match, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.fileUtils.createdir(path, mode=0o666)
+    assert e.value.errno == errno.EPERM
+
+
+def test_fileutils_createdir_non_default_mode_file_exists(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+
+    # Path exists and is a file, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.fileUtils.createdir(path, mode=mode)
+    assert e.value.errno == errno.ENOTDIR
+
+
+@requires_unprivileged_user
+def test_fileutils_createdir_bad_permissions(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir1", "subdir2"))
+    mode = 0o666
+
+    # Should create the first folder in the path and fail on the second one.
+    with pytest.raises(OSError) as e:
+        iop.fileUtils.createdir(path, mode=mode)
+    assert e.value.errno == errno.EACCES
+
+    assert os.path.exists(str(tmpdir.join("subdir1")))
+    assert not os.path.exists(str(tmpdir.join("subdir1", "subdir2")))
 
 
 @pytest.mark.parametrize("orig_size, expected_size", [
-    (4096 - 1, 4096),
-    (4096, 4096),
-    (4096 + 1, 4096 + 4096),
+    (sc.BLOCK_SIZE_4K - 1, sc.BLOCK_SIZE_4K),
+    (sc.BLOCK_SIZE_4K, sc.BLOCK_SIZE_4K),
+    (sc.BLOCK_SIZE_4K + 1, 2 * sc.BLOCK_SIZE_4K),
 ])
 def test_fileutils_padtoblocksize(
         oop_cleanup, tmpdir, orig_size, expected_size):
@@ -443,25 +542,394 @@ def test_fileutils_validateqemureadable_qemu_or_kvm_group(
 
 # os APIs
 
+ACCESS_PARAMS = [
+    (0o755, os.R_OK, True),
+    (0o300, os.R_OK, False),
+    (0o744, os.W_OK, True),
+    (0o444, os.W_OK, False),
+    (0o755, os.X_OK, True),
+    (0o400, os.X_OK, False),
+    (0o300, os.W_OK | os.X_OK, True),
+    (0o7300, os.R_OK | os.W_OK | os.X_OK, False),
+]
+
+
+@pytest.mark.parametrize("mode, permission, expected_result", ACCESS_PARAMS)
+@requires_unprivileged_user
+def test_os_access_file(
+        oop_cleanup, tmpdir, mode, permission, expected_result):
+    iop = oop.getProcessPool("test")
+
+    f = tmpdir.join("file")
+    f.write("")
+    path = str(f)
+
+    with chmod(path, mode):
+        assert iop.os.access(path, permission) == expected_result
+
+
+@pytest.mark.parametrize("mode, permission, expected_result", ACCESS_PARAMS)
+@requires_unprivileged_user
+def test_os_access_directory(
+        oop_cleanup, tmpdir, mode, permission, expected_result):
+    iop = oop.getProcessPool("test")
+
+    d = tmpdir.mkdir("subdir")
+    path = str(d)
+
+    with chmod(path, mode):
+        assert iop.os.access(path, permission) == expected_result
+
+
+def test_os_chmod_file_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    new_mode = 0o444
+    path = str(tmpdir.join("file"))
+
+    # File does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.chmod(path, new_mode)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_chmod_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    new_mode = 0o444
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+
+    # File exists, operation should succeed.
+    iop.os.chmod(path, new_mode)
+    expected_mode = new_mode & ~get_umask()
+    verify_file(path, mode=expected_mode)
+
+
+def test_os_chmod_dir_failed_no_such_dir(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    new_mode = 0o555
+    path = str(tmpdir.join("subdir"))
+
+    # Directory does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.chmod(path, new_mode)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_chmod_dir(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    new_mode = 0o555
+    path = str(tmpdir.join("subdir"))
+
+    tmpdir.mkdir("subdir")
+
+    # Directory exists, operation should succeed.
+    iop.os.chmod(path, new_mode)
+    expected_mode = new_mode & ~get_umask()
+    verify_directory(path, mode=expected_mode)
+
+
+def test_os_link_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_src = str(tmpdir.join("file"))
+    path_dst = path_src + ".link"
+
+    # Source does not exist, operation fails.
+    with pytest.raises(OSError) as e:
+        iop.os.link(path_src, path_dst)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_link(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_src1 = str(tmpdir.join("file1"))
+    path_src2 = str(tmpdir.join("file2"))
+    path_dst = str(tmpdir.join("file.link"))
+
+    open(path_src1, "w").close()
+    open(path_src2, "w").close()
+
+    # Link does not exist, created to point to "file1".
+    iop.os.link(path_src1, path_dst)
+    assert os.path.samefile(path_src1, path_dst)
+
+    # Link exists, attempt  to override to point to "file2" should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.link(path_src2, path_dst)
+    assert e.value.errno == errno.EEXIST
+    assert os.path.samefile(path_src1, path_dst)
+
+
+def test_os_mkdir_default_mode(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir"))
+    # The test describes the current behavior of ioprocess.os.mkdir:
+    # the default mode is 0o775 (depends on umask).
+    default_mode = 0o775
+
+    # Folder does not exist and is created successfully.
+    iop.os.mkdir(path)
+    expected_mode = default_mode & ~get_umask()
+    verify_directory(path, mode=expected_mode)
+
+    # Folder exists, operation fails.
+    with pytest.raises(OSError) as e:
+        iop.os.mkdir(path)
+    assert e.value.errno == errno.EEXIST
+    verify_directory(path, mode=expected_mode)
+
+
+def test_os_mkdir_non_default_mode(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir"))
+    mode = 0o766
+
+    # Folder does not exist and is created successfully.
+    iop.os.mkdir(path, mode=mode)
+    expected_mode = mode & ~get_umask()
+    verify_directory(path, mode=expected_mode)
+
+    # Folder exists, operation fails.
+    with pytest.raises(OSError) as e:
+        iop.os.mkdir(path, mode=mode)
+    assert e.value.errno == errno.EEXIST
+    verify_directory(path, mode=expected_mode)
+
+
+def test_os_remove_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    # File does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.remove(path)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_remove(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+
+    # File exists, operation should succeed.
+    iop.os.remove(path)
+    assert not os.path.exists(path)
+
+
+def test_os_rename_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_src = str(tmpdir.join("file_src"))
+    path_dst = str(tmpdir.join("file_dst"))
+
+    # Source & destination do not exist, operation fails.
+    with pytest.raises(OSError) as e:
+        iop.os.rename(path_src, path_dst)
+    assert e.value.errno == errno.ENOENT
+
+    open(path_dst, "w").close()
+
+    # Source does not exist, destination exists, operation fails.
+    with pytest.raises(OSError) as e:
+        iop.os.rename(path_src, path_dst)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_rename(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_src = str(tmpdir.join("file_src"))
+    path_dst = str(tmpdir.join("file_dst"))
+
+    open(path_src, "w").close()
+
+    # Source exists, destination does not exist. Source renamed to destination.
+    iop.os.rename(path_src, path_dst)
+    assert not os.path.exists(path_src)
+    assert os.path.exists(path_dst)
+
+    open(path_src, "w").close()
+
+    # Source & destination exist, override the destination.
+    iop.os.rename(path_src, path_dst)
+    assert not os.path.exists(path_src)
+    assert os.path.exists(path_dst)
+
+
+def test_os_rmdir_failed_no_such_dir(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("subdir"))
+
+    # Directory does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.rmdir(path)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_rmdir(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.mkdir("subdir"))
+
+    # Directory exists, operation should succeed.
+    iop.os.rmdir(path)
+    assert not os.path.exists(path)
+
+
+def test_os_stat_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    # File does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.stat(path)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_stat(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+
+    # File exists, operation should succeed.
+    iop_stat = iop.os.stat(path)
+    os_stat = os.stat(path)
+    check_stat(iop_stat, os_stat)
+
+
+def test_os_statvfs_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    # File does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.statvfs(path)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_statvfs(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+
+    # File exists, operation should succeed.
+    iop_statvfs = iop.os.statvfs(path)
+    os_statvfs = os.statvfs(path)
+    check_statvfs(iop_statvfs, os_statvfs)
+
+
+def test_os_unlink_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    # File does not exist, operation should fail.
+    with pytest.raises(OSError) as e:
+        iop.os.unlink(path)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_os_unlink(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    open(path, "w").close()
+
+    # File exists, operation should succeed.
+    iop.os.unlink(path)
+    assert not os.path.exists(path)
+
+
+# os.path APIs
+
+def test_os_path_isdir(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+
+    path_dir = str(tmpdir.mkdir("subdir"))
+    assert iop.os.path.isdir(path_dir)
+
+    path_file = str(tmpdir.join("file"))
+    open(path_file, "w").close()
+    assert not iop.os.path.isdir(path_file)
+
+    path_no_such_dir = str(tmpdir.join("no such directory"))
+    assert not iop.os.path.isdir(path_no_such_dir)
+
+
 def test_os_path_islink(oop_cleanup, tmpdir):
     iop = oop.getProcessPool("test")
     link = str(tmpdir.join("link"))
+
     os.symlink("/no/such/file", link)
     assert iop.os.path.islink(link)
 
 
 def test_os_path_islink_not_link(oop_cleanup, tmpdir):
     iop = oop.getProcessPool("test")
-    assert not iop.os.path.islink(str(tmpdir))
+
+    # Link doesn't exist.
+    link = str(tmpdir.join("link"))
+    assert not iop.os.path.islink(link)
+
+    # File is not a link.
+    path_file = str(tmpdir.join("file"))
+    open(path_file, "w").close()
+    assert not iop.os.path.islink(path_file)
+
+    # Directory is not a link.
+    path_dir = str(tmpdir)
+    assert not iop.os.path.islink(path_dir)
 
 
-def test_os_path_exists(oop_cleanup):
-    path = "/dev/null"
+def test_os_path_lexists(oop_cleanup, tmpdir):
     iop = oop.getProcessPool("test")
+    link = str(tmpdir.join("link"))
+
+    assert not iop.os.path.lexists(link)
+
+    os.symlink("/no/such/file", link)
+    assert iop.os.path.lexists(link)
+
+
+def test_os_path_exists(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path = str(tmpdir.join("file"))
+
+    assert not iop.os.path.exists(path)
+
+    open(path, "w").close()
     assert iop.os.path.exists(path)
 
 
 # utils APIs
+
+def test_utils_forcelink_failed_no_such_file(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_src = str(tmpdir.join("file"))
+    path_dst = path_src + ".link"
+
+    # Source does not exist, operation fails.
+    with pytest.raises(OSError) as e:
+        iop.utils.forceLink(path_src, path_dst)
+    assert e.value.errno == errno.ENOENT
+
+
+def test_utils_forcelink(oop_cleanup, tmpdir):
+    iop = oop.getProcessPool("test")
+    path_src1 = str(tmpdir.join("file1"))
+    path_src2 = str(tmpdir.join("file2"))
+    path_dst = str(tmpdir.join("file.link"))
+
+    open(path_src1, "w").close()
+    open(path_src2, "w").close()
+
+    # Link does not exist, created to point to "file1".
+    iop.utils.forceLink(path_src1, path_dst)
+    assert os.path.samefile(path_src1, path_dst)
+
+    # Link exists, overridden to point to "file2".
+    iop.utils.forceLink(path_src2, path_dst)
+    assert os.path.samefile(path_src2, path_dst)
+
 
 def test_utils_rmfile(oop_cleanup, tmpdir):
     iop = oop.getProcessPool("test")
@@ -469,9 +937,13 @@ def test_utils_rmfile(oop_cleanup, tmpdir):
     path = str(tmpdir.join("file"))
     open(path, "w").close()
 
+    # File exists, "rmFile" should succeed.
     assert os.path.exists(path)
     iop.utils.rmFile(path)
     assert not os.path.exists(path)
+
+    # File does not exist, "rmFile" should fail silently.
+    iop.utils.rmFile(path)
 
 
 # glob APIs
@@ -646,31 +1118,6 @@ def verify_directory(path, mode=None):
 
 
 @contextmanager
-def chmod(path, mode):
-    """
-    Changes path permissions.
-
-    Change the permissions of path to the numeric mode before entering the
-    context, and restore the original value when exiting from the context.
-
-    Arguments:
-        path (str): file/directory path
-        mode (int): new mode
-    """
-
-    orig_mode = stat.S_IMODE(os.stat(path).st_mode)
-
-    os.chmod(path, mode)
-    try:
-        yield
-    finally:
-        try:
-            os.chmod(path, orig_mode)
-        except Exception as e:
-            logging.error("Failed to restore %r mode: %s", path, e)
-
-
-@contextmanager
 def chown(path, uid=-1, gid=-1):
     """
     Changes path owner (must run as root).
@@ -698,3 +1145,33 @@ def chown(path, uid=-1, gid=-1):
         except Exception as e:
             logging.error("Failed to restore %r to uid %d gid %d: %s",
                           path, orig_uid, orig_gid, e)
+
+
+def check_stat(iop_stat, os_stat):
+    # TODO; similar problem as described in the below "TODO".
+    #  "st_blocks" doesn't appear in "os.stat(path)", but its "hasattr"
+    #  returns True as if the attribute does appear!
+    #  Comparison doesn't fail since both "getattr" return zero.
+    common_fields = [field
+                     for field in iop_stat._fields
+                     if hasattr(os_stat, field)]
+    for field in common_fields:
+        if field in ("st_atime", "st_mtime", "st_ctime"):
+            # These are float\double values and due to the many conversions
+            # the values experience during marshaling they cannot be equated.
+            # The rest of the fields are a good enough test.
+            continue
+        assert getattr(iop_stat, field) == getattr(os_stat, field)
+
+
+def check_statvfs(iop_statvfs, os_statvfs):
+    # TODO: need to understand why it doesn't work for "f_fsid".
+    #  For some reason "os.statvfs(path)" returns an object without "f_fsid",
+    #  but "hasattr" returns True as if the attribute does appear!
+    #  After that "getattr" returns some value that fails the below comparison.
+    common_fields = [field
+                     for field in iop_statvfs._fields
+                     if hasattr(os_statvfs, field) and field != "f_fsid"]
+
+    for field in common_fields:
+        assert getattr(iop_statvfs, field) == getattr(os_statvfs, field)

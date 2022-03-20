@@ -27,17 +27,38 @@ import sys
 import os
 import threading
 
-from ovirt_imageio_common import directio  # pylint: disable=import-error
+# TODO: Stop using internal modules.
+from ovirt_imageio._internal import directio
 
 from vdsm.common import concurrent
 from vdsm.common import libvirtconnection
 from vdsm.common import time
 from vdsm.common.password import ProtectedPassword
+from vdsm.common.units import MiB
+from vdsm.common import fileutils
 
 _start = None
 
 
-class VMAdapter(object):
+class _Adapter(object):
+    def readinto(self, b):
+        # This method is required for `io` module compatibility.
+        temp = self.read(len(b))
+        temp_len = len(temp)
+        if temp_len == 0:
+            return 0
+        else:
+            b[:temp_len] = temp
+            return temp_len
+
+    def read(self, size):
+        raise NotImplementedError
+
+    def finish(self):
+        pass
+
+
+class VMAdapter(_Adapter):
     def __init__(self, vm, src):
         self._vm = vm
         self._src = src
@@ -48,11 +69,8 @@ class VMAdapter(object):
         self._pos += len(buf)
         return buf
 
-    def finish(self):
-        pass
 
-
-class StreamAdapter(object):
+class StreamAdapter(_Adapter):
     def __init__(self, stream):
         self.read = stream.recv
         self._stream = stream
@@ -99,7 +117,7 @@ def arguments(args):
                         required=True, help='Storage type (volume or path)')
     parser.add_argument('--vm-name', dest='vmname', required=True,
                         help='Libvirt source VM name')
-    parser.add_argument('--bufsize', dest='bufsize', default=1048576,
+    parser.add_argument('--bufsize', dest='bufsize', default=MiB,
                         type=int, help='Size of packets in bytes, default'
                         '1048676')
     parser.add_argument('--verbose', action='store_true',
@@ -184,7 +202,11 @@ def handle_volume(con, diskno, src, dst, options):
     stream = con.newStream()
     preallocated = True
 
+    # Current code does not support writing to block storage using libvirt
+    # sparse stream API.
+    # Libvirt sparseness is only supported from version 3004000 and up.
     if options.allocation == "sparse" and \
+            not fileutils.is_block_device(dst) and \
             con.getLibVersion() >= 3004000:
         try:
             preallocated = False

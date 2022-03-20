@@ -105,7 +105,14 @@ def attach_volume(vol_id, connection_info):
                     path=path,
                     attachment=attachment,
                     multipath_id=attachment.get("multipath_id"))
-                _invalidate_lvm_filter(attachment)
+                _invalidate_lvm_devices(attachment)
+                volume_type = connection_info["driver_volume_type"]
+                if volume_type not in ("rbd", "iscsi"):
+                    raise se.UnsupportedOperation(
+                        "Unsupported volume type, supported types are: "
+                        "rbd, iscsi")
+
+                _add_udev_rule(vol_id, path)
             except:
                 _silent_detach(connection_info, attachment)
                 raise
@@ -136,6 +143,7 @@ def detach_volume(vol_id):
         if "path" in vol_info and os.path.exists(vol_info["path"]):
             run_helper("detach", vol_info)
 
+        _remove_udev_rule(vol_info['vol_id'])
         db.remove_volume(vol_id)
 
 
@@ -234,20 +242,20 @@ def _resolve_path(vol_id, connection_info, attachment):
         return attachment["path"]
 
 
-def _invalidate_lvm_filter(attachment):
+def _invalidate_lvm_devices(attachment):
     """
-    Invalidate lvm filter when if attached disk has a multipath id.
+    Invalidate lvm devices when attached disk has a multipath id.
 
     Vdsm may discover a managed volume after we connected the device to the
-    host on the storage side (FC), or after we attached the volume but betore
-    we store the multipath id (iSCSI). In this case lvm filter may include the
+    host on the storage side (FC), or after we attached the volume but before
+    we store the multipath id (iSCSI). In this case lvm devices may include the
     device, and the next lvm command will scan the device.
 
-    Invalidate the lvm filter to ensure that it does not contain the managed
+    Invalidate the lvm devices to ensure that it does not contain the managed
     volume.
     """
     if "multipath_id" in attachment:
-        lvm.invalidateFilter()
+        lvm.invalidate_devices()
 
 
 def _silent_remove(db, vol_id):
@@ -270,3 +278,22 @@ def _silent_detach(connection_info, attachment):
         run_helper("detach", vol_info)
     except Exception:
         log.exception("Failed to detach managed volume %s", vol_info)
+
+
+def _add_udev_rule(vol_id, path):
+    proxy = supervdsm.getProxy()
+    proxy.add_managed_udev_rule(vol_id, path)
+    try:
+        proxy.trigger_managed_udev_rule(path)
+    except:
+        _remove_udev_rule(vol_id)
+        raise
+
+
+def _remove_udev_rule(vol_id):
+    try:
+        proxy = supervdsm.getProxy()
+        proxy.remove_managed_udev_rule(vol_id)
+    except Exception:
+        log.exception(
+            "Failed to remove udev rule for volume %s", vol_id)

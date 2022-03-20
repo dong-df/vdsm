@@ -1,4 +1,4 @@
-# Copyright 2018 Red Hat, Inc.
+# Copyright 2018-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@ from __future__ import division
 import os
 import stat
 
+from vdsm.common.units import MiB
 from vdsm.storage import sdc
 from vdsm.storage import qemuimg
 
@@ -36,7 +37,7 @@ from testlib import make_config
 from testlib import namedTemporaryDir
 from testlib import permutations, expandPermutations
 
-VIRTUAL_SIZE = 10 * 1024**2
+VIRTUAL_SIZE = 10 * MiB
 QCOW2_COMPAT = '1.1'
 
 
@@ -67,9 +68,9 @@ class TestTransient(VdsmTestCase):
         testvm = FakeVM()
         testvm._prepareTransientDisks([drive])
 
-        self.assertEqual(drive['diskType'], DISK_TYPE.FILE)
-        self.assertEqual(drive['path'], '/original/path')
-        self.assertEqual(drive['format'], 'cow')
+        assert drive['diskType'] == DISK_TYPE.FILE
+        assert drive['path'] == '/original/path'
+        assert drive['format'] == 'cow'
 
     @MonkeyPatch(vm, 'config', make_config([]))
     @MonkeyPatch(sdc, 'sdCache', FakeSDCache())
@@ -94,19 +95,20 @@ class TestTransient(VdsmTestCase):
             self.check_drive(drive, original_path, tmpdir)
 
     def check_drive(self, drive, original_path, tmpdir):
-        self.assertEqual(drive['diskType'], DISK_TYPE.FILE)
-        self.assertEqual(drive['format'], 'cow')
-        self.assertTrue(drive['path'].startswith(tmpdir),
-                        "%s does not start with %s" % (drive['path'], tmpdir))
+        assert drive['diskType'] == DISK_TYPE.FILE
+        assert drive['format'] == 'cow'
+        assert drive['path'].startswith(tmpdir), \
+            "%s does not start with %s" % (drive['path'], tmpdir)
 
         file_stat = os.stat(drive['path'])
-        self.assertEqual(stat.S_IMODE(file_stat.st_mode), 0o660)
+        assert stat.S_IMODE(file_stat.st_mode) == 0o660
 
         transient_info = qemuimg.info(drive['path'])
-        self.assertEqual(transient_info['format'], qemuimg.FORMAT.QCOW2)
-        self.assertEqual(transient_info['virtualsize'], VIRTUAL_SIZE)
-        self.assertEqual(transient_info['compat'], QCOW2_COMPAT)
-        self.assertEqual(transient_info['backingfile'], original_path)
+        assert transient_info['format'] == qemuimg.FORMAT.QCOW2
+        assert transient_info['virtual-size'] == VIRTUAL_SIZE
+        assert transient_info['format-specific']['data']['compat'] == \
+            QCOW2_COMPAT
+        assert transient_info['backing-filename'] == original_path
 
     def create_image(self, img_path, img_format):
         if img_format == 'raw':

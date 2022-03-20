@@ -29,13 +29,13 @@ import pytest
 
 from testlib import make_uuid
 
+from vdsm.common.units import MiB, GiB, PiB
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
-from vdsm.storage import volume
+from vdsm.storage import volume, volumemetadata
 
 from . constants import CLEARED_VOLUME_METADATA
 
-MB = 1024 ** 2
 FAKE_TIME = 1461095629
 
 
@@ -43,15 +43,16 @@ def make_init_params(**kwargs):
     res = dict(
         domain=make_uuid(),
         image=make_uuid(),
-        puuid=make_uuid(),
-        capacity=1024 * MB,
+        parent=make_uuid(),
+        capacity=GiB,
         format=sc.type2name(sc.RAW_FORMAT),
         type=sc.type2name(sc.SPARSE_VOL),
         voltype=sc.type2name(sc.LEAF_VOL),
         disktype=sc.DATA_DISKTYPE,
         description="",
         legality=sc.LEGAL_VOL,
-        generation=sc.DEFAULT_GENERATION)
+        generation=sc.DEFAULT_GENERATION,
+        sequence=sc.DEFAULT_SEQUENCE)
     res.update(kwargs)
     return res
 
@@ -70,6 +71,7 @@ def make_md_dict(**kwargs):
         sc.LEGALITY: 'legality',
         sc.CTIME: '0',
         sc.GENERATION: '1',
+        sc.SEQUENCE: 7,
     }
     res.update(kwargs)
     return res
@@ -98,11 +100,12 @@ class TestVolumeMetadata:
             FORMAT=params['format'],
             IMAGE=params['image'],
             LEGALITY=params['legality'],
-            PUUID=params['puuid'],
+            PUUID=params['parent'],
             CAP=str(params['capacity']),
             TYPE=params['type'],
             VOLTYPE=params['voltype'],
-            GEN=params['generation'])
+            GEN=params['generation'],
+            SEQ=params['sequence'])
 
         monkeypatch.setattr(time, 'time', lambda: FAKE_TIME)
         info = volume.VolumeMetadata(**params)
@@ -123,7 +126,7 @@ class TestVolumeMetadata:
             IMAGE=%(image)s
             LEGALITY=%(legality)s
             MTIME=0
-            PUUID=%(puuid)s
+            PUUID=%(parent)s
             SIZE=%(size)s
             TYPE=%(type)s
             VOLTYPE=%(voltype)s
@@ -144,7 +147,8 @@ class TestVolumeMetadata:
             GEN=%(generation)s
             IMAGE=%(image)s
             LEGALITY=%(legality)s
-            PUUID=%(puuid)s
+            PUUID=%(parent)s
+            SEQ=%(sequence)s
             TYPE=%(type)s
             VOLTYPE=%(voltype)s
             EOF
@@ -167,12 +171,12 @@ class TestVolumeMetadata:
 
     @pytest.mark.parametrize("required_key",
                              [key for key in make_md_dict()
-                              if key != sc.GENERATION])
+                              if key not in (sc.SEQUENCE, sc.GENERATION)])
     def test_from_lines_missing_key(self, required_key):
         data = make_md_dict()
         data[required_key] = None
         lines = make_lines(**data)
-        with pytest.raises(se.MetaDataKeyNotFoundError):
+        with pytest.raises(se.InvalidMetadata):
             volume.VolumeMetadata.from_lines(lines)
 
     def test_from_lines_invalid_param(self):
@@ -184,8 +188,9 @@ class TestVolumeMetadata:
     @pytest.mark.parametrize("key", [sc.CTIME, sc.CAPACITY])
     def test_from_lines_int_parse_error(self, key):
         lines = make_lines(**{key: 'not_an_integer'})
-        with pytest.raises(ValueError):
+        with pytest.raises(se.InvalidMetadata) as e:
             volume.VolumeMetadata.from_lines(lines)
+        assert 'not_an_integer' in str(e.value)
 
     @pytest.mark.parametrize("version", [4, 5])
     def test_from_lines_common(self, monkeypatch, version):
@@ -197,7 +202,7 @@ class TestVolumeMetadata:
         md = volume.VolumeMetadata.from_lines(lines)
         assert data['domain'] == md.domain
         assert data['image'] == md.image
-        assert data['puuid'] == md.puuid
+        assert data['parent'] == md.parent
         assert data['format'] == md.format
         assert data['type'] == md.type
         assert data['voltype'] == md.voltype
@@ -206,6 +211,11 @@ class TestVolumeMetadata:
         assert FAKE_TIME == md.ctime
         assert data['legality'] == md.legality
         assert int(data['generation']) == md.generation
+
+        if version == 5:
+            assert int(data['sequence']) == md.sequence
+        if version == 4:
+            assert 0 == md.sequence
 
     def test_from_lines_v5(self):
         data = make_init_params()
@@ -223,7 +233,7 @@ class TestVolumeMetadata:
         lines.insert(0, b"SIZE=4096")
 
         md = volume.VolumeMetadata.from_lines(lines)
-        assert md.capacity == 2 * MB
+        assert md.capacity == 2 * MiB
 
     def test_from_lines_no_size_and_capacity(self):
         data = make_init_params()
@@ -231,7 +241,7 @@ class TestVolumeMetadata:
         lines = md.storage_format(5).splitlines()
         lines.remove(b"CAP=1073741824")
 
-        with pytest.raises(se.MetaDataKeyNotFoundError):
+        with pytest.raises(se.InvalidMetadata):
             volume.VolumeMetadata.from_lines(lines)
 
     def test_generation_default(self):
@@ -239,21 +249,91 @@ class TestVolumeMetadata:
         md = volume.VolumeMetadata.from_lines(lines)
         assert sc.DEFAULT_GENERATION == md.generation
 
+    def test_sequence_default(self):
+        lines = make_lines(SEQ=None)
+        md = volume.VolumeMetadata.from_lines(lines)
+        assert sc.DEFAULT_SEQUENCE == md.sequence
+
     def test_cleared_metadata(self):
         lines = CLEARED_VOLUME_METADATA.rstrip(b"\0").splitlines()
-        with pytest.raises(se.MetadataCleared):
+        with pytest.raises(se.InvalidMetadata) as e:
             volume.VolumeMetadata.from_lines(lines)
+        assert 'Metadata was cleared, volume is partly deleted' in str(e.value)
 
     def test_empty_metadata(self):
-        with pytest.raises(se.MetaDataKeyNotFoundError):
+        with pytest.raises(se.InvalidMetadata):
             volume.VolumeMetadata.from_lines([])
+
+    @pytest.mark.parametrize("key", [sc.CTIME, sc.CAPACITY, sc.GENERATION])
+    def test_parse_invalid_values(self, key):
+        lines = make_lines(**{key: 'not_an_integer'})
+        md, errors = volumemetadata.parse(lines)
+
+        # Check other keys are reported using the right type.
+        for attr, validator in volumemetadata.ATTRIBUTES.values():
+            if attr in md:
+                validator(md[attr])
+
+        # Errors should contain invalid values.
+        assert any(['not_an_integer' in x for x in errors])
+
+        # The key with invalid value should not be present in metadata.
+        missing_attr, _ = volumemetadata.ATTRIBUTES[key]
+        assert missing_attr not in md
+
+    def test_invalid_legacy_size_value(self):
+        capacity = 123456
+        lines = make_lines(**{volumemetadata._SIZE: 'not_an_integer',
+                              "CAP": capacity})
+
+        # Check capacity is used regardless of invalid size legacy value.
+        md, errors = volumemetadata.parse(lines)
+        assert not errors
+        assert md['capacity'] == capacity
+
+    def test_valid_legacy_size_no_capacity(self):
+        size = 4
+        capacity = size * sc.BLOCK_SIZE_512
+        lines = make_lines(**{volumemetadata._SIZE: size,
+                              "CAP": capacity})
+
+        # Remove capacity value.
+        lines.remove(b'CAP=%s' % str(capacity).encode("utf-8"))
+
+        # Parse lines and check capacity was calculated from size.
+        md, errors = volumemetadata.parse(lines)
+        assert not errors
+        assert md['capacity'] == capacity
+
+    def test_parse_missing_key(self):
+        lines = make_lines()
+
+        # Remove some value to simulate missing storage data.
+        lines.remove(b"VOLTYPE=voltype")
+
+        # Parse metadata ignoring errors
+        md, errors = volumemetadata.parse(lines)
+
+        # Invalid value should be shown in errors.
+        assert any(['voltype' in x for x in errors])
+
+        assert 'voltype' not in md
+
+    def test_parse_invalid_storage_value(self):
+        lines = make_lines()
+        invalid_value = b"invalid\xd7value"
+        lines.insert(0, invalid_value)
+        md, errors = volumemetadata.parse(lines)
+
+        # Errors should contain invalid values.
+        assert any([repr(invalid_value) in x for x in errors])
 
 
 class TestMDSize:
     MAX_DESCRIPTION = "x" * sc.DESCRIPTION_SIZE
     # We don't think that any one will actually preallocate
     # 1 PB in near future.
-    MAX_PREALLOCATED_SIZE = 1024**5
+    MAX_PREALLOCATED_SIZE = PiB
     MAX_VOLUME_SIZE = 2**63 - 1
 
     @pytest.mark.parametrize('size', [
@@ -282,6 +362,7 @@ class TestMDSize:
         # POOL_UUID=
         # TYPE=PREALLOCATED
         # GEN=0
+        # SEQ=4294967295
         # EOF
         {
             'capacity': MAX_PREALLOCATED_SIZE,
@@ -302,6 +383,7 @@ class TestMDSize:
         # POOL_UUID=
         # TYPE=SPARSE
         # GEN=0
+        # SEQ=4294967295
         # EOF
         {
             'capacity': MAX_VOLUME_SIZE,
@@ -319,10 +401,11 @@ class TestMDSize:
             image='75f8a1bb-4504-4314-91ca-d9365a30692b',
             legality='ILLEGAL',
             # Blank UUID for RAW, can be real UUID for COW.
-            puuid=sc.BLANK_UUID,
+            parent=sc.BLANK_UUID,
             capacity=md_params['capacity'],
             type=md_params['type'],
             voltype='INTERNAL',
+            sequence=sc.MAX_SEQUENCE,
         )
 
         md_len = len(md.storage_format(version))
@@ -376,12 +459,13 @@ class TestDictInterface:
         assert md[sc.DOMAIN] == params['domain']
         assert md[sc.FORMAT] == params['format']
         assert md[sc.IMAGE] == params['image']
-        assert md[sc.PUUID] == params['puuid']
+        assert md[sc.PUUID] == params['parent']
         assert md[sc.CAPACITY] == str(params['capacity'])
         assert md[sc.TYPE] == params['type']
         assert md[sc.VOLTYPE] == params['voltype']
         assert md[sc.DISKTYPE] == params['disktype']
         assert md[sc.GENERATION] == params['generation']
+        assert md[sc.SEQUENCE] == params['sequence']
 
     def test_dict_setter(self):
         params = make_init_params()
@@ -406,3 +490,25 @@ class TestDictInterface:
         params = make_init_params()
         md = volume.VolumeMetadata(**params)
         assert md.get("INVALID_KEY", "TEST") == "TEST"
+
+    def test_dump(self, monkeypatch):
+        params = make_init_params()
+        monkeypatch.setattr(time, 'time', lambda: FAKE_TIME)
+        md = volume.VolumeMetadata(**params)
+
+        expected = {
+            'capacity': params['capacity'],
+            'ctime': FAKE_TIME,
+            'description': params['description'],
+            'disktype': params['disktype'],
+            'format': params['format'],
+            'generation': params['generation'],
+            'sequence': params['sequence'],
+            'image': params['image'],
+            'legality': params['legality'],
+            'parent': params['parent'],
+            'type': params['type'],
+            'voltype': params['voltype'],
+        }
+
+        assert md.dump() == expected

@@ -22,27 +22,32 @@ from __future__ import absolute_import
 
 import os
 
-import six
-
 from vdsm import constants
 from vdsm.common.config import config
 from vdsm.common.units import MiB
 from vdsm.storage import qemuimg
 
+# Stroage pool.
+POOL_MASTER_DOMAIN = "mastersd"
 
 # ResourceManager Lock Namespaces
 STORAGE = "00_storage"
 IMAGE_NAMESPACE = '01_img'
 VOLUME_NAMESPACE = '02_vol'
 LVM_ACTIVATION_NAMESPACE = '03_lvm'
-VOLUME_LEASE_NAMESPACE = "04_lease"
 
-VG_EXTENT_SIZE_MB = 128
+# These namespace do not need to be registered as they are not used by the
+# resource manager, but by sanlock. We only need the namespace to perform
+# the lock sorting.
+VOLUME_LEASE_NAMESPACE = "04_lease"
+EXTERNAL_LEASE_NAMESPACE = "05_external_lease"
+
+VG_EXTENT_SIZE = 128 * MiB
 COW_OVERHEAD = 1.1
 
 # The minimal size used to limit internal volume size. This is mainly used
 # when calculating volume optimal size.
-MIN_CHUNK = 8 * VG_EXTENT_SIZE_MB * MiB
+MIN_CHUNK = 8 * VG_EXTENT_SIZE
 
 # TODO: This constant is useful only file base storage, it should be moved to
 # some constant module specific to file based storage once we have such module.
@@ -77,12 +82,14 @@ ALIGNMENT_2M = 2 * MiB
 ALIGNMENT_4M = 4 * MiB
 ALIGNMENT_8M = 8 * MiB
 
-# block size/alignment mapping to the number of hosts
-HOSTS_512_1M = 2000
+# A maximum number of hosts for both 512B & 4K block sizes.
+HOSTS_MAX = 2000
+# Block size/alignment mapping to the number of hosts.
+HOSTS_512_1M = HOSTS_MAX
 HOSTS_4K_1M = 250
 HOSTS_4K_2M = 500
 HOSTS_4K_4M = 1000
-HOSTS_4K_8M = 2000
+HOSTS_4K_8M = HOSTS_MAX
 
 FILE_VOLUME_PERMISSIONS = 0o660
 LEASE_FILEEXT = ".lease"
@@ -114,6 +121,7 @@ HEVD_DISKTYPE = "HEVD"  # Hosted Engine VM disk
 HESD_DISKTYPE = "HESD"  # Hosted Engine Sanlock disk
 HEMD_DISKTYPE = "HEMD"  # Hosted Engine metadata disk
 HECI_DISKTYPE = "HECI"  # Hosted Engine configuration image
+SCRD_DISKTYPE = "SCRD"  # VM backup scratch disk
 
 # Engine < 4.2, or engine with compatibility level < 4.2 created data disks
 # with this disk type.
@@ -132,25 +140,41 @@ VOL_DISKTYPE = frozenset([
     HESD_DISKTYPE,
     HEMD_DISKTYPE,
     HECI_DISKTYPE,
+    SCRD_DISKTYPE,
     LEGACY_DATA_DISKTYPE,
     LEGACY_V2V_DATA_DISKTYPE,
 ])
 
-VOLUME_TYPES = {UNKNOWN_VOL: 'UNKNOWN', PREALLOCATED_VOL: 'PREALLOCATED',
-                SPARSE_VOL: 'SPARSE',
-                UNKNOWN_FORMAT: 'UNKNOWN', COW_FORMAT: 'COW',
-                RAW_FORMAT: 'RAW',
-                SHARED_VOL: 'SHARED', INTERNAL_VOL: 'INTERNAL',
-                LEAF_VOL: 'LEAF'}
+_TYPE2NAME = {
+    UNKNOWN_VOL: 'UNKNOWN',
+    PREALLOCATED_VOL: 'PREALLOCATED',
+    SPARSE_VOL: 'SPARSE',
+    UNKNOWN_FORMAT: 'UNKNOWN',
+    COW_FORMAT: 'COW',
+    RAW_FORMAT: 'RAW',
+    SHARED_VOL: 'SHARED',
+    INTERNAL_VOL: 'INTERNAL',
+    LEAF_VOL: 'LEAF'
+}
+
+_NAME2TYPE = {v: k for k, v in _TYPE2NAME.items()}
 
 ILLEGAL_VOL = "ILLEGAL"
 LEGAL_VOL = "LEGAL"
 FAKE_VOL = "FAKE"
 
-FMT2STR = {
+# Volume info statuses
+VOL_STATUS_OK = "OK"
+VOL_STATUS_INIT = "INIT"
+VOL_STATUS_INVALID = "INVALID"
+VOL_STATUS_REMOVED = "REMOVED"
+
+_FMT2STR = {
     COW_FORMAT: qemuimg.FORMAT.QCOW2,
     RAW_FORMAT: qemuimg.FORMAT.RAW,
 }
+
+_STR2FMT = {v: k for k, v in _FMT2STR.items()}
 
 BLANK_UUID = "00000000-0000-0000-0000-000000000000"
 
@@ -160,22 +184,20 @@ REMOVED_IMAGE_PREFIX = "_remove_me_"
 ZEROED_IMAGE_PREFIX = REMOVED_IMAGE_PREFIX + "ZERO_"
 
 
-def fmt2str(format):
-    return FMT2STR[format]
+def fmt2str(fmt):
+    return _FMT2STR[fmt]
+
+
+def str2fmt(s):
+    return _STR2FMT[s]
 
 
 def type2name(volType):
-    try:
-        return VOLUME_TYPES[volType]
-    except IndexError:
-        return None
+    return _TYPE2NAME[volType]
 
 
 def name2type(name):
-    for (k, v) in six.iteritems(VOLUME_TYPES):
-        if v == name.upper():
-            return k
-    return None
+    return _NAME2TYPE[name.upper()]
 
 
 # Volume meta data fields
@@ -192,6 +214,7 @@ DESCRIPTION = "DESCRIPTION"
 LEGALITY = "LEGALITY"
 MTIME = "MTIME"
 GENERATION = "GEN"  # Added in 4.1
+SEQUENCE = "SEQ"  # Added in 4.5
 
 # In block storage, metadata size is limited to BLOCK_SIZE (512), to
 # ensure that metadata is written atomically. This is big enough for the
@@ -220,6 +243,7 @@ GENERATION = "GEN"  # Added in 4.1
 # TYPE=PREALLOCATED                           # PREALLOCATED|UNKNOWN|SPARSE
 # VOLTYPE=INTERNAL                            # INTERNAL|SHARED|LEAF
 # GEN=999                                     # int
+# SEQ=4294967295                              # int
 # EOF
 #
 # For more info why this is the worst possible case, see
@@ -228,7 +252,7 @@ GENERATION = "GEN"  # Added in 4.1
 # On V4 This content requires up to 276 bytes, leaving 236 bytes for the
 # description.
 #
-# On V5 this content requires 270 bytes, leaving 242 bytes for the description
+# On V5 this content requires 285 bytes, leaving 227 bytes for the description
 # field.
 #
 # OVF_STORE JSON description format needs up to 175 bytes.
@@ -246,6 +270,10 @@ DESCRIPTION_SIZE = 210
 # after reaching its maximum value.
 DEFAULT_GENERATION = 0
 MAX_GENERATION = 999  # Since this is represented in ASCII, limit to 3 places
+
+# The SEQUENCE metadata may be missing, as it was added only in 4.5.
+DEFAULT_SEQUENCE = 0
+MAX_SEQUENCE = 2**32 - 1
 
 # Block volume metadata tags
 TAG_PREFIX_MD = "MD_"
@@ -278,3 +306,9 @@ REPO_MOUNT_DIR = os.path.join(REPO_DATA_CENTER, DOMAIN_MNT_POINT)
 # TODO: Consider totally removing it in the future.
 # Global process pool name.
 GLOBAL_OOP = 'Global'
+
+# Job statuses for external lease metadata
+JOB_STATUS_PENDING = "PENDING"
+JOB_STATUS_FAILED = "FAILED"
+JOB_STATUS_SUCCEEDED = "SUCCEEDED"
+JOB_STATUS_FENCED = "FENCED"

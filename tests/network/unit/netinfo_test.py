@@ -1,5 +1,5 @@
 #
-# Copyright 2012-2019 Red Hat, Inc.
+# Copyright 2012-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,18 +23,31 @@ from __future__ import absolute_import
 from __future__ import division
 import os
 import io
+from unittest import mock
 
 import pytest
-import six
 
 from vdsm.network import ipwrapper
 from vdsm.network.ip.address import prefix2netmask
 from vdsm.network.link import nic
-from vdsm.network.link.bond import Bond
+from vdsm.network.link.bond import Bond, bond_speed
 from vdsm.network.netinfo import addresses, bonding, misc, nics, routes
 from vdsm.network.netinfo.cache import get
 
-from network.compat import mock
+from vdsm.network import nmstate
+from vdsm.network.nmstate import api
+
+
+@pytest.fixture
+def current_state_mock():
+    with mock.patch.object(api, 'state_show') as state:
+        state.return_value = {
+            nmstate.Interface.KEY: [],
+            nmstate.DNS.KEY: {},
+            nmstate.Route.KEY: {},
+            nmstate.RouteRule.KEY: {},
+        }
+        yield state.return_value
 
 
 class TestNetinfo(object):
@@ -49,6 +62,43 @@ class TestNetinfo(object):
         pytest.raises(ValueError, prefix2netmask, -1)
         pytest.raises(ValueError, prefix2netmask, 33)
 
+    @mock.patch.object(nic, 'speed')
+    @mock.patch.object(bond_speed, 'properties')
+    def test_bond_speed(self, mock_properties, speed_mock):
+        values = (
+            ('bond1', [1000], 1000),
+            ('bond2', [1000, 2000], 3000),
+            ('bond3', [1000, 2000], 1000),
+            ('bond4', [1000, 1000], 0),
+            ('bond5', [1000, 2000], 0),
+        )
+        bonds_opts = {
+            'bond1': {
+                'mode': ['active-backup', '1'],
+                'slaves': ('dummy1', 'dummy2'),
+                'active_slave': 'dummy1',
+            },
+            'bond2': {
+                'mode': ['balance-xor', '2'],
+                'slaves': ('dummy1', 'dummy2'),
+            },
+            'bond3': {
+                'mode': ['broadcast', '3'],
+                'slaves': ('dummy1', 'dummy2'),
+            },
+            'bond4': {'mode': ['802.3ad', '4']},
+            'bond5': {
+                'mode': ['active-backup', '1'],
+                'slaves': ('dummy1', 'dummy2'),
+            },
+        }
+
+        for bond_name, nics_speeds, expected_speed in values:
+            mock_properties.return_value = bonds_opts[bond_name]
+            speed_mock.side_effect = nics_speeds
+
+            assert bond_speed.speed(bond_name) == expected_speed
+
     @mock.patch.object(nic, 'iface')
     @mock.patch.object(nics.io, 'open')
     def test_valid_nic_speed(self, mock_io_open, mock_iface):
@@ -56,8 +106,8 @@ class TestNetinfo(object):
         values = (
             (b'0', IS_UP, 0),
             (b'-10', IS_UP, 0),
-            (six.b(str(2 ** 16 - 1)), IS_UP, 0),
-            (six.b(str(2 ** 32 - 1)), IS_UP, 0),
+            (str(2 ** 16 - 1).encode("utf8"), IS_UP, 0),
+            (str(2 ** 32 - 1).encode("utf8"), IS_UP, 0),
             (b'123', IS_UP, 123),
             (b'', IS_UP, 0),
             (b'', not IS_UP, 0),
@@ -70,15 +120,11 @@ class TestNetinfo(object):
 
             assert nic.speed('fake_nic') == expected
 
-    def test_dpdk_device_speed(self):
-        assert nic.speed('dpdk0') == 0
-
-    def test_dpdk_operstate_always_up(self):
-        assert nics.operstate('dpdk0') == nics.OPERSTATE_UP
-
     @mock.patch.object(bonding, 'permanent_address', lambda: {})
     @mock.patch('vdsm.network.netinfo.cache.RunningConfig')
-    def test_get_non_existing_bridge_info(self, mock_runningconfig):
+    def test_get_non_existing_bridge_info(
+        self, mock_runningconfig, current_state_mock
+    ):
         # Getting info of non existing bridge should not raise an exception,
         # just log a traceback. If it raises an exception the test will fail as
         # it should.
@@ -88,7 +134,7 @@ class TestNetinfo(object):
     @mock.patch.object(bonding, 'permanent_address', lambda: {})
     @mock.patch('vdsm.network.netinfo.cache.getLinks')
     @mock.patch('vdsm.network.netinfo.cache.RunningConfig')
-    def test_get_empty(self, mock_networks, mock_getLinks):
+    def test_get_empty(self, mock_networks, mock_getLinks, current_state_mock):
         result = {}
         result.update(get())
         assert result['networks'] == {}
@@ -225,28 +271,6 @@ class TestNetinfo(object):
             state='up',
         ),
     ]
-
-    @mock.patch.object(misc, 'open', create=True)
-    def test_get_ifcfg(self, mock_open):
-        gateway = '1.1.1.1'
-        netmask = '255.255.0.0'
-
-        ifcfg = "GATEWAY0={}\nNETMASK={}\n".format(gateway, netmask)
-        ifcfg_stream = six.StringIO(ifcfg)
-        mock_open.return_value.__enter__.return_value = ifcfg_stream
-
-        resulted_ifcfg = misc.getIfaceCfg('eth0')
-
-        assert resulted_ifcfg['GATEWAY'] == gateway
-        assert resulted_ifcfg['NETMASK'] == netmask
-
-    @mock.patch.object(misc, 'open', create=True)
-    def test_missing_ifcfg_file(self, mock_open):
-        mock_open.return_value.__enter__.side_effect = IOError()
-
-        ifcfg = misc.getIfaceCfg('eth0')
-
-        assert ifcfg == {}
 
     @staticmethod
     def _bond_opts_without_mode(bond_name):

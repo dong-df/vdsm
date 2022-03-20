@@ -23,17 +23,16 @@ from __future__ import absolute_import
 from __future__ import division
 
 import io
+import pickle
 import sys
 import yaml
 
-from vdsm.common.compat import pickle
-
 
 def _load_yaml_file(file_path):
-    if hasattr(yaml, 'CLoader'):
+    if hasattr(yaml, 'CSafeLoader'):
         loader = yaml.CLoader
     else:
-        loader = yaml.Loader
+        loader = yaml.SafeLoader
     yaml_file = yaml.load(file_path, Loader=loader)
     return yaml_file
 
@@ -44,7 +43,7 @@ def _dump_pickled_schema(schema_path, pickled_schema_path):
         with io.open(pickled_schema_path, 'wb') as pickled_schema:
             pickle.dump(loaded_schema,
                         pickled_schema,
-                        protocol=pickle.HIGHEST_PROTOCOL)
+                        protocol=4)
 
 
 def main():

@@ -1,5 +1,5 @@
 # Copyright (C) 2012 - 2017 Adam Litke, IBM Corporation
-# Copyright 2016-2018 Red Hat, Inc.
+# Copyright 2016-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 as
@@ -195,7 +195,7 @@ class DynamicBridge(object):
                     except ge.GlusterException as e:
                         result = e.response()
                 else:
-                        result = fn(*methodArgs)
+                    result = fn(*methodArgs)
             except TypeError as e:
                 self.log.exception("TypeError raised by dispatched function")
                 raise InvalidCall(fn, methodArgs, e)
@@ -211,7 +211,7 @@ class DynamicBridge(object):
                 ret = retfield(result)
         elif _glusterEnabled and className.startswith('Gluster'):
             ret = dict([(key, value) for key, value in result.items()
-                        if key is not 'status'])
+                        if key != 'status'])
         else:
             ret = self._get_result(result, retfield)
 
@@ -373,6 +373,7 @@ command_info = {
     'StorageDomain_getInfo': {'ret': 'info'},
     'StorageDomain_getStats': {'ret': 'stats'},
     'StorageDomain_getVolumes': {'ret': 'uuidlist'},
+    'StorageDomain_dump': {'ret': 'result'},
     'StorageDomain_resizePV': {'ret': 'size'},
     'StoragePool_connectStorageServer': {'ret': 'statuslist'},
     'StoragePool_disconnectStorageServer': {'ret': 'statuslist'},
@@ -387,6 +388,7 @@ command_info = {
     'StoragePool_prepareMerge': {'ret': 'uuid'},
     'StoragePool_finalizeMerge': {'ret': 'uuid'},
     'StoragePool_reduceVolume': {'ret': 'uuid'},
+    'StoragePool_switchMaster': {'ret': 'uuid'},
     'Task_getInfo': {'ret': 'TaskInfo'},
     'Task_getStatus': {'ret': 'taskStatus'},
     'VM_changeCD': {'ret': 'vmList'},
@@ -395,6 +397,7 @@ command_info = {
     'VM_cont': {'ret': VM_running_state_change_Ret},
     'VM_diskSizeExtend': {'ret': 'size'},
     'VM_getDiskAlignment': {'ret': 'alignment'},
+    'VM_getExternalData': {'ret': 'data'},
     'VM_getInfo': {'call': VM_getInfo_Call, 'ret': VM_getInfo_Ret},
     'VM_getIoTune': {'ret': 'ioTuneList'},
     'VM_getIoTunePolicy': {'ret': 'ioTunePolicyList'},
@@ -402,8 +405,8 @@ command_info = {
     'VM_hotplugDisk': {'ret': 'vmList'},
     'VM_hotplugLease': {'ret': 'vmList'},
     'VM_hotplugNic': {'ret': 'vmList'},
-    'VM_hostdevHotplug': {'ret': 'assignedDevices'},
-    'VM_hostdevHotunplug': {'ret': 'unpluggedDevices'},
+    'VM_hotplugHostdev': {'ret': 'assignedDevices'},
+    'VM_hotunplugHostdev': {'ret': 'unpluggedDevices'},
     'VM_hotunplugDisk': {'ret': 'vmList'},
     'VM_hotunplugLease': {'ret': 'vmList'},
     'VM_hotunplugNic': {'ret': 'vmList'},
@@ -427,6 +430,7 @@ command_info = {
     'Volume_getPath': {'ret': 'path'},
     'Volume_getSize': {'ret': Volume_getsize_Ret},
     'Volume_extendSize': {'ret': 'uuid'},
+    'Volume_measure': {'ret': 'result'},
     'Host_getAllTasks': {'ret': 'tasks'},
     'Host_getJobs': {'ret': 'jobs'},
     'Lease_create': {'ret': 'uuid'},
@@ -440,6 +444,10 @@ command_info = {
     'VM_start_backup': {'ret': 'result'},
     'VM_stop_backup': {'ret': 'status'},
     'VM_backup_info': {'ret': 'result'},
-    'VM_delete_checkpoints': {'ret': 'status'},
-    'VM_redefine_checkpoints': {'ret': 'status'},
+    'VM_delete_checkpoints': {'ret': 'result'},
+    'VM_redefine_checkpoints': {'ret': 'result'},
+    'VM_list_checkpoints': {'ret': 'result'},
+    'VM_dump_checkpoint': {'ret': 'result'},
+    'VM_refresh_disk': {'ret': 'result'},
+    'VM_screenshot': {'ret': 'result'},
 }

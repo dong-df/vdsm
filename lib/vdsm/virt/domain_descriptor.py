@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2017 Red Hat, Inc.
+# Copyright 2014-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,11 +22,19 @@ from __future__ import absolute_import
 from __future__ import division
 
 from contextlib import contextmanager
+import enum
 import xml.etree.ElementTree as etree
 
+from vdsm import taskset
 from vdsm.common import xmlutils
 from vdsm.virt import metadata
 from vdsm.virt import vmxml
+
+
+class XmlSource(enum.Enum):
+    INITIAL = enum.auto()
+    MIGRATION_SOURCE = enum.auto()
+    LIBVIRT = enum.auto()
 
 
 class MutableDomainDescriptor(object):
@@ -92,18 +100,32 @@ class MutableDomainDescriptor(object):
         return hash(xmlutils.tostring(devices) if devices is not None else '')
 
     def all_channels(self):
+        """
+        Returns a tuple (name, path, state) for each channel device in domain
+        XML. Name and path are always non-empty strings, state is non-empty
+        string (connected/disconnected) or None if the channel state is
+        unknown.
+        """
         if self.devices is not None:
             for channel in vmxml.find_all(self.devices, 'channel'):
                 name = vmxml.find_attr(channel, 'target', 'name')
                 path = vmxml.find_attr(channel, 'source', 'path')
+                state = vmxml.find_attr(channel, 'target', 'state')
                 if name and path:
-                    yield name, path
+                    yield name, path, (None if not state else state)
 
     def get_number_of_cpus(self):
         """
-        Return the number of VM's CPUs as a string.
+        Return the number of VM's CPUs as int.
         """
-        return self._dom.findtext('vcpu')
+        vcpu = self._dom.find('./vcpu')
+        if vcpu is None:
+            raise LookupError('Element vcpu not found in domain XML')
+        cpus = vmxml.attr(vcpu, 'current')
+        if cpus == '':
+            # If attribute current is not present fall-back to element text
+            cpus = vcpu.text
+        return int(cpus)
 
     def get_memory_size(self, current=False):
         """
@@ -124,14 +146,63 @@ class MutableDomainDescriptor(object):
         elem = next((el for el in self._dom.findall('.//on_reboot')), None)
         return elem is not None and elem.text or None
 
+    @property
+    def nvram(self):
+        """
+        :return: NVRAM element defining NVRAM store (used to store UEFI or
+          SecureBoot variables) or None if the VM has no NVRAM store.
+        """
+        return vmxml.find_first(self._dom, 'os/nvram', None)
+
+    @property
+    def pinned_cpus(self):
+        """
+        :return: A dictionary in which key is vCPU ID and value is a frozenset
+          with IDs of pCPUs the vCPU is pinned to. If a vCPU is not pinned to
+          any pCPU it is not listed in the dictionary. Empty dictionary is
+          returned if none of the vCPUs has a pinning defined.
+        """
+        cputune = vmxml.find_first(self._dom, 'cputune', None)
+        if cputune is None:
+            return {}
+        pinning = dict()
+        for vcpupin in vmxml.find_all(cputune, 'vcpupin'):
+            cpuset = vcpupin.get('cpuset', None)
+            vcpu = vcpupin.get('vcpu', None)
+            if vcpu is not None and cpuset is not None:
+                cpus = taskset.cpulist_parse(cpuset)
+                if len(cpus) > 0:
+                    pinning[int(vcpu)] = cpus
+        return pinning
+
 
 class DomainDescriptor(MutableDomainDescriptor):
 
-    def __init__(self, xmlStr):
+    def __init__(self, xmlStr, xml_source=XmlSource.LIBVIRT):
+        """
+        :param xmlStr: Domain XML
+        :type xmlStr: string
+        :param xml_source: If set to INITIAL or MIGRATION_SOURCE then the
+          provided domain XML is the initial domain XML and possitbly not yet
+          filled with information from libvirt, such as device addresses.
+          Device hash is None in such a case, to prevent Engine from
+          retrieving and processing incomplete device information.
+        :type xml_source: XmlSource
+        :type migration_src: bool
+        """
         super(DomainDescriptor, self).__init__(xmlStr)
         self._xml = xmlStr
+        self._xml_source = xml_source
         self._devices = super(DomainDescriptor, self).devices
-        self._devices_hash = super(DomainDescriptor, self).devices_hash
+        if self._xml_source == XmlSource.INITIAL or \
+                self._xml_source == XmlSource.MIGRATION_SOURCE:
+            self._devices_hash = None
+        else:
+            self._devices_hash = super(DomainDescriptor, self).devices_hash
+
+    @property
+    def xml_source(self):
+        return self._xml_source
 
     @property
     def xml(self):

@@ -57,11 +57,11 @@ class FakeLVM(object):
     # We pretend all PVs are 10G in size
     _PV_SIZE = 10 * GiB
     # Found via inspection of real environment
-    _PV_PE_SIZE = sc.VG_EXTENT_SIZE_MB * MiB
+    _PV_PE_SIZE = sc.VG_EXTENT_SIZE
     # The number of PEs used for metadata areas
     _PV_MDA_COUNT = 2
     # 2 PE for metadata + 1 PE to hold a header
-    _PV_UNUSABLE = (_PV_PE_SIZE * (1 + _PV_MDA_COUNT))
+    _PV_UNUSABLE = _PV_PE_SIZE * (1 + _PV_MDA_COUNT)
 
     def __init__(self, root):
         self.root = root
@@ -73,7 +73,6 @@ class FakeLVM(object):
     def createVG(self, vgName, devices, initialTag, metadataSize, force=False):
         # Convert params from MiB to bytes to match other fields
         metadataSize *= MiB
-        extentsize = sc.VG_EXTENT_SIZE_MB * MiB
 
         for dev in devices:
             self._create_pv(dev, vgName, self._PV_SIZE)
@@ -93,7 +92,7 @@ class FakeLVM(object):
                      attr=vg_attr,
                      size=str(size),
                      free=str(size),
-                     extent_size=str(extentsize),
+                     extent_size=str(sc.VG_EXTENT_SIZE),
                      extent_count=str(extent_count),
                      free_count=str(extent_count),
                      tags=(initialTag,),
@@ -112,12 +111,10 @@ class FakeLVM(object):
     def invalidateVG(self, vgName):
         pass
 
-    def _size_param_to_bytes(self, size):
-        # Size is received as a string in MiB.  We need to convert it to bytes
+    def _size_param_to_bytes(self, size_mb):
+        # Size is received in MiB. We need to convert it to bytes
         # and round it up to a multiple of the VG extent size.
-        extent_size = sc.VG_EXTENT_SIZE_MB * MiB
-        size = int(size) * MiB
-        return utils.round(size, extent_size)
+        return utils.round(size_mb * MiB, sc.VG_EXTENT_SIZE)
 
     def _create_lv_file(self, vgName, lvName, active, size):
         # Create an LV as a regular file so we have a place to write data
@@ -135,7 +132,8 @@ class FakeLVM(object):
         try:
             vg_md = self.vgmd[vgName]
         except KeyError:
-            raise se.CannotCreateLogicalVolume(vgName, lvName, 'Fake error')
+            raise se.CannotCreateLogicalVolume(
+                ['Fake cmd'], 5, ['Fake out'], ['Fake error'])
 
         size = self._size_param_to_bytes(size)
 
@@ -167,7 +165,8 @@ class FakeLVM(object):
         lv_count = int(vg_md['lv_count']) + 1
 
         if (vgName, lvName) in self.lvmd:
-            raise se.CannotCreateLogicalVolume(vgName, lvName, 'Fake error')
+            raise se.CannotCreateLogicalVolume(
+                ['Fake cmd'], 5, ['Fake out'], ['Fake error'])
 
         self.lvmd[(vgName, lvName)] = lv_md
         self.vgmd[vgName]['lv_count'] = str(lv_count)
@@ -209,8 +208,8 @@ class FakeLVM(object):
             try:
                 lv_mds.append(self.lvmd[(vg, lv)])
             except KeyError:
-                raise se.LogicalVolumeReplaceTagError("LV %s does not exist",
-                                                      "%s/%s" % (vg, lv))
+                raise se.LogicalVolumeReplaceTagError(
+                    "cmd", 1, ["out"], ["err"])
 
         for lv_md in lv_mds:
             # Adding an existing tag or removing a nonexistent tag are ignored
@@ -257,8 +256,8 @@ class FakeLVM(object):
         try:
             vg_md = self.vgmd[vgName]
         except KeyError:
-            raise se.VolumeGroupReplaceTagError("VG %s does not exist" %
-                                                vgName)
+            raise se.VolumeGroupReplaceTagError(
+                ['Fake cmd'], 5, ['Fake out'], ['Fake error'])
 
         # Adding an existing tag or removing a nonexistent tag are ignored
         tags = set(vg_md['tags'])
@@ -283,12 +282,11 @@ class FakeLVM(object):
         else:
             return self._getLV(vgName, lvName)
 
-    def extendLV(self, vgName, lvName, size_mb):
+    def extendLV(self, vgName, lvName, size_mb, refresh=True):
         try:
             lv = self.lvmd[(vgName, lvName)]
         except KeyError:
-            raise se.LogicalVolumeExtendError(vgName, lvName,
-                                              "%sm" % (size_mb,))
+            raise se.LogicalVolumeExtendError("cmd", 5, ["out"], ["err"])
         size = self._size_param_to_bytes(size_mb)
         current_size = int(lv["size"])
         if current_size >= size:
@@ -343,6 +341,7 @@ class FakeResourceManager(object):
 
     SHARED = rm.SHARED
     EXCLUSIVE = rm.EXCLUSIVE
+    RequestTimedOutError = rm.RequestTimedOutError
 
     @recorded
     @contextmanager
@@ -371,6 +370,10 @@ class FakeFileSD(object):
     def getVolumeClass(self):
         return fileVolume.FileVolumeManifest
 
+    @classmethod
+    def is_block(cls):
+        return False
+
 
 class FakeBlockSD(object):
     def __init__(self, sd_manifest):
@@ -382,6 +385,10 @@ class FakeBlockSD(object):
 
     def getVolumeClass(self):
         return blockVolume.BlockVolumeManifest
+
+    @classmethod
+    def is_block(cls):
+        return True
 
 
 class FakeStorageDomainCache(object):
@@ -427,6 +434,58 @@ class fake_guarded_context(object):
         pass
 
 
+class MonitorEvent(object):
+
+    def __init__(self):
+        self.callbacks = set()
+
+    def register(self, callback):
+        self.callbacks.add(callback)
+
+    def unregister(self, callback):
+        self.callbacks.remove(callback)
+
+
+class FakeDomainMonitor(object):
+    """
+    Test class implementing mock methods for a domain monitor,
+    originally used for testing SPM in blocksd_test.
+    This class cannot be used for tests relying over domain
+    monitor's functionality itself.
+    """
+    def __init__(self):
+        self.onDomainStateChange = MonitorEvent()
+        self.monitors = {}
+
+    @property
+    def poolDomains(self):
+        return [k for k, v in self.monitors.items() if v]
+
+    def startMonitoring(self, sdUUID, hostId, poolDomain=True):
+        self.monitors[sdUUID] = poolDomain
+
+    def stopMonitoring(self, sdUUIDs):
+        for k in sdUUIDs:
+            del self.monitors[k]
+
+    def isMonitoring(self, sdUUID):
+        return sdUUID in self.monitors
+
+
+class FakeTaskManager(object):
+    """
+    Test class implementing mock methods for a task manager,
+    originally used for testing SPM in blocksd_test.
+    This class cannot be used for tests relying over task
+    manager's functionality itself.
+    """
+    def loadDumpedTasks(self, task_dir):
+        pass
+
+    def recoverDumpedTasks(self):
+        pass
+
+
 @contextmanager
 def fake_repo():
     """
@@ -459,5 +518,5 @@ def fake_spm(pool_id, master_version, domains_map):
     pool = sp.StoragePool(pool_id, None, None)
     pool.setBackend(spb.StoragePoolMemoryBackend(
         pool, master_version, domains_map))
-    pool._setSecure()
+    pool._set_secure()
     return pool

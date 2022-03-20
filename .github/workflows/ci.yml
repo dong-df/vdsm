@@ -1,0 +1,50 @@
+name: CI
+on: [push, pull_request]
+env:
+  EXPORT_DIR: exported-artifacts
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    container: quay.io/ovirt/vdsm-test-centos-8
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run linters
+      run: ./automation/lint.sh
+  test-storage:
+    env:
+      TRAVIS_CI: 1
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/ovirt/vdsm-test-centos-8
+      # Required to create loop devices.
+      options: --privileged
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run storage tests
+      run: ./automation/tests-storage.sh
+  tests:
+    env:
+      TRAVIS_CI: 1
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/ovirt/vdsm-test-centos-8
+      # Needed for many operations, i.e. creating bridges
+      options: --privileged
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run tests
+      run: ./automation/tests.sh
+  rpm:
+    runs-on: ubuntu-latest
+    container: quay.io/ovirt/vdsm-test-centos-8
+    steps:
+    # we need the tags to be pulled for RPMs to have proper versions
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+    - name: Build RPMs
+      run: ./automation/rpm.sh
+    - name: Upload artifacts
+      uses: ovirt/upload-rpms-action@v2
+      with:
+        directory: ${{ env.EXPORT_DIR }}

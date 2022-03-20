@@ -25,6 +25,7 @@ import os
 
 import pytest
 
+from vdsm.common.units import GiB
 from vdsm.storage import constants as sc
 from vdsm.storage import multipath
 
@@ -46,9 +47,9 @@ AFTER = b"b" * 10
     pytest.param(sc.BLOCK_SIZE_4K, marks=[
         requires_loopback_sector_size,
         pytest.mark.xfail(
-            testing.on_ovirt_ci(),
+            testing.on_ovirt_ci() or testing.on_travis_ci(),
             reason="fails randomly to create loop device with 4k sector "
-                   "size, only in ovirt CI - needs investigation",
+                   "size, only in CI - needs investigation",
             strict=False),
     ]),
 ])
@@ -93,7 +94,7 @@ def test_many_devices(tmpdir):
 
 def prepare_backing_file(filename):
     with io.open(filename, "wb") as f:
-        f.truncate(1024**3)
+        f.truncate(GiB)
         f.write(BEFORE)
 
 

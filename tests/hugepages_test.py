@@ -25,13 +25,15 @@ from __future__ import division
 import os
 import tempfile
 
+from unittest import mock
+
 from monkeypatch import MonkeyPatch
 from testlib import VdsmTestCase as TestCaseBase
 from testlib import make_config
-from testlib import mock
 from testlib import namedTemporaryDir
 from testlib import permutations, expandPermutations
-import vmfakelib as fake
+
+from virt import vmfakelib as fake
 
 from vdsm import hugepages
 from vdsm import osinfo

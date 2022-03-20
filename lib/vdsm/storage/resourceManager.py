@@ -27,8 +27,6 @@ import weakref
 from functools import partial
 from uuid import uuid4
 
-import six
-
 from six.moves import queue
 
 from vdsm import utils
@@ -38,6 +36,8 @@ from vdsm.storage import exception as se
 from vdsm.storage import guarded
 from vdsm.storage import rwlock
 
+log = logging.getLogger("storage.resourcemanager")
+
 
 # Errors
 
@@ -46,7 +46,7 @@ class ResourceManagerError(Exception):
 
 
 class NamespaceRegistered(ResourceManagerError):
-    """ Raised if a namesapce is already registered """
+    """ Raised if a namespace is already registered """
 
 
 class RequestAlreadyProcessedError(ResourceManagerError):
@@ -76,46 +76,22 @@ class ResourceDoesNotExist(ResourceManagerError):
 #        enums.
 
 
+# Lock types.
 SHARED = "shared"
 EXCLUSIVE = "exclusive"
 
+# Lock statuses.
+STATUS_FREE = "free"
+STATUS_SHARED = "shared"
+STATUS_LOCKED = "locked"
 
-class LockState:
-    free = "free"
-    shared = "shared"
-    locked = "locked"
 
-    def __init__(self, state=free):
-        self.validate(state)
-        self.state = state
-
-    def __str__(self):
-        return self.state
-
-    def __eq__(self, x):
-        if type(x) == str:
-            return self.state == x
-        if isinstance(x, self):
-            return x.state == self.state
-
-    def __ne__(self, x):
-        return not self.__eq__(x)
-
-    @classmethod
-    def fromType(cls, locktype):
-        if str(locktype) == SHARED:
-            return cls.shared
-        if str(locktype) == EXCLUSIVE:
-            return cls.locked
-        raise InvalidLockType("Invalid locktype %r was used" % locktype)
-
-    @classmethod
-    def validate(cls, state):
-        try:
-            if type(getattr(cls, state)) != str:
-                raise ValueError
-        except:
-            raise ValueError("invalid lock state %s" % state)
+def _statusFromType(locktype):
+    if str(locktype) == SHARED:
+        return STATUS_SHARED
+    if str(locktype) == EXCLUSIVE:
+        return STATUS_LOCKED
+    raise InvalidLockType("Invalid locktype %r was used" % locktype)
 
 
 # TODO : Integrate all factory functionality to manager
@@ -175,12 +151,17 @@ class RequestRef(object):
 
         return self._realRequset == other._realRequset
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self._realRequset)
+
 
 class Request(object):
     """
     Internal request object, don't use directly
     """
-    _log = logging.getLogger("storage.ResourceManager.Request")
     namespace = property(lambda self: self._namespace)
     name = property(lambda self: self._name)
     full_name = property(lambda self: "%s.%s" % (self._namespace, self._name))
@@ -197,8 +178,8 @@ class Request(object):
         self._doneEvent = threading.Event()
         self._callback = callback
         self.reqID = str(uuid4())
-        self._log = SimpleLogAdapter(self._log, {"ResName": self.full_name,
-                                                 "ReqID": self.reqID})
+        self._log = SimpleLogAdapter(
+            log, {"ResName": self.full_name, "ReqID": self.reqID})
 
     def cancel(self):
         with self._syncRoot:
@@ -269,7 +250,6 @@ class ResourceRef(object):
     This object will auto release the referenced resource unless autorelease
     is set to `False`
     """
-    _log = logging.getLogger("storage.ResourceManager.ResourceRef")
     namespace = property(lambda self: self._namespace)
     name = property(lambda self: self._name)
     full_name = property(lambda self: "%s.%s" % (self._namespace, self._name))
@@ -281,8 +261,8 @@ class ResourceRef(object):
                  resRefID=str(uuid4())):
         self._namespace = namespace
         self._name = name
-        self._log = SimpleLogAdapter(self._log, {"ResName": self.full_name,
-                                                 "ResRefID": resRefID})
+        self._log = SimpleLogAdapter(
+            log, {"ResName": self.full_name, "ResRefID": resRefID})
 
         self.__wrappedObject = wrappedObject
         if wrappedObject is not None:
@@ -361,7 +341,6 @@ class _ResourceManager(object):
     This class is for internal usage only, clients should use the module
     interface.
     """
-    _log = logging.getLogger("storage.ResourceManager")
     _namespaceValidator = re.compile(r"^[\w\d_-]+$")
     _resourceNameValidator = re.compile(r"^[^\s.]+$")
 
@@ -382,7 +361,7 @@ class _ResourceManager(object):
                 raise NamespaceRegistered("Namespace '%s' already registered"
                                           % namespace)
 
-            self._log.debug("Registering namespace '%s'", namespace)
+            log.debug("Registering namespace '%s'", namespace)
 
             self._namespaces[namespace] = Namespace(factory)
 
@@ -403,9 +382,9 @@ class _ResourceManager(object):
                                                                  name))
 
                 if name not in resources:
-                    return LockState.free
+                    return STATUS_FREE
 
-                return LockState.fromType(resources[name].currentLock)
+                return _statusFromType(resources[name].currentLock)
 
     def _switchLockType(self, resourceInfo, newLockType):
         switchLock = (resourceInfo.currentLock != newLockType)
@@ -420,7 +399,7 @@ class _ResourceManager(object):
                     resourceInfo.realObj.switchLockType(newLockType)
                     return
                 except:
-                    self._log.warning(
+                    log.warning(
                         "Lock type switch failed on resource '%s'. "
                         "Falling back to object recreation.",
                         resourceInfo.full_name,
@@ -439,8 +418,8 @@ class _ResourceManager(object):
             try:
                 resourceInfo.realObj.close()
             except:
-                self._log.warning("Couldn't close resource '%s'.",
-                                  resourceInfo.full_name, exc_info=True)
+                log.warning("Couldn't close resource '%s'.",
+                            resourceInfo.full_name, exc_info=True)
 
     def acquireResource(self, namespace, name, lockType, timeout=None):
         """
@@ -490,8 +469,8 @@ class _ResourceManager(object):
             raise InvalidLockType("Invalid locktype %r was used" % lockType)
 
         request = Request(namespace, name, lockType, callback)
-        self._log.debug("Trying to register resource '%s' for lock type '%s'",
-                        full_name, lockType)
+        log.debug("Trying to register resource '%s' for lock type '%s'",
+                  full_name, lockType)
         with utils.RollbackContext() as contextCleanup, self._syncRoot.shared:
             try:
                 namespaceObj = self._namespaces[namespace]
@@ -511,10 +490,10 @@ class _ResourceManager(object):
                             resource.currentLock == SHARED and \
                             request.lockType == SHARED:
                         resource.activeUsers += 1
-                        self._log.debug("Resource '%s' found in shared state "
-                                        "and queue is empty, Joining current "
-                                        "shared lock (%d active users)",
-                                        full_name, resource.activeUsers)
+                        log.debug("Resource '%s' found in shared state "
+                                  "and queue is empty, Joining current "
+                                  "shared lock (%d active users)",
+                                  full_name, resource.activeUsers)
                         request.grant()
                         contextCleanup.defer(request.emit,
                                              ResourceRef(namespace, name,
@@ -523,9 +502,9 @@ class _ResourceManager(object):
                         return RequestRef(request)
 
                     resource.queue.insert(0, request)
-                    self._log.debug("Resource '%s' is currently locked, "
-                                    "Entering queue (%d in queue)",
-                                    full_name, len(resource.queue))
+                    log.debug("Resource '%s' is currently locked, "
+                              "Entering queue (%d in queue)",
+                              full_name, len(resource.queue))
                     return RequestRef(request)
 
                 # TODO : Creating the object inside the namespace lock causes
@@ -537,7 +516,7 @@ class _ResourceManager(object):
                 try:
                     obj = namespaceObj.factory.createResource(name, lockType)
                 except:
-                    self._log.warning(
+                    log.warning(
                         "Resource factory failed to create resource"
                         " '%s'. Canceling request.", full_name, exc_info=True)
                     contextCleanup.defer(request.cancel)
@@ -547,8 +526,9 @@ class _ResourceManager(object):
                 resource.currentLock = request.lockType
                 resource.activeUsers += 1
 
-                self._log.debug("Resource '%s' is free. Now locking as '%s' "
-                                "(1 active user)", full_name, request.lockType)
+                log.debug("Resource '%s' is free. Now locking as '%s' "
+                          "(1 active user)",
+                          full_name, request.lockType)
                 request.grant()
                 contextCleanup.defer(request.emit,
                                      ResourceRef(namespace, name,
@@ -563,7 +543,7 @@ class _ResourceManager(object):
         #        a case
         full_name = "%s.%s" % (namespace, name)
 
-        self._log.debug("Trying to release resource '%s'", full_name)
+        log.debug("Trying to release resource '%s'", full_name)
         with utils.RollbackContext() as contextCleanup, self._syncRoot.shared:
             try:
                 namespaceObj = self._namespaces[namespace]
@@ -580,27 +560,27 @@ class _ResourceManager(object):
                                      "registered" % (namespace, name))
 
                 resource.activeUsers -= 1
-                self._log.debug("Released resource '%s' (%d active users)",
-                                full_name, resource.activeUsers)
+                log.debug("Released resource '%s' (%d active users)",
+                          full_name, resource.activeUsers)
 
                 # Is some one else is using the resource
                 if resource.activeUsers > 0:
                     return
-                self._log.debug("Resource '%s' is free, finding out if anyone "
-                                "is waiting for it.", full_name)
+                log.debug("Resource '%s' is free, finding out if anyone "
+                          "is waiting for it.", full_name)
                 # Grant a request
                 while True:
                     # Is there someone waiting for the resource
                     if len(resource.queue) == 0:
                         self._freeResource(resources[name])
                         del resources[name]
-                        self._log.debug("No one is waiting for resource '%s', "
-                                        "Clearing records.", full_name)
+                        log.debug("No one is waiting for resource '%s', "
+                                  "Clearing records.", full_name)
                         return
 
-                    self._log.debug("Resource '%s' has %d requests in queue. "
-                                    "Handling top request.", full_name,
-                                    len(resource.queue))
+                    log.debug("Resource '%s' has %d requests in queue. "
+                              "Handling top request.",
+                              full_name, len(resource.queue))
                     nextRequest = resource.queue.pop()
                     # We lock the request to simulate a transaction. We cannot
                     # grant the request before there is a resource switch. And
@@ -608,15 +588,15 @@ class _ResourceManager(object):
                     # that the request will be granted.
                     with nextRequest.syncRoot:
                         if nextRequest.canceled():
-                            self._log.debug("Request '%s' was canceled, "
-                                            "Ignoring it.", nextRequest)
+                            log.debug("Request '%s' was canceled, Ignoring it",
+                                      nextRequest)
                             continue
 
                         try:
                             self._switchLockType(resource,
                                                  nextRequest.lockType)
                         except Exception:
-                            self._log.warning(
+                            log.warning(
                                 "Resource factory failed to create "
                                 "resource '%s'. Canceling request.",
                                 full_name, exc_info=True)
@@ -632,8 +612,7 @@ class _ResourceManager(object):
 
                         resource.activeUsers += 1
 
-                        self._log.debug("Request '%s' was granted",
-                                        nextRequest)
+                        log.debug("Request '%s' was granted", nextRequest)
                         break
 
                 # If the lock is exclusive were done
@@ -641,8 +620,7 @@ class _ResourceManager(object):
                     return
 
                 # Keep granting shared locks
-                self._log.debug("This is a shared lock. Granting all shared "
-                                "requests")
+                log.debug("This is a shared lock. Granting shared requests")
                 while len(resource.queue) > 0:
 
                     nextRequest = resource.queue[-1]
@@ -665,9 +643,8 @@ class _ResourceManager(object):
                         continue
 
                     resource.activeUsers += 1
-                    self._log.debug("Request '%s' was granted (%d "
-                                    "active users)", nextRequest,
-                                    resource.activeUsers)
+                    log.debug("Request '%s' was granted (%d active users)",
+                              nextRequest, resource.activeUsers)
 
 
 class Namespace(object):
@@ -695,7 +672,6 @@ class ResourceInfo(object):
 
 
 class Owner(object):
-    log = logging.getLogger('storage.ResourceManager.Owner')
 
     def __init__(self, ownerobject, raiseonfailure=False):
         self.ownerobject = ownerobject
@@ -713,9 +689,7 @@ class Owner(object):
         if timeout_ms is not None:
             timeout = timeout_ms / 1000.0
 
-        self.lock.acquire()
-        try:
-
+        with self.lock:
             try:
                 if full_name in self.resources:
                     raise ResourceAlreadyAcquired(
@@ -730,22 +704,25 @@ class Owner(object):
                         self.ownerobject.resourceAcquired(namespace, name,
                                                           locktype)
                 except RequestTimedOutError:
-                    self.log.debug("%s: request for '%s' timed out after '%f' "
-                                   "seconds", self, full_name, timeout)
+                    log.debug(
+                        "%s: request for '%s' timed out after '%f' seconds",
+                        self, full_name, timeout)
                     raise se.ResourceTimeout()
                 except ValueError as ex:
-                    self.log.debug("%s: request for '%s' could not be "
-                                   "processed (%s)", self, full_name, ex)
+                    log.debug(
+                        "%s: request for '%s' could not be processed (%s)",
+                        self, full_name, ex)
                     raise se.InvalidResourceName(name)
                 except KeyError:
-                    self.log.debug("%s: resource '%s' does not exist", self,
-                                   full_name)
+                    log.debug(
+                        "%s: resource '%s' does not exist",
+                        self, full_name)
                     raise ResourceDoesNotExist("Resource %s does not exist"
                                                % full_name)
                 except Exception:
-                    self.log.warning(
-                        "Unexpected exception caught while owner "
-                        "'%s' tried to acquire '%s'",
+                    log.warning(
+                        "Unexpected exception caught while owner '%s' tried "
+                        "to acquire '%s'",
                         self, full_name, exc_info=True)
                     raise se.ResourceException(full_name)
             except:
@@ -755,22 +732,16 @@ class Owner(object):
                 return False
 
             return True
-        finally:
-            self.lock.release()
 
     def releaseAll(self):
-        self.log.debug("Owner.releaseAll resources %s", self.resources)
-        self.lock.acquire()
-        try:
-            for res in list(six.itervalues(self.resources)):
+        log.debug("Owner.releaseAll resources %s", self.resources)
+        with self.lock:
+            for res in list(self.resources.values()):
                 self._release(res.namespace, res.name)
-        finally:
-            self.lock.release()
 
     def _release(self, namespace, name):
         full_name = "%s.%s" % (namespace, name)
-        self.lock.acquire()
-        try:
+        with self.lock:
             if full_name not in self.resources:
                 raise ValueError("resource %s not owned by %s" %
                                  (full_name, self))
@@ -778,16 +749,15 @@ class Owner(object):
             resource = self.resources[full_name]
 
             if not resource.isValid:
-                self.log.warning("%s: Tried to release an already released "
-                                 "resource '%s'", self, resource.full_name)
+                log.warning(
+                    "%s: Tried to release an already released resource "
+                    "'%s'",
+                    self, resource.full_name)
                 return
 
             resource.release()
 
             del self.resources[resource.full_name]
-
-        finally:
-            self.lock.release()
 
         if hasattr(self.ownerobject, "resourceReleased"):
             self.ownerobject.resourceReleased(resource.namespace,
@@ -801,14 +771,18 @@ class Owner(object):
         return str(self.ownerobject)
 
 
-class ResourceManagerLock(guarded.AbstractLock):
+class Lock(guarded.AbstractLock):
     """
     Extend AbstractLock to enable Resources to be used with guarded utilities.
+
+    This lock can also be used as a context manager.
     """
     def __init__(self, ns, name, mode):
         self._ns = ns
         self._name = name
         self._mode = mode
+
+    # guarded.AbstractLock interface.
 
     @property
     def ns(self):
@@ -831,6 +805,25 @@ class ResourceManagerLock(guarded.AbstractLock):
 
     def release(self):
         releaseResource(self.ns, self.name)
+
+    # Contextmanger interface.
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, t, v, tb):
+        try:
+            self.release()
+        except Exception as e:
+            if t is None:
+                raise
+
+            # Log the release error without the user error which is propagated
+            # to the caller. This avoids the annoying "while handling this
+            # error, another error occurred" double traceback.
+            e.__cause__ = None
+            log.exception("Error releasing resource manager lock")
 
 
 # The single resource manager - this instance is monkeypatched by the tests.

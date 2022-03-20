@@ -1,4 +1,4 @@
-# Copyright 2016-2019 Red Hat, Inc.
+# Copyright 2016-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,47 +24,12 @@ import pytest
 
 from vdsm.network import errors
 from vdsm.network import netswitch
-from vdsm.network.netinfo.cache import NetInfo
+
+from .testlib import NetInfo as NetInfoLib
 
 
 BOND_NAME = 'bond1'
 NETWORK1_NAME = 'test-network1'
-
-
-class TestSplitSetupActions(object):
-    def test_split_nets(self):
-        net_query = {
-            'net2add': {'nic': 'eth0'},
-            'net2edit': {'nic': 'eth1'},
-            'net2remove': {'remove': True},
-        }
-        running_nets = {'net2edit': {'foo': 'bar'}}
-
-        nets = netswitch.configurator._split_setup_actions(
-            net_query, running_nets
-        )
-        nets2add, nets2edit, nets2remove = nets
-
-        assert nets2add == {'net2add': {'nic': 'eth0'}}
-        assert nets2edit == {'net2edit': {'nic': 'eth1'}}
-        assert nets2remove == {'net2remove': {'remove': True}}
-
-    def test_split_bonds(self):
-        bond_query = {
-            'bond2add': {'nics': ['eth0', 'eth1']},
-            'bond2edit': {'nics': ['eth2', 'eth3']},
-            'bond2remove': {'remove': True},
-        }
-        running_bonds = {'bond2edit': {'foo': 'bar'}}
-
-        nets = netswitch.configurator._split_setup_actions(
-            bond_query, running_bonds
-        )
-        bonds2add, bonds2edit, bonds2remove = nets
-
-        assert bonds2add == {'bond2add': {'nics': ['eth0', 'eth1']}}
-        assert bonds2edit == {'bond2edit': {'nics': ['eth2', 'eth3']}}
-        assert bonds2remove == {'bond2remove': {'remove': True}}
 
 
 class TestSouthboundValidation(object):
@@ -109,10 +74,10 @@ class TestSouthboundValidation(object):
             'fakebrnet2': {'nic': 'eth0', 'switch': switch},
             'fakebrnet1': {'remove': True},
         }
-
-        netswitch.validator.validate_southbound_devices_usages(
-            NETSETUP, _create_fake_netinfo(switch)
+        validator = netswitch.validator.Validator(
+            NETSETUP, {}, _create_fake_netinfo(switch)
         )
+        validator.validate_southbound_devices_usages()
 
     def _assert_net_setup_fails_bad_params(
         self, net_name, switch, sb_device, vlan=None
@@ -124,68 +89,44 @@ class TestSouthboundValidation(object):
             net_setup[net_name]['vlan'] = vlan
 
             with pytest.raises(errors.ConfigNetworkError) as cne_context:
-                netswitch.validator.validate_southbound_devices_usages(
-                    net_setup, _create_fake_netinfo(switch)
+                validator = netswitch.validator.Validator(
+                    net_setup, {}, _create_fake_netinfo(switch)
                 )
+                validator.validate_southbound_devices_usages()
             assert cne_context.value.errCode == errors.ERR_BAD_PARAMS
 
 
 def _create_fake_netinfo(switch):
-    common_net_attrs = {
-        'ipv6addrs': [],
-        'gateway': '',
-        'dhcpv4': False,
-        'netmask': '',
-        'ipv4defaultroute': False,
-        'stp': 'off',
-        'ipv4addrs': [],
-        'mtu': 1500,
-        'ipv6gateway': '::',
-        'dhcpv6': False,
-        'ipv6autoconf': False,
-        'addr': '',
-        'ports': [],
-        'switch': switch,
-    }
-
-    common_bond_attrs = {'opts': {'mode': '0'}, 'switch': switch}
-
-    fake_netinfo = {
-        'networks': {
-            'fakebrnet1': dict(
-                iface='eth0',
-                bridged=False,
-                southbound='eth0',
-                **common_net_attrs
+    fake_netinfo = NetInfoLib.create(
+        networks={
+            'fakebrnet1': NetInfoLib.create_network(
+                iface='eth0', bridged=False, southbound='eth0', switch=switch
             ),
-            'fakevlannet1': dict(
+            'fakevlannet1': NetInfoLib.create_network(
                 iface='eth1.1',
                 bridged=False,
-                southbound='eth1',
+                southbound='eth1.1',
                 vlanid=1,
-                **common_net_attrs
+                switch=switch,
             ),
-            'fakebondnet1': dict(
-                iface='bond0',
-                bridged=False,
-                southbound='bond0',
-                **common_net_attrs
+            'fakebondnet1': NetInfoLib.create_network(
+                iface='bond0', bridged=False, southbound='bond0', switch=switch
             ),
         },
-        'vlans': {
-            'eth1.1': {
-                'iface': 'eth1',
-                'addr': '10.10.10.10',
-                'netmask': '255.255.0.0',
-                'mtu': 1500,
-                'vlanid': 1,
-            }
+        vlans={
+            'eth1.1': NetInfoLib.create_vlan(
+                iface='eth1',
+                addr='10.10.10.10',
+                netmask='255.255.0.0',
+                mtu=1500,
+                vlanid=1,
+            )
         },
-        'nics': ['eth0', 'eth1', 'eth2', 'eth3'],
-        'bridges': {},
-        'bondings': {
-            'bond0': dict(slaves=['eth2', 'eth3'], **common_bond_attrs)
+        nics=['eth0', 'eth1', 'eth2', 'eth3'],
+        bondings={
+            'bond0': NetInfoLib.create_bond(
+                slaves=['eth2', 'eth3'], switch=switch
+            )
         },
-        'nameservers': [],
-    }
-    return NetInfo(fake_netinfo)
+    )
+    return fake_netinfo

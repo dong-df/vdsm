@@ -36,7 +36,7 @@ import six
 from vdsm import utils
 from vdsm.common import filecontrol
 from vdsm.common import supervdsm
-from vdsm.config import config
+from vdsm.common.units import MiB
 from vdsm.virt import vmstatus
 
 _MAX_SUPPORTED_API_VERSION = 3
@@ -80,7 +80,11 @@ _FILTERED_CHARS = (
 )
 
 _filter_chars_re = re.compile(u'[%s]' % _FILTERED_CHARS)
-_qga_re = re.compile(r'\bqemu[ -](guest[ -]agent|ga)\b', re.IGNORECASE)
+_apps_duplicates_re = re.compile(
+    r'(\bqemu[ -](guest[ -]agent|ga)\b)' +
+    r'|' +
+    r'(\bkernel-)',
+    re.IGNORECASE)
 
 
 def _filterXmlChars(u):
@@ -154,11 +158,10 @@ class GuestAgentEvents(object):
 
 
 class GuestAgent(object):
-    MAX_MESSAGE_SIZE = 2 ** 20  # 1 MiB for now
-    SEEN_SHUTDOWN_TIMEOUT = config.getint('vars', 'sys_shutdown_timeout') * 2
+    MAX_MESSAGE_SIZE = 1 * MiB  # for now
 
     def __init__(self, socketName, channelListener, log, onStatusChange,
-                 qgaCaps, qgaGuestInfo, api_version=None, user='Unknown',
+                 qgaGuestInfo, api_version=None, user='Unknown',
                  ips=''):
         self.effectiveApiVersion = min(
             api_version or _IMPLICIT_API_VERSION_ZERO,
@@ -189,17 +192,7 @@ class GuestAgent(object):
         self._completion_lock = threading.Lock()
         self._completion_events = {}
         self._first_connect = threading.Event()
-        self._seen_shutdown = None
-        self._qgaCaps = qgaCaps
         self._qgaGuestInfo = qgaGuestInfo
-
-    def has_seen_shutdown(self):
-        if self._seen_shutdown is None:
-            return True
-        diff = time.time() - self._agentTimestamp
-        if diff < GuestAgent.SEEN_SHUTDOWN_TIMEOUT:
-            return self._seen_shutdown
-        return False
 
     def _on_completion(self, reply_id):
         with self._completion_lock:
@@ -253,6 +246,9 @@ class GuestAgent(object):
         return self._diskMappingHash
 
     def start(self):
+        if self._socketName is None:
+            self.log.info("Skipping connection to oVirt guest agent")
+            return
         self.log.info("Starting connection")
         self._prepare_socket()
         self._channelListener.register(
@@ -372,8 +368,6 @@ class GuestAgent(object):
             # Only change the state AFTER all data of the heartbeat has been
             # consumed
             self.guestStatus = vmstatus.UP
-            if self._seen_shutdown:
-                self._seen_shutdown = False
         elif message == 'host-name':
             self.guestInfo['guestName'] = args['name']
         elif message == 'os-version':
@@ -396,15 +390,6 @@ class GuestAgent(object):
             self.guestInfo['guestIPs'] = old_ips.strip()
         elif message == 'applications':
             self.guestInfo['appsList'] = tuple(args['applications'])
-            # Fake QEMU-GA if it is not reported
-            if not any(bool(_qga_re.match(x))
-                       for x in self.guestInfo['appsList']):
-                qga_caps = self._qgaCaps()
-                if qga_caps is not None and qga_caps['version'] is not None:
-                    # NOTE: this is a tuple
-                    self.guestInfo['appsList'] = \
-                        self.guestInfo['appsList'] + \
-                        ('qemu-guest-agent-%s' % qga_caps['version'],)
         elif message == 'active-user':
             currentUser = args['name']
             if ((currentUser != self.guestInfo['username']) and
@@ -425,12 +410,10 @@ class GuestAgent(object):
             self.log.debug("guest agent was uninstalled.")
             self.guestInfo['appsList'] = ()
         elif message == 'session-startup':
-            self._seen_shutdown = False
             self.log.debug("Guest system is started or restarted.")
         elif message == 'fqdn':
             self.guestInfo['guestFQDN'] = args['fqdn']
         elif message == 'session-shutdown':
-            self._seen_shutdown = True
             self.log.debug("Guest system shuts down.")
         elif message == 'containers':
             self.guestInfo['guestContainers'] = args['list']
@@ -500,10 +483,16 @@ class GuestAgent(object):
             if 'diskMapping' in qga:
                 diskMapping.update(qga['diskMapping'])
                 del qga['diskMapping']
-            if len(info['appsList']) > 0 and 'appsList' in qga:
-                # This is an exception since the entry from QEMU GA is faked.
-                # Prefer oVirt GA info if available. Take fake QEMU GA info
-                # only if the other is not available.
+            if 'appsList' in qga:
+                # We produce some fake entries (for qemu-ga and linux kernel)
+                # with version information. These entries duplicate some of
+                # the entries provided by oVirt Guest Agent. To make the list
+                # look better we remove the duplicate entries from oVirt Guest
+                # Agent apps list (we prefer the fakes with version
+                # information).
+                oga_apps_list = [app for app in info['appsList']
+                                 if _apps_duplicates_re.match(app) is None]
+                info['appsList'] = qga['appsList'] + tuple(oga_apps_list)
                 del qga['appsList']
             info.update(qga)
         self.guestDiskMapping = diskMapping
@@ -581,7 +570,6 @@ class GuestAgent(object):
         if self.guestStatus not in (vmstatus.POWERING_DOWN,
                                     vmstatus.REBOOT_IN_PROGRESS):
             self.log.debug("Guest connection timed out")
-            self.guestStatus = None
 
     def _clearReadBuffer(self):
         self._buffer = []

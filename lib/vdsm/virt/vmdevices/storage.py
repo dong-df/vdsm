@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2019 Red Hat, Inc.
+# Copyright 2008-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -31,8 +31,9 @@ from vdsm.common import conv
 from vdsm.common import cpuarch
 from vdsm.common import errors
 from vdsm.common import exception
+from vdsm.common import time
+from vdsm.common.units import MiB
 from vdsm.config import config
-from vdsm import constants
 from vdsm import utils
 from vdsm.virt import vmtune
 from vdsm.virt import vmxml
@@ -95,25 +96,16 @@ class VolumeNotFound(errors.Base):
         self.vol_id = vol_id
 
 
-class InvalidBackingStoreIndex(errors.Base):
-    msg = ("Backing store for path {self.path} "
-           "contains invalid index {self.index!r}")
+class InvalidDiskXML(errors.Base):
+    msg = "Invalid disk xml: {self.reason}"
 
-    def __init__(self, path, index):
-        self.path = path
-        self.index = index
+    def __init__(self, reason):
+        self.reason = reason
 
 
 VolumeChainEntry = collections.namedtuple(
     'VolumeChainEntry',
-    ['uuid', 'path', 'allocation', 'index'])
-
-
-BlockInfo = collections.namedtuple("BlockInfo", [
-    "capacity",  # guest virtual size
-    "allocation",  # host allocated size (highest allocated offset)
-    "physical"  # host physical size (lv size, file size)
-])
+    ['uuid', 'path', 'index'])
 
 
 class Drive(core.Base):
@@ -124,10 +116,11 @@ class Drive(core.Base):
                  'volumeChain', 'baseVolumeID', 'serial', 'reqsize', 'cache',
                  'extSharedState', 'drv', 'sgio', 'GUID', 'diskReplicate',
                  '_diskType', 'hosts', 'protocol', 'auth', 'discard',
-                 'vm_custom', 'blockinfo', '_threshold_state', '_lock',
-                 '_monitorable', 'guestName', '_iotune', 'RBD')
+                 'vm_custom', '_block_info', '_threshold_state', '_lock',
+                 '_monitorable', 'guestName', '_iotune', 'RBD', 'managed',
+                 'scratch_disk', 'exceeded_time')
     VOLWM_CHUNK_SIZE = (config.getint('irs', 'volume_utilization_chunk_mb') *
-                        constants.MEGAB)
+                        MiB)
     VOLWM_FREE_PCT = 100 - config.getint('irs', 'volume_utilization_percent')
     VOLWM_CHUNK_REPLICATE_MULT = 2  # Chunk multiplier during replication
 
@@ -233,11 +226,15 @@ class Drive(core.Base):
         # Must be initialized for getXML.
         self.propagateErrors = 'off'
         self._iotune = {}
+        self.managed = False
+        self.scratch_disk = None
+
         super(Drive, self).__init__(log, **kwargs)
+
         if not hasattr(self, 'vm_custom'):
             self.vm_custom = {}
         self._monitorable = True
-        self._threshold_state = BLOCK_THRESHOLD.UNSET
+        self.threshold_state = BLOCK_THRESHOLD.UNSET
         # Keep sizes as int
         self.reqsize = int(kwargs.get('reqsize', '0'))  # Backward compatible
         self.truesize = int(kwargs.get('truesize', '0'))
@@ -254,7 +251,7 @@ class Drive(core.Base):
             kwargs.get('readonly', self.device == 'floppy'))
 
         # Used for chunked drives or drives replicating to chunked replica.
-        self.blockinfo = None
+        self._block_info = None
 
         self._setExtSharedState()
 
@@ -266,7 +263,7 @@ class Drive(core.Base):
         if self.transientDisk:
             # Force the cache to be writethrough, which is qemu's default.
             # This is done to ensure that we don't ever use cache=none for
-            # transient disks, since we create them in /var/run/vdsm which
+            # transient disks, since we create them in /run/vdsm which
             # may end up on tmpfs and don't support O_DIRECT, and qemu uses
             # O_DIRECT when cache=none and hence hotplug might fail with
             # error that one can take eternity to debug the reason behind it!
@@ -354,8 +351,7 @@ class Drive(core.Base):
         capacity is the maximum size of the volume. It can be discovered using
         libvirt.virDomain.blockInfo() or qemuimg.info().
         """
-        nextSize = utils.round(curSize + self.volExtensionChunk,
-                               constants.MEGAB)
+        nextSize = utils.round(curSize + self.volExtensionChunk, MiB)
         return min(nextSize, self.getMaxVolumeSize(capacity))
 
     def getMaxVolumeSize(self, capacity):
@@ -365,8 +361,7 @@ class Drive(core.Base):
         data. The actual lv size may be larger due to rounding to next lvm
         extent.
         """
-        return utils.round(capacity * self.VOLWM_COW_OVERHEAD,
-                           constants.MEGAB)
+        return utils.round(capacity * self.VOLWM_COW_OVERHEAD, MiB)
 
     @property
     def chunked(self):
@@ -451,19 +446,16 @@ class Drive(core.Base):
     def threshold_state(self, state):
         with self._lock:
             self._threshold_state = state
+            # State set to EXCEEDED in on_block_threshold().
+            self.exceeded_time = None
 
-    def needs_monitoring(self, events_enabled):
+    def needs_monitoring(self):
         """
         Return True if the drive needs to be picked by
         a Drivemonitor periodic check, False otherwise.
 
-        If events_enabled is False, the drive needs monitoring
-        if it is writable and chunked drives; Drives being replicated
-        to a chunked drive needs monitoring too.
-
-        If events_enabled is True, the drive needs monitoring in
-        a subset of the above cases.
-        We can can have two states:
+        Drive needs monitoring in a subset of the above cases. We can
+        can have two states:
 
         - threshold_state == UNSET
           Possible use cases are the first time we monitor a drive, or
@@ -499,12 +491,20 @@ class Drive(core.Base):
             if not (self.chunked or self.replicaChunked):
                 return False
 
-            if events_enabled:
-                return self._threshold_state in (
-                    BLOCK_THRESHOLD.UNSET,
-                    BLOCK_THRESHOLD.EXCEEDED)
+            return self._threshold_state in (
+                BLOCK_THRESHOLD.UNSET,
+                BLOCK_THRESHOLD.EXCEEDED)
 
-            return True
+    @property
+    def block_info(self):
+        return self._block_info
+
+    @block_info.setter
+    def block_info(self, value):
+        if value != self._block_info:
+            self.log.debug("Extension info for drive %s volume %s: %s",
+                           self.name, self.volumeID, value)
+            self._block_info = value
 
     @property
     def diskType(self):
@@ -714,45 +714,23 @@ class Drive(core.Base):
 
     def volume_target(self, vol_id, actual_chain):
         """
-        Retrieves volume's device target
-        from drive's volume chain using its ID.
-        That device target is used in block-commit api of libvirt.
+        Retrieves volume's target string from drive's volume chain using its
+        ID. That device target is used in block-commit api of libvirt.
 
         Arguments:
             vol_id (str): Volume's UUID
-            actual_chain (VolumeChainEntry[]): Current volume chain
-                as parsed from libvirt xml,
-                see parse_volume_chain. We expect it to be
+            actual_chain (VolumeChainEntry[]): Current volume chain as parsed
+                from libvirt xml, see parse_volume_chain. We expect it to be
                 ordered from base to top.
 
         Returns:
-            str: Volume device target - None for top volume,
-                "vda[1]" for the next volume after top and so on.
+            Volume target string (e.g. "vda[7]")
 
         Raises:
             VolumeNotFound exception when volume is not in chain.
         """
         index = self.volume_target_index(vol_id, actual_chain)
-        # libvirt device target format is name[index] where name is
-        # target device name inside a vm and index is a number,
-        # pointing to a snapshot layer.
-        # Unfortunately, top layer do not have index value and libvirt
-        # doesn't support referencing top layer as name[0] therefore,
-        # we have to check for index absence and return just name for
-        # the top layer. We have an RFE for that problem,
-        # https://bugzilla.redhat.com/1451398 and when it will be
-        # implemented, we need to remove special handling of
-        # the active layer.
-        if index is None:
-            # As right now libvirt is not able to correctly parse
-            # 'name' as a reference to the active layer we need to
-            # return None, so libvirt will use active layer as a
-            # default value for None. We have bug filed for that issue:
-            # https://bugzilla.redhat.com/1451394 and we need to return
-            # self.name instead of None when it is fixed.
-            return None
-        else:
-            return "%s[%d]" % (self.name, index)
+        return "%s[%d]" % (self.name, index)
 
     def volume_id(self, vol_path):
         """
@@ -766,64 +744,151 @@ class Drive(core.Base):
         """
         for vol in self.volumeChain:
             if self.diskType == DISK_TYPE.NETWORK:
-                    if vol['path'] == vol_path:
-                        return vol['volumeID']
+                if vol['path'] == vol_path:
+                    return vol['volumeID']
             else:
                 if os.path.realpath(vol['path']) == os.path.realpath(vol_path):
                     return vol['volumeID']
         raise LookupError("Unable to find VolumeID for path '%s'", vol_path)
 
-    def parse_volume_chain(self, disk_xml):
+    def parse_volume_chain(self, disk):
         """
-        Parses libvirt xml and extracts volume chain from it.
+        Extract volume chain from disk root element.
+
+        Relevant elements from typical XML:
+
+        <disk type='block' device='disk' snapshot='no'>
+          <source dev='/top/volume' index='1'>
+            <seclabel model='dac' relabel='no'/>
+          </source>
+          <backingStore type='block' index='3'>
+            <source dev='/first/child'>
+              <seclabel model='dac' relabel='no'/>
+            </source>
+            <backingStore type='block' index='4'>
+              <source dev='/second/child'>
+                <seclabel model='dac' relabel='no'/>
+              </source>
+              <backingStore type='block' index='5'>
+                <source dev='/base/volume'>
+                  <seclabel model='dac' relabel='no'/>
+                </source>
+                <backingStore/>
+              </backingStore>
+            </backingStore>
+          </backingStore>
+        </disk>
+
+        If a disk has not backing store, we have an emtpy backingStore.
+
+        <disk type='block' device='disk' snapshot='no'>
+          <source dev='/single/volume' index='1'>
+            <seclabel model='dac' relabel='no'/>
+          </source>
+          <backingStore/>
+        </disk>
+
+        See https://libvirt.org/formatdomain.html for more info.
 
         Arguments:
-             disk_xml (ElementTree): libvirt xml to parse
+             disk (xml.etree.ElementTree.Element): disk root element from
+                libvirt domain xml.
 
         Returns:
-            list: VolumeChainEntry[] - List of chain entries where
-            each entry contains volume UUID, volume path
-            and volume index. For the 'top' volume index
-            is None, as 'top' volume have no indices at
-            all.
-
-            VolumeChainEntry is reversed in relation to
-            libvirt xml: xml is ordered from top to base
-            volume, while volume chain is ordered from
-            base to the top.
+            list of VolumeChainEntry objects, ordered from base to top (ordered
+            reversed compared to xml order).
 
         Raises:
-            InvalidBackingStoreIndex exception when index value is not int.
+            InvalidDiskXML exception when index value is not int.
         """
         volChain = []
-        index = None
-        source_attr = SOURCE_ATTR[self.diskType]
-        while True:
-            path = vmxml.find_attr(disk_xml, 'source', source_attr)
-            if not path:
-                break
 
-            if index is not None:
-                try:
-                    index = int(index)
-                except ValueError:
-                    raise InvalidBackingStoreIndex(path, index)
+        # Libvirst disk XML is not consistent; For the disk element, the index
+        # is stored in the source element, but for the backing chain, the index
+        # is stored in the backingStore element. So we first parse to top
+        # source element, and then enter a loop parsing backingStore elements.
 
-            # TODO: Allocation information is not available in the XML.  Switch
-            # to the new interface once it becomes available in libvirt.
-            alloc = None
-            backingstore = next(vmxml.children(disk_xml, 'backingStore'), None)
-            if backingstore is None:
-                self.log.warning("<backingStore/> missing from backing "
-                                 "chain for drive %s", self.name)
-                break
+        source = self._parse_source(disk)
+        disk_type = self._parse_type(disk)
+        path = self._parse_path(source, disk_type)
+        index = self._parse_index(source)
 
-            entry = VolumeChainEntry(self.volume_id(path), path, alloc, index)
+        entry = VolumeChainEntry(self.volume_id(path), path, index)
+        volChain.append(entry)
+
+        backing_store = self._parse_backing_store(disk)
+
+        while len(backing_store):
+            source = self._parse_source(backing_store)
+            disk_type = self._parse_type(backing_store)
+            path = self._parse_path(source, disk_type)
+            index = self._parse_index(backing_store)
+
+            entry = VolumeChainEntry(self.volume_id(path), path, index)
             volChain.insert(0, entry)
 
-            disk_xml = backingstore
-            index = vmxml.attr(backingstore, 'index')
+            backing_store = self._parse_backing_store(backing_store)
+
         return volChain or None
+
+    def _parse_source(self, element):
+        """
+        Return source element from disk or backingStore element.
+        """
+        source = element.find("./source")
+        if source is None:
+            raise InvalidDiskXML("No source element")
+
+        return source
+
+    def _parse_backing_store(self, element):
+        """
+        Return backingStore element from disk or another backingStore.
+        """
+        backing_store = element.find("./backingStore")
+        if backing_store is None:
+            raise InvalidDiskXML("No backingStore element")
+
+        return backing_store
+
+    def _parse_index(self, element):
+        """
+        Return index attribute from source or backingStore element.
+        """
+        index = element.get("index")
+        if index is None:
+            raise InvalidDiskXML("No index attribute")
+
+        try:
+            return int(index)
+        except ValueError:
+            raise InvalidDiskXML(
+                "Invalid backingStore index {}".format(index))
+
+    def _parse_type(self, element):
+        """
+        Return type attribtue from disk or backingStore element.
+        """
+        disk_type = element.get("type")
+        if disk_type is None:
+            raise InvalidDiskXML("No type attribute")
+
+        if disk_type not in SOURCE_ATTR:
+            raise InvalidDiskXML("Unknown type {}".format(disk_type))
+
+        return disk_type
+
+    def _parse_path(self, source, disk_type):
+        """
+        Return name, dev, or file attribute from source element, based on disk
+        type.
+        """
+        name = SOURCE_ATTR[disk_type]
+        path = source.get(name)
+        if path is None:
+            raise InvalidDiskXML("No {} attribute".format(name))
+
+        return path
 
     def get_snapshot_xml(self, snap_info):
         """Libvirt snapshot XML"""
@@ -871,6 +936,7 @@ class Drive(core.Base):
                 return
 
             self._threshold_state = BLOCK_THRESHOLD.EXCEEDED
+            self.exceeded_time = time.monotonic_time()
             self.log.info("drive %r threshold exceeded", self.name)
 
 
@@ -905,7 +971,7 @@ def image_id(path):
     return os.path.basename(image_path)
 
 
-def disable_dynamic_ownership(element):
+def disable_dynamic_ownership(element, write_type=True):
     """
     Disable dynamic ownership in the given device element.
 
@@ -937,7 +1003,8 @@ def disable_dynamic_ownership(element):
     if element.find('seclabel') is not None:
         return
     seclabel = ET.Element('seclabel')
-    seclabel.set('type', 'none')
+    if write_type:
+        seclabel.set('type', 'none')
     seclabel.set('relabel', 'no')
     seclabel.set('model', 'dac')
     element.append(seclabel)
@@ -973,6 +1040,8 @@ def _getSourceXML(drive):
         needs_seclabel = True
         source.setAttrs(dev=drive["path"])
     elif drive["diskType"] == DISK_TYPE.NETWORK:
+        if drive["protocol"] == "gluster":
+            needs_seclabel = True
         source.setAttrs(protocol=drive["protocol"], name=drive["path"])
         for host in drive["hosts"]:
             source.appendChildWithArgs('host', **host)

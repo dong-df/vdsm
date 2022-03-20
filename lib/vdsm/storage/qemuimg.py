@@ -31,9 +31,10 @@ from vdsm.common.units import GiB
 from vdsm.config import config
 from vdsm.storage import operation
 
-_qemuimg = cmdutils.CommandPath("qemu-img", "/usr/bin/qemu-img")
+_qemuimg = cmdutils.CommandPath(
+    "qemu-img", "/usr/local/bin/qemu-img", "/usr/bin/qemu-img")
 
-_log = logging.getLogger("QemuImg")
+_log = logging.getLogger("storage.qemuimg")
 
 
 class FORMAT:
@@ -42,6 +43,7 @@ class FORMAT:
     QED = "qed"
     RAW = "raw"
     VMDK = "vmdk"
+
 
 _QCOW2_COMPAT_SUPPORTED = ("0.10", "1.1")
 
@@ -78,7 +80,8 @@ class InvalidOutput(cmdutils.Error):
         self.reason = reason
 
 
-def info(image, format=None, unsafe=False, trusted_image=True):
+def info(image, format=None, unsafe=False, trusted_image=True,
+         backing_chain=False):
     cmd = [_qemuimg.cmd, "info", "--output", "json"]
 
     if format:
@@ -86,6 +89,9 @@ def info(image, format=None, unsafe=False, trusted_image=True):
 
     if unsafe:
         cmd.append('-U')
+
+    if backing_chain:
+        cmd.append('--backing-chain')
 
     cmd.append(image)
 
@@ -114,49 +120,39 @@ def info(image, format=None, unsafe=False, trusted_image=True):
     out = _run_cmd(cmd)
 
     try:
-        qemu_info = _parse_qemuimg_json(out)
-    except ValueError:
-        raise InvalidOutput(cmd, out, "Failed to process qemu-img output")
+        info = _parse_qemuimg_json(out, list if backing_chain else dict)
+    except ValueError as e:
+        raise InvalidOutput(
+            cmd, out, "Failed to process qemu-img output: %s" % e)
 
-    try:
-        info = {
-            'format': qemu_info['format'],
-            'virtualsize': qemu_info['virtual-size'],
-        }
-    except KeyError as key:
-        raise InvalidOutput(cmd, out, "Missing field: %r" % key)
-
-    # In qemu-img info, actual-size means:
-    # File storage: the number of allocated blocks multiplied by
-    #               the block size 512.
-    # Block storage: always 0
-    # This behavior isn't documented -
-    # https://bugzilla.redhat.com/1578259
-    if 'actual-size' in qemu_info:
-        info['actualsize'] = qemu_info['actual-size']
-    if 'cluster-size' in qemu_info:
-        info['clustersize'] = qemu_info['cluster-size']
-    if 'backing-filename' in qemu_info:
-        info['backingfile'] = qemu_info['backing-filename']
-    if qemu_info['format'] == FORMAT.QCOW2:
-        try:
-            info['compat'] = qemu_info['format-specific']['data']['compat']
-        except KeyError:
-            raise InvalidOutput(cmd, out, "'compat' expected but not found")
+    chain = info if backing_chain else [info]
+    for node in chain:
+        for key in ("virtual-size", "format"):
+            if key not in node:
+                raise InvalidOutput(cmd, out, "Missing field: %r" % key)
 
     return info
 
 
-def measure(image, format=None, output_format=None):
+def measure(image, format=None, output_format=None, backing=True,
+            is_block=False):
     cmd = [_qemuimg.cmd, "measure", "--output", "json"]
 
-    if format:
-        cmd.extend(("-f", format))
+    if not format and not backing:
+        raise ValueError("backing=False requires specifying image format")
 
     if output_format:
         cmd.extend(("-O", output_format))
 
-    cmd.append(image)
+    protocol = "host_device" if is_block else "file"
+    node = {"file": {"driver": protocol, "filename": image}}
+    if format:
+        node["driver"] = format
+        if format == FORMAT.QCOW2 and not backing:
+            node["backing"] = None
+
+    cmd.append("json:" + json.dumps(node))
+
     out = _run_cmd(cmd)
     try:
         qemu_measure = _parse_qemuimg_json(out)
@@ -236,47 +232,58 @@ def check(image, format=None):
 def convert(srcImage, dstImage, srcFormat=None, dstFormat=None,
             dstQcow2Compat=None, backing=None, backingFormat=None,
             preallocation=None, compressed=False, unordered_writes=False,
-            create=True):
+            create=True, bitmaps=False, target_is_zero=False):
     """
     Arguments:
         unordered_writes (bool): Allow out-of-order writes to the destination.
             This option improves performance, but is only recommended for
             preallocated devices like host devices or other raw block devices.
         create (bool): If True (default) the destination image is created. Must
-            be set to False when convert to NBD.
+            be set to False when convert to NBD. If create is False,
+            backingFormat, preallocated and dstQcow2Compat are ignored as
+            qemu-img ignores them and may return an error at some point
+        target_is_zero (bool): If True and using create=False and backing is
+            not None, qemu-img convert will not try to zero the target. This is
+            required to keep preallocated image preallocated, and improves
+            performance. This option is effective only with qemu-img 5.1 and
+            later.
     """
     cmd = [_qemuimg.cmd, "convert", "-p", "-t", "none", "-T", "none"]
     options = []
     cwdPath = None
 
-    if not create:
-        cmd.append("-n")
-
     if srcFormat:
         cmd.extend(("-f", srcFormat))
 
-    cmd.append(srcImage)
-
     if dstFormat:
         cmd.extend(("-O", dstFormat))
-        if dstFormat == FORMAT.QCOW2:
-            qcow2Compat = _validate_qcow2_compat(dstQcow2Compat)
-            options.append('compat=' + qcow2Compat)
-        if preallocation:
-            value = _get_preallocation(preallocation, dstFormat)
-            options.append("preallocation=" + value)
+        if create:
+            if dstFormat == FORMAT.QCOW2:
+                qcow2Compat = _validate_qcow2_compat(dstQcow2Compat)
+                options.append('compat=' + qcow2Compat)
+            if preallocation:
+                value = _get_preallocation(preallocation, dstFormat)
+                options.append("preallocation=" + value)
 
     if backing:
         if not os.path.isabs(backing):
             cwdPath = os.path.dirname(srcImage)
 
-        options.append('backing_file=' + str(backing))
+        if create:
+            options.append('backing_file=' + str(backing))
 
-        if backingFormat:
-            options.append('backing_fmt=' + str(backingFormat))
+            if backingFormat:
+                options.append('backing_fmt=' + str(backingFormat))
+        else:
+            cmd.extend(('-B', backing))
 
-    if options:
-        cmd.extend(('-o', ','.join(options)))
+    if create:
+        if options:
+            cmd.extend(('-o', ','.join(options)))
+    else:
+        cmd.append("-n")
+        if backing is None and target_is_zero:
+            cmd.append("--target-is-zero")
 
     if compressed:
         cmd.append('-c')
@@ -284,6 +291,11 @@ def convert(srcImage, dstImage, srcFormat=None, dstFormat=None,
     if unordered_writes:
         cmd.append('-W')
 
+    if bitmaps:
+        cmd.append('--bitmaps')
+        cmd.append('--skip-broken-bitmaps')
+
+    cmd.append(srcImage)
     cmd.append(dstImage)
 
     return ProgressCommand(cmd, cwd=cwdPath)
@@ -420,6 +432,77 @@ def rebase(image, backing, format=None, backingFormat=None, unsafe=False):
     return operation.Command(cmd, cwd=cwdPath)
 
 
+def compare(img1, img2, img1_format=None, img2_format=None, strict=False):
+    cmd = [_qemuimg.cmd, "compare", "-p"]
+
+    if img1_format:
+        cmd.extend(('-f', img1_format))
+
+    if img2_format:
+        cmd.extend(('-F', img2_format))
+
+    if strict:
+        cmd.append("-s")
+
+    cmd.extend([img1, img2])
+    cwdPath = os.path.dirname(img1)
+
+    return operation.Command(cmd, cwd=cwdPath)
+
+
+def bitmap_add(image, bitmap, enable=True, granularity=None):
+    cmd = [_qemuimg.cmd, "bitmap", "--add"]
+
+    if enable:
+        cmd.append("--enable")
+    else:
+        cmd.append("--disable")
+
+    cmd.extend([image, bitmap])
+
+    if granularity:
+        cmd.extend(("-g", str(granularity)))
+
+    cwdPath = os.path.dirname(image)
+    return operation.Command(cmd, cwd=cwdPath)
+
+
+def bitmap_remove(image, bitmap):
+    cmd = [_qemuimg.cmd, "bitmap", "--remove", image, bitmap]
+
+    cwdPath = os.path.dirname(image)
+    return operation.Command(cmd, cwd=cwdPath)
+
+
+def bitmap_merge(src_image, src_bitmap, src_fmt, dst_image, dst_bitmap):
+    cmd = [
+        _qemuimg.cmd,
+        "bitmap",
+        "--merge", src_bitmap,
+        "-F", src_fmt,
+        "-b", src_image,
+        dst_image,
+        dst_bitmap,
+    ]
+
+    cwdPath = os.path.dirname(src_image)
+    return operation.Command(cmd, cwd=cwdPath)
+
+
+def bitmap_update(image, bitmap, enable):
+    cmd = [_qemuimg.cmd, "bitmap"]
+
+    if enable:
+        cmd.append("--enable")
+    else:
+        cmd.append("--disable")
+
+    cmd.extend([image, bitmap])
+
+    cwdPath = os.path.dirname(image)
+    return operation.Command(cmd, cwd=cwdPath)
+
+
 def default_qcow2_compat():
     value = config.get('irs', 'qcow2_compat')
     if value not in _QCOW2_COMPAT_SUPPORTED:
@@ -430,10 +513,10 @@ def default_qcow2_compat():
     return value
 
 
-def _parse_qemuimg_json(output):
+def _parse_qemuimg_json(output, expected_type=dict):
     obj = json.loads(output.decode("utf8"))
-    if not isinstance(obj, dict):
-        raise ValueError("not a JSON object")
+    if not isinstance(obj, expected_type):
+        raise ValueError("Not a %s", expected_type)
     return obj
 
 

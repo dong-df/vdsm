@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2017 Red Hat, Inc.
+# Copyright 2016-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,19 +23,19 @@ from __future__ import division
 
 import json
 import logging
+import pickle
 import yaml
 
 from io import StringIO
 from textwrap import dedent
+from unittest import mock
 
 from nose.plugins.attrib import attr
 from vdsm.api import vdsmapi
 from vdsm.api.schema_inconsistency_formatter \
     import SchemaInconsistencyFormatter
-from vdsm.common.compat import pickle
 from yajsonrpc.exception import JsonRpcErrorBase
 
-from testlib import mock
 from testlib import VdsmTestCase as TestCaseBase
 from testValidation import xfail
 
@@ -87,7 +87,7 @@ class FakeSchema(object):
 
     @staticmethod
     def _schema_from(yaml_str):
-        pickled_yaml = pickle.dumps(yaml.load(yaml_str))
+        pickled_yaml = pickle.dumps(yaml.safe_load(yaml_str))
         mocked_open = mock.mock_open(read_data=pickled_yaml)
         with mock.patch('{}.io.open'.format(vdsmapi.__name__),
                         mocked_open,
@@ -185,7 +185,12 @@ class DataVerificationTests(TestCaseBase):
                                          u"cpuSys": u"0.40",
                                          u"cpuIdle": u"99.13"}},
                u"numaNodeMemFree": {u"0": {u"memPercent": 15,
-                                           u"memFree": u"13645"}},
+                                           u"memFree": u"13645",
+                                           u"hugepages": {
+                                               4: {
+                                                   u"freePages": u"10"},
+                                               2048: {
+                                                   u"freePages": u"20"}}}},
                u"memShared": 0,
                u"thpState": u"madvise",
                u"vmCount": 0,
@@ -259,16 +264,14 @@ class DataVerificationTests(TestCaseBase):
                u"cpuLoad": u"0.42",
                u"cpuSys": u"0.43",
                u"diskStats": {u"/var/log": {u"free": u"10810"},
-                              u"/var/run/vdsm/": {u"free": u"7966"},
+                              u"/run/vdsm/": {u"free": u"7966"},
                               u"/tmp": {u"free": u"7967"}},
                u"cpuUserVdsmd": u"1.07",
                u"netConfigDirty": u"False",
-               u"memCommitted": 0,
                u"ksmState": False,
                u"vmMigrating": 0,
                u"ksmMergeAcrossNodes": True,
                u"ksmCpu": 0,
-               u"memAvailable": 15226,
                u"bootTime": u"1456910791",
                u"haStats": {u"active": False,
                             u"configured": False,
@@ -357,6 +360,7 @@ class DataVerificationTests(TestCaseBase):
                 'elapsedTime': '2560',
                 'vmType': u'kvm',
                 'cpuSys': '0.20',
+                'cpuActual': True,
                 'status': 'Up',
                 'guestCPUCount': -1,
                 'appsList': (),
@@ -428,6 +432,7 @@ class DataVerificationTests(TestCaseBase):
                 'elapsedTime': '2541',
                 'vmType': u'kvm',
                 'cpuSys': '0.07',
+                'cpuActual': True,
                 'status': 'Up',
                 'guestCPUCount': -1,
                 'appsList': (),
@@ -629,11 +634,18 @@ class DataVerificationTests(TestCaseBase):
                                       'ipv6gateway': '::',
                                       'gateway': '',
                                       'opts': {'mode': '0'}}},
+               'vdsmToCpusAffinity': [1],
                'software_version': '4.18',
                'memSize': '15934',
                'cpuSpeed': '1600.125',
-               'numaNodes': {'0': {'totalMemory': '15934',
-                                   'cpus': [0, 1, 2, 3, 4, 5, 6, 7]}},
+               'numaNodes': {
+                       '0': {'totalMemory': '15934',
+                             'cpus': [0, 1, 2, 3, 4, 5, 6, 7],
+                             'hugepages': {
+                                 4: {
+                                     'totalPages': '2500'},
+                                 2048: {
+                                     'totalPages': '100'}}}},
                'cpuSockets': '1',
                'nameservers': [],
                'vlans': {},
@@ -643,6 +655,23 @@ class DataVerificationTests(TestCaseBase):
                'guestOverhead': '65',
                'version_name': 'Snow Man',
                'cpuThreads': '8',
+               'cpuTopology': [
+                       {'cpu_id': 0, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 1, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 2, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 3, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 4, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 5, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 6, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0},
+                       {'cpu_id': 7, 'numa_cell_id': 0, 'socket_id': 0,
+                        'die_id': 0, 'core_id': 0}],
                'emulatedMachines': ['pc-q35-2.0', 'pc-q35-2.1'],
                'rngSources': ['hwrng', 'random'],
                'operatingSystem': {'release': '1',
@@ -655,7 +684,21 @@ class DataVerificationTests(TestCaseBase):
             vdsmapi.MethodRep('Host', 'getCapabilities'), ret)
 
     def test_create_complex_params(self):
-        complex_type = {'lease': {'sd_id': 'UUID', 'lease_id': 'UUID'}}
+        complex_type = {
+            'lease': {
+                'sd_id': 'UUID',
+                'lease_id': 'UUID'
+            },
+            'metadata': {
+                'LeaseMetadata': [
+                    [
+                        'JobMetadata',
+                        'object'
+                    ]
+                ]
+            }
+        }
+
         self.assertEqual(
             _schema.get_args_dict('Lease', 'create'),
             json.dumps(complex_type, indent=4))

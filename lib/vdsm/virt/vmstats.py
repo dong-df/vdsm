@@ -1,5 +1,5 @@
 #
-# Copyright 2008-2017 Red Hat, Inc.
+# Copyright 2008-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -108,6 +108,7 @@ def cpu(stats, first_sample, last_sample, interval):
     - cpuUser
     - cpuSys
     - cpuTime
+    - cpuActual
     Expect two samplings `first_sample' and `last_sample'
     which must be data in the format of the libvirt bulk stats.
     `interval' is the time between the two samplings, in seconds.
@@ -118,6 +119,7 @@ def cpu(stats, first_sample, last_sample, interval):
     stats['cpuUser'] = 0.0
     stats['cpuSys'] = 0.0
     stats['cpuUsage'] = 0.0
+    stats['cpuActual'] = False
 
     if first_sample is None or last_sample is None:
         return None
@@ -145,7 +147,7 @@ def cpu(stats, first_sample, last_sample, interval):
                 ((last_sample['cpu.time'] - first_sample['cpu.time']) -
                  cpu_sys),
                 interval)
-
+            stats['cpuActual'] = True
             return stats
 
     return None
@@ -171,7 +173,8 @@ def balloon(vm, stats, sample):
             'balloon_max': str(max_mem),
             'balloon_min': str(balloon_info['minimum']),
             'balloon_cur': str(balloon_cur),
-            'balloon_target': str(balloon_info['target'])
+            'balloon_target': str(balloon_info['target']),
+            'ballooning_enabled': balloon_info['enabled'],
         })
 
 
@@ -272,7 +275,7 @@ def nic_info(nic):
         'macAddr': nic.macAddr,
         'name': nic.name,
         'speed': str(
-            1000 if nic.nicModel in ('e1000', 'virtio') else 100
+            1000 if nic.nicModel in ('e1000', 'e1000e', 'virtio') else 100
         ),
         'state': 'unknown',
     }

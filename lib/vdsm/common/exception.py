@@ -1,5 +1,5 @@
 #
-# Copyright 2012-2016 Red Hat, Inc.
+# Copyright 2012-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -40,6 +40,10 @@ class VdsmException(Exception):
 
     def __str__(self):
         return self.msg
+
+    def with_exception(self, exc):
+        self.__cause__ = None
+        return self.with_traceback(exc.__traceback__)
 
     def info(self):
         return {'code': self.code, 'message': str(self)}
@@ -159,7 +163,7 @@ class MigrationError(VdsmException):
     message = 'Fatal error during migration'
 
 
-class ImageFileNotFound(VdsmException):
+class ImageFileNotFound(ContextException):
     code = 13
     message = 'Drive image file could not be found'
 
@@ -190,6 +194,18 @@ class NonResponsiveGuestAgent(VdsmException):
 
 
 # codes 20-35 are reserved for add/delNetwork
+
+
+class UnsupportedDriveType(ContextException):
+    code = 36
+    message = 'Unsupported drive type'
+
+
+class LUNDoesNotExist(ContextException):
+    code = 37
+    message = 'LUN does not exist'
+
+
 # code 39 was used for:
 # wrongHost - migration destination has an invalid hostname
 
@@ -254,7 +270,7 @@ class MigrationInProgress(ContextException):
     message = 'Command not supported during migration'
 
 
-class MergeFailed(VdsmException):
+class MergeFailed(ContextException):
     code = 52
     message = 'Merge failed'
 
@@ -389,7 +405,7 @@ class HookFailed(VdsmException):
     message = 'Hook error'
 
 
-class DestinationVolumeTooSmall(VdsmException):
+class DestinationVolumeTooSmall(ContextException):
     code = 79
     message = 'Destination volume is too small'
 
@@ -439,6 +455,30 @@ class ReplicationNotInProgress(ContextException):
     message = "Replication not in progress."
 
 
+class ExternalDataFailed(ContextException):
+    code = 89
+    message = "Failed to handle external VM data"
+
+    def __init__(self, reason=None, exception=None, **kwargs):
+        if exception is not None:
+            # The original exception may contain parts of sensitive data,
+            # let's pass only some basic information from it.
+            kwargs['exception_class'] = exception.__class__
+            if exception.args:
+                kwargs['exception_arg_1'] = exception.args[0]
+        super(ExternalDataFailed, self).__init__(reason=reason, **kwargs)
+
+
+class ResetFailed(ContextException):
+    code = 90
+    message = "Failed to reset VM."
+
+
+class InvalidParameter(ContextException):
+    code = 91
+    message = 'Invalid parameter'
+
+
 class RecoveryInProgress(VdsmException):
     code = 99
     message = 'Recovering from crash or Initializing'
@@ -460,6 +500,11 @@ class InvalidConfiguration(ContextException):
     message = "Invalid configuration value"
 
 
+class MigrationOperationError(VdsmException):
+    code = 102
+    message = 'Error occurred during migration'
+
+
 class ActionStopped(GeneralException):
     code = 443
     message = "Action was stopped"
@@ -473,3 +518,99 @@ class ResourceExhausted(ContextException):
 class HookError(GeneralException):
     code = 1500
     message = "Hook Error"
+
+
+#################################################
+#  Backups Errors
+#  Range: 1600-1609
+#################################################
+
+
+class BackupError(ContextException):
+    code = 1600
+    message = "Backup Error"
+
+
+class NoSuchBackupError(ContextException):
+    code = 1601
+    message = "No such backup Error"
+
+
+#################################################
+#  Checkpoints Errors
+#  Range: 1610-1619
+#################################################
+
+
+class CheckpointError(ContextException):
+    code = 1610
+    message = "Checkpoint Error"
+
+
+class NoSuchCheckpointError(ContextException):
+    code = 1611
+    message = "No such checkpoint Error"
+
+
+class InconsistentCheckpointError(ContextException):
+    code = 1612
+    message = "Inconsistent checkpoint Error"
+
+
+#################################################
+#  Bitmaps Errors
+#  Range: 1620-1629
+#################################################
+
+
+class AddBitmapError(ContextException):
+    code = 1620
+    message = "Failed to add bitmap"
+
+
+class MergeBitmapError(ContextException):
+    code = 1621
+    message = "Failed to merge bitmaps"
+
+
+class RemoveBitmapError(ContextException):
+    code = 1622
+    message = "Failed to remove bitmap"
+
+
+#################################################
+#  Image Errors
+#  Range: 1630-1639
+#################################################
+
+
+class CannotPrepareImage(ContextException):
+    code = 1630
+    msg = "Failed to prepare image"
+
+
+#################################################
+#  Drive Errors
+#  Range: 1640-1649
+#################################################
+
+
+class DriveRefreshError(ContextException):
+    code = 1640
+    msg = "Failed to refresh drive"
+
+
+#################################################
+#  Migration Errors
+#  Range: 1650-1659
+#################################################
+
+
+class CannotRefreshDisk(ContextException):
+    code = 1650
+    msg = "Failed to refresh disk on the destination"
+
+
+class DiskRefreshNotSupported(ContextException):
+    code = 1651
+    msg = "Disk refresh is not supported by the host"

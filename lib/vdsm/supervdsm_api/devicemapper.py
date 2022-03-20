@@ -27,13 +27,3 @@ from . import expose
 @expose
 def devicemapper_removeMapping(deviceName):
     return devicemapper.removeMapping(deviceName)
-
-
-@expose
-def devicemapper_multipath_status():
-    return devicemapper.multipath_status()
-
-
-@expose
-def devicemapper_getPathsStatus():
-    return devicemapper.getPathsStatus()

@@ -1,6 +1,6 @@
 #
 # Copyright 2012 Roman Fenkhuber.
-# Copyright 2012-2019 Red Hat, Inc.
+# Copyright 2012-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,40 +19,42 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
-from __future__ import division
-
 from binascii import unhexlify
 from collections import namedtuple
 import os
-import sys
 import time
+from unittest import mock
 
 import pytest
-import six
 
-from network.compat import mock
-
-from ..nettestlib import Tap
-from ..nettestlib import dummy_device
-from ..nettestlib import veth_pair
-from ..nettestlib import vlan_device
-from .iperf import IperfServer
-from .iperf import IperfClient
-from .iperf import requires_iperf3
-from .netintegtestlib import Bridge
-from .netintegtestlib import bridge_device
-from .netintegtestlib import network_namespace
-from ..nettestlib import running
+from network.nettestlib import Bridge
+from network.nettestlib import bridge_device
+from network.nettestlib import dummy_device
+from network.nettestlib import Interface
+from network.nettestlib import IpFamily
+from network.nettestlib import running
+from network.nettestlib import running_on_ovirt_ci
+from network.nettestlib import running_on_travis_ci
+from network.nettestlib import Tap
+from network.nettestlib import veth_pair
+from network.nettestlib import vlan_device
 
 from vdsm.network import cmd
 from vdsm.network import tc
 from vdsm.network.configurators import qos
-from vdsm.network.ipwrapper import addrAdd, linkSet, netns_exec, link_set_netns
+from vdsm.network.ipwrapper import netns_exec, link_set_netns
 from vdsm.network.netinfo.qos import DEFAULT_CLASSID
 
+from .iperf import IperfServer
+from .iperf import IperfClient
+from .iperf import requires_iperf3
+from .netintegtestlib import network_namespace
 
-EXT_TC = "/sbin/tc"
+
+EXT_TC = '/sbin/tc'
+
+VLAN16_TAG = 16
+VLAN17_TAG = 17
 
 
 @pytest.fixture
@@ -63,45 +65,43 @@ def bridge_dev():
 
 @pytest.fixture
 def requires_tc(bridge_dev):
-    cmds = [EXT_TC, 'qdisc', 'add', 'dev', bridge_dev.devName, 'ingress']
-    rc, out, err = cmd.exec_sync(cmds)
+    cmds = [EXT_TC, 'qdisc', 'add', 'dev', bridge_dev, 'ingress']
+    rc, _, err = cmd.exec_sync(cmds)
     if rc != 0:
         pytest.skip(
-            '%r has failed: %s\nDo you have Traffic Control kernel '
-            'modules installed?' % (EXT_TC, err)
+            f'\'{EXT_TC}\' has failed: {err}\n'
+            'Do you have Traffic Control kernel modules installed?'
         )
 
 
 class TestQdisc(object):
-    def _showQdisc(self, bridge):
-        _, out, _ = cmd.exec_sync(
-            [EXT_TC, "qdisc", "show", "dev", bridge.devName]
-        )
+    def _show_qdisc(self, bridge):
+        _, out, _ = cmd.exec_sync([EXT_TC, 'qdisc', 'show', 'dev', bridge])
         return out
 
-    def _addIngress(self, bridge):
-        tc._qdisc_replace_ingress(bridge.devName)
-        assert 'qdisc ingress' in self._showQdisc(bridge)
+    def _add_ingress(self, bridge):
+        tc._qdisc_replace_ingress(bridge)
+        assert 'qdisc ingress' in self._show_qdisc(bridge)
 
-    def testToggleIngress(self, bridge_dev):
-        self._addIngress(bridge_dev)
-        tc._qdisc_del(bridge_dev.devName, 'ingress')
-        assert 'qdisc ingress' not in self._showQdisc(bridge_dev)
+    def test_toggle_ingress(self, bridge_dev):
+        self._add_ingress(bridge_dev)
+        tc._qdisc_del(bridge_dev, 'ingress')
+        assert 'qdisc ingress' not in self._show_qdisc(bridge_dev)
 
-    def testQdiscsOfDevice(self, bridge_dev):
-        self._addIngress(bridge_dev)
-        assert ('ffff:',) == tuple(tc._qdiscs_of_device(bridge_dev.devName))
+    def test_qdiscs_of_device(self, bridge_dev):
+        self._add_ingress(bridge_dev)
+        assert ('ffff:',) == tuple(tc._qdiscs_of_device(bridge_dev))
 
-    def testReplacePrio(self, bridge_dev):
-        self._addIngress(bridge_dev)
-        tc.qdisc.replace(bridge_dev.devName, 'prio', parent=None)
-        assert 'root' in self._showQdisc(bridge_dev)
+    def test_replace_prio(self, bridge_dev):
+        self._add_ingress(bridge_dev)
+        tc.qdisc.replace(bridge_dev, 'prio', parent=None)
+        assert 'root' in self._show_qdisc(bridge_dev)
 
-    def testException(self):
+    def test_exception(self):
         pytest.raises(
             tc.TrafficControlException,
             tc._qdisc_del,
-            "__nosuchiface__",
+            '__nosuchiface__',
             'ingress',
         )
 
@@ -175,66 +175,57 @@ class TestPortMirror(object):
             self._bridge1,
             self._bridge2,
         ]
-        # If setUp raise, teardown is not called, so we should either succeed,
-        # or fail without leaving junk around.
+
         cleanup = []
         try:
             for iface in self._devices:
-                iface.addDevice()
+                iface.create()
                 cleanup.append(iface)
-            self._bridge0.addIf(self._tap0.devName)
-            self._bridge1.addIf(self._tap1.devName)
-            self._bridge2.addIf(self._tap2.devName)
-        except:
-            t, v, tb = sys.exc_info()
+            self._bridge0.add_port(self._tap0.dev_name)
+            self._bridge1.add_port(self._tap1.dev_name)
+            self._bridge2.add_port(self._tap2.dev_name)
+
+            yield
+        finally:
+            failed = []
             for iface in cleanup:
                 try:
-                    iface.delDevice()
+                    iface.remove()
                 except Exception:
-                    self.log.exception("Error removing device %s" % iface)
-            six.reraise(t, v, tb)
+                    failed.append(str(iface))
+            if failed:
+                raise RuntimeError(f'Error removing devices: {failed}')
 
-        yield
+    def _send_ping(self):
+        self._tap1.start_listener(self._ICMP)
+        self._tap0.write_to_device(self._ICMP)
 
-        failed = False
-        for iface in self._devices:
-            try:
-                iface.delDevice()
-            except Exception:
-                self.log.exception("Error removing device %s" % iface)
-                failed = True
-        if failed:
-            raise RuntimeError("Error tearing down interfaces")
-
-    def _sendPing(self):
-        self._tap1.startListener(self._ICMP)
-        self._tap0.writeToDevice(self._ICMP)
-        # Attention: sleep is bad programming practice! Never use it for
-        # synchronization in productive code!
-        time.sleep(0.1)
-        if self._tap1.isListenerAlive():
-            self._tap1.stopListener()
-            return False
-        else:
+        if _wait_for_func(
+            lambda: not self._tap1.is_listener_alive(), timeout=2
+        ):
             return True
+        else:
+            self._tap1.stop_listener()
+            return False
 
-    @pytest.mark.skipif(six.PY3, reason='needs porting to python 3')
-    def testMirroring(self):
-        tc.setPortMirroring(self._bridge0.devName, self._bridge1.devName)
-        assert self._sendPing(), 'Bridge received no mirrored ping requests.'
+    @pytest.mark.xfail(
+        condition=running_on_travis_ci(),
+        reason='does not work on  Travis CI with nmstate',
+        strict=False,
+    )
+    def test_mirroring(self):
+        tc.setPortMirroring(self._bridge0.dev_name, self._bridge1.dev_name)
+        assert self._send_ping(), 'Bridge received no mirrored ping requests.'
 
-        tc.unsetPortMirroring(self._bridge0.devName, self._bridge1.devName)
-        assert not self._sendPing(), (
-            'Bridge received mirrored ping '
-            'requests, but mirroring is unset.'
-        )
+        tc.unsetPortMirroring(self._bridge0.dev_name, self._bridge1.dev_name)
+        msg = 'Bridge received mirrored ping requests, but mirroring is unset.'
+        assert not self._send_ping(), msg
 
-    @pytest.mark.skipif(six.PY3, reason='needs porting to python 3')
-    def testMirroringWithDistraction(self):
-        "setting another mirror action should not obstract the first one"
-        tc.setPortMirroring(self._bridge0.devName, self._bridge2.devName)
-        self.testMirroring()
-        tc.unsetPortMirroring(self._bridge0.devName, self._bridge2.devName)
+    def test_mirroring_with_distraction(self):
+        # setting another mirror action should not obstract the first one
+        tc.setPortMirroring(self._bridge0.dev_name, self._bridge2.dev_name)
+        self.test_mirroring()
+        tc.unsetPortMirroring(self._bridge0.dev_name, self._bridge2.dev_name)
 
 
 HOST_QOS_OUTBOUND = {
@@ -257,6 +248,18 @@ def dummy():
         yield dev_name
 
 
+@pytest.fixture
+def vlan16(dummy):
+    with vlan_device(dummy, VLAN16_TAG) as vlan:
+        yield vlan
+
+
+@pytest.fixture
+def vlan17(dummy):
+    with vlan_device(dummy, VLAN17_TAG) as vlan:
+        yield vlan
+
+
 class TestConfigureOutbound(object):
     # TODO:
     # test remove_outbound
@@ -273,53 +276,60 @@ class TestConfigureOutbound(object):
 
         assert len(tc_filters.tagged_filters) == 0
 
+    @pytest.mark.xfail(
+        condition=running_on_ovirt_ci() or running_on_travis_ci(),
+        reason='does not work on CI with nmstate',
+        strict=False,
+    )
     @pytest.mark.parametrize('repeating_calls', [1, 2])
     @mock.patch('vdsm.network.netinfo.bonding.permanent_address', lambda: {})
-    def test_single_vlan(self, dummy, repeating_calls):
-        with vlan_device(dummy) as vlan:
-            for _ in range(repeating_calls):
-                qos.configure_outbound(HOST_QOS_OUTBOUND, dummy, vlan.tag)
-            tc_entities = self._analyse_qos_and_general_assertions(dummy)
-            tc_classes, tc_filters, tc_qdiscs = tc_entities
-            assert len(tc_classes.classes) == 1
+    def test_single_vlan(self, dummy, vlan16, repeating_calls):
+        for _ in range(repeating_calls):
+            qos.configure_outbound(HOST_QOS_OUTBOUND, dummy, VLAN16_TAG)
+        tc_entities = self._analyse_qos_and_general_assertions(dummy)
+        tc_classes, tc_filters, tc_qdiscs = tc_entities
+        assert len(tc_classes.classes) == 1
 
-            assert len(tc_qdiscs.leaf_qdiscs) == 2
-            vlan_qdisc = self._vlan_qdisc(tc_qdiscs.leaf_qdiscs, vlan.tag)
-            vlan_class = self._vlan_class(tc_classes.classes, vlan.tag)
-            self._assert_parent([vlan_qdisc], vlan_class)
+        assert len(tc_qdiscs.leaf_qdiscs) == 2
+        vlan_qdisc = self._vlan_qdisc(tc_qdiscs.leaf_qdiscs, VLAN16_TAG)
+        vlan_class = self._vlan_class(tc_classes.classes, VLAN16_TAG)
+        self._assert_parent([vlan_qdisc], vlan_class)
 
-            tag_filters = tc_filters.tagged_filters
-            assert len(tag_filters) == 1
-            assert int(tag_filters[0]['basic']['value']) == vlan.tag
+        tag_filters = tc_filters.tagged_filters
+        assert len(tag_filters) == 1
+        assert int(tag_filters[0]['basic']['value']) == VLAN16_TAG
 
+    @pytest.mark.xfail(
+        condition=running_on_ovirt_ci() or running_on_travis_ci(),
+        reason='does not work on CI with nmstate',
+        strict=False,
+    )
     @mock.patch('vdsm.network.netinfo.bonding.permanent_address', lambda: {})
-    def test_multiple_vlans(self, dummy):
-        with vlan_device(dummy, tag=16) as vlan1:
-            with vlan_device(dummy, tag=17) as vlan2:
-                for v in (vlan1, vlan2):
-                    qos.configure_outbound(HOST_QOS_OUTBOUND, dummy, v.tag)
+    def test_multiple_vlans(self, dummy, vlan16, vlan17):
+        for vlan_tag in (VLAN16_TAG, VLAN17_TAG):
+            qos.configure_outbound(HOST_QOS_OUTBOUND, dummy, vlan_tag)
 
-                tc_entities = self._analyse_qos_and_general_assertions(dummy)
-                tc_classes, tc_filters, tc_qdiscs = tc_entities
-                assert len(tc_classes.classes) == 2
+        tc_entities = self._analyse_qos_and_general_assertions(dummy)
+        tc_classes, tc_filters, tc_qdiscs = tc_entities
+        assert len(tc_classes.classes) == 2
 
-                assert len(tc_qdiscs.leaf_qdiscs) == 3
-                v1_qdisc = self._vlan_qdisc(tc_qdiscs.leaf_qdiscs, vlan1.tag)
-                v2_qdisc = self._vlan_qdisc(tc_qdiscs.leaf_qdiscs, vlan2.tag)
-                v1_class = self._vlan_class(tc_classes.classes, vlan1.tag)
-                v2_class = self._vlan_class(tc_classes.classes, vlan2.tag)
-                self._assert_parent([v1_qdisc], v1_class)
-                self._assert_parent([v2_qdisc], v2_class)
+        assert len(tc_qdiscs.leaf_qdiscs) == 3
+        v1_qdisc = self._vlan_qdisc(tc_qdiscs.leaf_qdiscs, VLAN16_TAG)
+        v2_qdisc = self._vlan_qdisc(tc_qdiscs.leaf_qdiscs, VLAN17_TAG)
+        v1_class = self._vlan_class(tc_classes.classes, VLAN16_TAG)
+        v2_class = self._vlan_class(tc_classes.classes, VLAN17_TAG)
+        self._assert_parent([v1_qdisc], v1_class)
+        self._assert_parent([v2_qdisc], v2_class)
 
-                assert len(tc_filters.tagged_filters) == 2
-                current_tagged_filters_flow_id = set(
-                    f['basic']['flowid'] for f in tc_filters.tagged_filters
-                )
-                expected_flow_ids = set(
-                    '%s%x' % (qos._ROOT_QDISC_HANDLE, v.tag)
-                    for v in (vlan1, vlan2)
-                )
-                assert current_tagged_filters_flow_id == expected_flow_ids
+        assert len(tc_filters.tagged_filters) == 2
+        current_tagged_filters_flow_id = set(
+            f['basic']['flowid'] for f in tc_filters.tagged_filters
+        )
+        expected_flow_ids = set(
+            '%s%x' % (qos._ROOT_QDISC_HANDLE, vlan_tag)
+            for vlan_tag in (VLAN16_TAG, VLAN17_TAG)
+        )
+        assert current_tagged_filters_flow_id == expected_flow_ids
 
     @requires_iperf3
     @pytest.mark.xfail(reason='Not maintained stress test', run=False)
@@ -347,16 +357,15 @@ class TestConfigureOutbound(object):
             client_dev,
             client_peer,
         ):
-            linkSet(server_peer, ['up'])
-            linkSet(client_peer, ['up'])
             # iperf server and its veth peer lie in a separate network
             # namespace
             link_set_netns(server_dev, ns)
-            bridge.addIf(server_peer)
-            bridge.addIf(client_peer)
-            linkSet(client_dev, ['up'])
+            bridge.add_port(server_peer)
+            bridge.add_port(client_peer)
             netns_exec(ns, ['ip', 'link', 'set', 'dev', server_dev, 'up'])
-            addrAdd(client_dev, client_ip, 24)
+            Interface.from_existing_dev_name(client_dev).add_ip(
+                client_ip, 24, IpFamily.IPv4
+            )
             netns_exec(
                 ns,
                 [
@@ -521,3 +530,12 @@ def _find_entity(predicate, entities):
     for ent in entities:
         if predicate(ent):
             return ent
+
+
+def _wait_for_func(func, timeout=5, **func_kwargs):
+    while not func(**func_kwargs):
+        if timeout <= 0:
+            return False
+        timeout -= 1
+        time.sleep(1)
+    return True

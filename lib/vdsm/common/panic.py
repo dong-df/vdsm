@@ -22,10 +22,17 @@ from __future__ import division
 
 import logging
 import os
+import signal
 import sys
 
 
 def panic(msg):
-    logging.error("Panic: %s", msg, exc_info=True)
-    os.killpg(0, 9)
-    sys.exit(-3)
+    try:
+        logging.exception("Panic: %s", msg)
+        # Depends on SIGALRM handler register during startup.
+        signal.alarm(10)
+        logging.shutdown()
+    finally:
+        signal.alarm(0)
+        os.killpg(0, 9)
+        sys.exit(-3)

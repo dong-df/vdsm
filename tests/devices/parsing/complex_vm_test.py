@@ -3,11 +3,9 @@ from __future__ import division
 import os
 
 from vdsm.virt import domain_descriptor
-from vdsm.virt.vmdevices import hwclass
 
 from testlib import XMLTestCase
-
-import vmfakelib as fake
+from virt import vmfakelib as fake
 
 import verify
 
@@ -54,11 +52,6 @@ class TestSRiovXmlParsing(XMLTestCase, verify.DeviceMixin):
         devices = [{'device': 'bridge', 'nicModel': 'virtio',
                     'macAddr': '52:54:00:59:FF:FF', 'type': 'interface',
                     'network': ''},
-                   {'device': 'hostdev', 'type': hwclass.NIC,
-                    'alias': 'hostdev2', 'hostdev': 'pci_0000_05_00_1',
-                    'deviceId': '6940d5e7-9814-4ae0-94ef-f78e68229e76',
-                    'macAddr': '00:00:00:00:00:43',
-                    'specParams': {'vlanid': 12}},
                    ]
 
         test_path = os.path.realpath(__file__)
@@ -75,11 +68,6 @@ class TestSRiovXmlParsing(XMLTestCase, verify.DeviceMixin):
             vm._getUnderlyingVmDevicesInfo()
             self.verifyDevicesConf(vm.conf['devices'])
             self._assert_guest_device_adress_is_reported(vm)
-            self._assert_host_address_is_reported(devices, vm)
-
-    def _assert_host_address_is_reported(self, devices, vm):
-        reported = _reported_host_device(vm)
-        self.assertEqual(reported['hostdev'], devices[1]['hostdev'])
 
     def _assert_guest_device_adress_is_reported(self, vm):
         reported = _reported_host_device(vm)

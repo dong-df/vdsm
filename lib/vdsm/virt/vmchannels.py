@@ -38,7 +38,6 @@ GUESTFS_DEVICE_NAME = 'org.libguestfs.channel.0'
 # This device name is used as default both in the qemu-guest-agent
 # service/daemon and in libvirtd (to be used with the quiesce flag).
 QEMU_GA_DEVICE_NAME = 'org.qemu.guest_agent.0'
-AGENT_DEVICE_NAMES = (LEGACY_DEVICE_NAME, QEMU_GA_DEVICE_NAME)
 
 
 class Listener(object):
@@ -102,18 +101,18 @@ class Listener(object):
             self._prepare_reconnect(fileno)
 
     def _prepare_reconnect(self, fileno):
-            # fileno will be closed by create_cb
-            self._unregister_fd(fileno)
-            obj = self._channels.pop(fileno)
-            obj['timeout_seen'] = False
-            try:
-                fileno = obj['create_cb']()
-            except:
-                self.log.exception("An error occurred in the create callback "
-                                   "fileno: %d.", fileno)
-            else:
-                with self._update_lock:
-                    self._unconnected[fileno] = obj
+        # fileno will be closed by create_cb
+        self._unregister_fd(fileno)
+        obj = self._channels.pop(fileno)
+        obj['timeout_seen'] = False
+        try:
+            fileno = obj['create_cb']()
+        except:
+            self.log.exception("An error occurred in the create callback "
+                               "fileno: %d.", fileno)
+        else:
+            with self._update_lock:
+                self._unconnected[fileno] = obj
 
     def _handle_timeouts(self):
         """

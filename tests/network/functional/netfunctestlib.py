@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2019 Red Hat, Inc.
+# Copyright 2016-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,15 +18,10 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
-from __future__ import division
-
 from contextlib import contextmanager
 from copy import deepcopy
+import ipaddress
 import time
-
-import six
-from six.moves import zip
 
 import pytest
 
@@ -34,13 +29,11 @@ from vdsm.common import fileutils
 from vdsm.network import api
 from vdsm.network import errors
 from vdsm.network import kernelconfig
-from vdsm.network import nmstate
 from vdsm.network.canonicalize import bridge_opts_dict_to_sorted_str
 from vdsm.network.canonicalize import bridge_opts_str_to_dict
 from vdsm.network.cmd import exec_sync
-from vdsm.network.ip import dhclient
+from vdsm.network.dhcp_monitor import MonitoredItemPool
 from vdsm.network.ip.address import ipv6_supported, prefix2netmask
-from vdsm.network.ifacetracking import is_tracked as iface_is_tracked
 from vdsm.network.link.iface import iface
 from vdsm.network.link.bond import sysfs_options as bond_options
 from vdsm.network.link.bond import sysfs_options_mapper as bond_opts_mapper
@@ -52,6 +45,7 @@ from vdsm.network.netlink import monitor
 from vdsm.network.netlink import waitfor
 from vdsm.network.restore_net_config import restore
 
+
 try:
     from functional.utils import getProxy, SUCCESS
 except ImportError:
@@ -60,21 +54,11 @@ except ImportError:
     getProxy = None
     SUCCESS = 0
 
-try:
-    import ipaddress
-except ImportError:
-    ipaddress = None
-
 NOCHK = {'connectivityCheck': False}
 TIMEOUT_CHK = {'connectivityCheck': True, 'connectivityTimeout': 0.1}
 
 IFCFG_DIR = '/etc/sysconfig/network-scripts/'
 IFCFG_PREFIX = IFCFG_DIR + 'ifcfg-'
-
-
-class IpFamily(object):
-    IPv4 = 4
-    IPv6 = 6
 
 
 parametrize_switch = pytest.mark.parametrize(
@@ -97,24 +81,9 @@ parametrize_bonded = pytest.mark.parametrize(
     'bonded', [False, True], ids=['unbonded', 'bonded']
 )
 
-parametrize_ip_families = pytest.mark.parametrize(
-    'families',
-    [(IpFamily.IPv4,), (IpFamily.IPv6,), (IpFamily.IPv4, IpFamily.IPv6)],
-    ids=['IPv4', 'IPv6', 'IPv4&6'],
-)
-
 parametrize_def_route = pytest.mark.parametrize(
     'def_route', [True, False], ids=['withDefRoute', 'withoutDefRoute']
 )
-
-
-def requires_ipaddress():
-    """
-    ipaddress package is a part of the Python std from PY3.3, on PY2 we need
-    the backported implementation installed.
-    """
-    if ipaddress is None:
-        pytest.skip('ipaddress package is not installed')
 
 
 def retry_assert(func):
@@ -322,7 +291,7 @@ class NetFuncTestAdapter(object):
         bond = netattrs.get('bonding')
         vlan = netattrs.get('vlan')
 
-        if vlan is not None and netattrs['switch'] == 'legacy':
+        if vlan is not None:
             sb_iface = '{}.{}'.format(nic or bond, vlan)
         else:
             sb_iface = nic or bond
@@ -362,19 +331,8 @@ class NetFuncTestAdapter(object):
                 ]
             )
             bridge_opts_caps = bridge_caps['opts']
-            for br_opt, br_val in six.iteritems(req_bridge_opts):
+            for br_opt, br_val in req_bridge_opts.items():
                 assert br_val == bridge_opts_caps[br_opt]
-
-    # FIXME: Redundant because we have NetworkExists + kernel_vs_running_config
-    def assertNetworkExistsInRunning(self, netname, netattrs):
-        self.update_running_config()
-        netsconf = self.running_config.networks
-
-        assert netname in netsconf
-        netconf = netsconf[netname]
-
-        bridged = netattrs.get('bridged')
-        assert bridged == netconf.get('bridged')
 
     def assertNoNetwork(self, netname):
         self.assertNoNetworkExists(netname)
@@ -503,7 +461,7 @@ class NetFuncTestAdapter(object):
         bond_ad_partner_mac = bond_caps[partner_bond]['ad_partner_mac']
         assert bond_hwaddr == bond_ad_partner_mac
 
-    def assertNetworkIp(self, net, attrs):
+    def assertNetworkIp(self, net, attrs, ignore_ip=False):
         bridged = attrs.get('bridged', True)
         vlan = attrs.get('vlan')
         bond = attrs.get('bonding')
@@ -533,8 +491,8 @@ class NetFuncTestAdapter(object):
             self.assertStaticIPv4(attrs, network_netinfo)
             self.assertStaticIPv4(attrs, topdev_netinfo)
         if attrs.get('bootproto') == 'dhcp':
-            self.assertDHCPv4(network_netinfo)
-            self.assertDHCPv4(topdev_netinfo)
+            self.assertDHCPv4(network_netinfo, ignore_ip)
+            self.assertDHCPv4(topdev_netinfo, ignore_ip)
         if _ipv4_is_unused(attrs):
             self.assertDisabledIPv4(network_netinfo)
             self.assertDisabledIPv4(topdev_netinfo)
@@ -543,8 +501,8 @@ class NetFuncTestAdapter(object):
             self.assertStaticIPv6(attrs, network_netinfo)
             self.assertStaticIPv6(attrs, topdev_netinfo)
         elif attrs.get('dhcpv6'):
-            self.assertDHCPv6(network_netinfo)
-            self.assertDHCPv6(topdev_netinfo)
+            self.assertDHCPv6(network_netinfo, ignore_ip)
+            self.assertDHCPv6(topdev_netinfo, ignore_ip)
         elif attrs.get('ipv6autoconf'):
             self.assertIPv6Autoconf(network_netinfo)
             self.assertIPv6Autoconf(topdev_netinfo)
@@ -552,14 +510,13 @@ class NetFuncTestAdapter(object):
             self.assertDisabledIPv6(network_netinfo)
             self.assertDisabledIPv6(topdev_netinfo)
 
-        self.assertRoutesIPv4(attrs, network_netinfo)
-        self.assertRoutesIPv4(attrs, topdev_netinfo)
+        self.assertRoutesIPv4(attrs, network_netinfo, ignore_ip)
+        self.assertRoutesIPv4(attrs, topdev_netinfo, ignore_ip)
 
-        self.assertRoutesIPv6(attrs, network_netinfo)
-        self.assertRoutesIPv6(attrs, topdev_netinfo)
+        self.assertRoutesIPv6(attrs, network_netinfo, ignore_ip)
+        self.assertRoutesIPv6(attrs, topdev_netinfo, ignore_ip)
 
     def assertStaticIPv4(self, netattrs, ipinfo):
-        requires_ipaddress()
         address = netattrs['ipaddr']
         netmask = netattrs.get('netmask') or prefix2netmask(
             int(netattrs.get('prefix'))
@@ -570,20 +527,23 @@ class NetFuncTestAdapter(object):
         assert str(ipv4.with_prefixlen) in ipinfo['ipv4addrs']
 
     def assertStaticIPv6(self, netattrs, ipinfo):
-        requires_ipaddress()
-        ipv6_address = str(
-            ipaddress.IPv6Interface(six.text_type(netattrs['ipv6addr']))
-        )
+        ipv6_address = str(ipaddress.IPv6Interface(str(netattrs['ipv6addr'])))
         assert ipv6_address in ipinfo['ipv6addrs']
 
-    def assertDHCPv4(self, ipinfo):
+    def assertDHCPv4(self, ipinfo, ignore_ip=False):
         assert ipinfo['dhcpv4']
-        assert ipinfo['addr'] != ''
-        assert len(ipinfo['ipv4addrs']) > 0
+        if not ignore_ip:
+            assert ipinfo['addr'] != ''
+            assert len(ipinfo['ipv4addrs']) > 0
 
-    def assertDHCPv6(self, ipinfo):
+    def assertDHCPv6(self, ipinfo, ignore_ip=False):
         assert ipinfo['dhcpv6']
-        assert len(ipinfo['ipv6addrs']) > 0
+        if not ignore_ip:
+            length = len(ipinfo['ipv6addrs'])
+            if length == 0:
+                raise MissingDynamicIPv6Address(
+                    f'IPv6 addresses are empty: {ipinfo}'
+                )
 
     def assertIPv6Autoconf(self, ipinfo):
         assert ipinfo['ipv6autoconf']
@@ -599,30 +559,22 @@ class NetFuncTestAdapter(object):
         # differentiate that from not acquiring an address.
         assert [] == ipinfo['ipv6addrs']
 
-    def assertDhclient(self, iface, family):
-        return dhclient.is_active(iface, family)
-
-    def assertNoDhclient(self, iface, family):
-        assert not self.assertDhclient(iface, family)
-
-    def assertRoutesIPv4(self, netattrs, ipinfo):
-        # TODO: Support sourceroute on OVS switches
-        if netattrs.get('switch', 'legacy') == 'legacy':
-            is_dynamic = netattrs.get('bootproto') == 'dhcp'
-            if is_dynamic:
-                # When dynamic is used, route is assumed to be included.
-                assert ipinfo['gateway']
-            else:
-                gateway = netattrs.get('gateway', '')
-                assert gateway == ipinfo['gateway']
+    def assertRoutesIPv4(self, netattrs, ipinfo, ignore_ip=False):
+        is_dynamic = netattrs.get('bootproto') == 'dhcp'
+        if is_dynamic and not ignore_ip:
+            # When dynamic is used, route is assumed to be included.
+            assert ipinfo['gateway']
+        else:
+            gateway = netattrs.get('gateway', '')
+            assert gateway == ipinfo['gateway']
 
         self.assertDefaultRouteIPv4(netattrs, ipinfo)
 
-    def assertRoutesIPv6(self, netattrs, ipinfo):
+    def assertRoutesIPv6(self, netattrs, ipinfo, ignore_ip=False):
         # TODO: Support sourceroute for IPv6 networks
         if netattrs.get('defaultRoute', False):
             is_dynamic = netattrs.get('ipv6autoconf') or netattrs.get('dhcpv6')
-            if is_dynamic:
+            if is_dynamic and not ignore_ip:
                 # When dynamic is used, route is assumed to be included.
                 assert ipinfo['ipv6gateway']
             else:
@@ -686,8 +638,7 @@ class NetFuncTestAdapter(object):
         # Do not use KernelConfig.__eq__ to get a better exception if something
         # breaks.
         assert running_config['networks'] == kernel_config['networks']
-        if nmstate.is_nmstate_backend():
-            self._assert_inclusive_bond_options(kernel_config, running_config)
+        self._assert_inclusive_bond_options(kernel_config, running_config)
         assert running_config['bonds'] == kernel_config['bonds']
 
     def _assert_inclusive_bond_options(self, kernel_config, running_config):
@@ -709,7 +660,7 @@ class NetFuncTestAdapter(object):
     def _pop_bonds_options(self, running_config, kernel_config):
         r_bonds_opts = []
         k_bonds_opts = []
-        for k_name, k_attrs in six.viewitems(kernel_config['bonds']):
+        for k_name, k_attrs in kernel_config['bonds'].items():
             r_bonds_opts.append(
                 running_config['bonds'][k_name].pop('options', '')
             )
@@ -737,7 +688,7 @@ class NetFuncTestAdapter(object):
     def _pop_nameservers(self, running_config, kernel_config):
         r_nameservers_list = []
         k_nameservers_list = []
-        for k_name, k_attrs in six.viewitems(kernel_config['networks']):
+        for k_name, k_attrs in kernel_config['networks'].items():
             r_nameservers_list.append(
                 running_config['networks'][k_name].pop('nameservers', '')
             )
@@ -753,7 +704,7 @@ class NetFuncTestAdapter(object):
 
 
 def _extend_with_bridge_opts(kernel_config, running_config):
-    for net, attrs in six.viewitems(running_config['networks']):
+    for net, attrs in running_config['networks'].items():
         if not attrs['bridged']:
             continue
         if net not in kernel_config.networks:
@@ -764,7 +715,7 @@ def _extend_with_bridge_opts(kernel_config, running_config):
         running_opts_dict = bridge_opts_str_to_dict(running_opts_str)
         kernel_opts_dict = {
             key: val
-            for key, val in six.viewitems(bridges.bridge_options(net))
+            for key, val in bridges.bridge_options(net).items()
             if key in running_opts_dict
         }
         kernel_opts_str = bridge_opts_dict_to_sorted_str(kernel_opts_dict)
@@ -813,15 +764,10 @@ class SetupNetworks(object):
             self._update_configs()
             raise SetupNetworksError(status, msg)
 
-        if self._is_dynamic_ipv4():
-            self._wait_for_dhcp_response(10)
+        if self._is_sync_dynamic():
+            _wait_for_dhcp_response(30)
             self.vdsm_proxy.refreshNetworkCapabilities()
-        # FIXME This is just workaround, eventually we need to fix this by
-        # adding proper support for IPv6 dhcp monitoring
-        # (https://projects.engineering.redhat.com/browse/RHV-17589)
-        if self._is_dynamic_ipv6() and nmstate.is_nmstate_backend():
-            time.sleep(10)
-            self.vdsm_proxy.refreshNetworkCapabilities()
+
         try:
             self._update_configs()
             self._assert_configs()
@@ -857,48 +803,50 @@ class SetupNetworks(object):
 
         nics_used = [
             attr['nic']
-            for attr in six.itervalues(self.setup_networks)
+            for attr in self.setup_networks.values()
             if 'nic' in attr
         ]
-        for attr in six.itervalues(self.setup_bonds):
+        for attr in self.setup_bonds.values():
             nics_used += attr.get('nics', [])
         for nic in nics_used:
             fileutils.rm_file(IFCFG_PREFIX + nic)
 
         return status, msg
 
+    def _is_sync_dynamic(self):
+        return (
+            self._is_dynamic_ipv4() or self._is_dynamic_ipv6()
+        ) and self._is_blocking_dhcp()
+
     def _is_dynamic_ipv4(self):
-        for attr in six.viewvalues(self.setup_networks):
+        for attr in self.setup_networks.values():
             if attr.get('bootproto') == 'dhcp':
                 return True
         return False
 
     def _is_dynamic_ipv6(self):
-        for attr in six.viewvalues(self.setup_networks):
+        for attr in self.setup_networks.values():
             if attr.get('dhcpv6'):
                 return True
         return False
 
-    def _wait_for_dhcp_response(self, timeout=5):
-        dev_names = self._collect_all_dhcp_interfaces()
-        for attempt in range(timeout):
-            if _did_every_dhcp_server_responded(dev_names):
-                break
-            time.sleep(1)
-
-    def _collect_all_dhcp_interfaces(self):
-        return [
-            _get_network_iface_name(name, attr)
-            for name, attr in six.viewitems(self.setup_networks)
-            if attr.get('bootproto') == 'dhcp'
-        ]
+    def _is_blocking_dhcp(self):
+        for attr in self.setup_networks.values():
+            if attr.get('blockingdhcp'):
+                return True
+        return False
 
 
-def _did_every_dhcp_server_responded(dev_names):
-    for dev_name in dev_names:
-        if iface_is_tracked(dev_name):
-            return False
-    return True
+def _wait_for_dhcp_response(timeout=5):
+    _wait_for_func(MonitoredItemPool.instance().is_pool_empty, timeout)
+
+
+def _wait_for_func(func, timeout=5, **func_kwargs):
+    for attempt in range(timeout):
+        if func(**func_kwargs):
+            break
+        time.sleep(1)
+    time.sleep(1)
 
 
 @contextmanager
@@ -910,7 +858,7 @@ def monitor_stable_link_state(device, wait_for_linkup=True):
     iface_properties = iface(device).properties()
     original_state = iface_properties['state']
     try:
-        with monitor.Monitor(groups=('link',)) as mon:
+        with monitor.object_monitor(groups=('link',)) as mon:
             yield
     finally:
         state_changes = (e['state'] for e in mon if e['name'] == device)
@@ -923,19 +871,6 @@ def monitor_stable_link_state(device, wait_for_linkup=True):
                 )
 
 
-@contextmanager
-def create_tap():
-    devname = '_tap99'
-    rc, _, err = exec_sync(['ip', 'tuntap', 'add', devname, 'mode', 'tap'])
-    if rc != 0:
-        pytest.fail('Unable to create tap device. err: {}'.format(err))
-    try:
-        iface(devname).up()
-        yield devname
-    finally:
-        exec_sync(['ip', 'tuntap', 'del', devname, 'mode', 'tap'])
-
-
 def attach_dev_to_bridge(tapdev, bridge):
     rc, _, err = exec_sync(['ip', 'link', 'set', tapdev, 'master', bridge])
     if rc != 0:
@@ -945,9 +880,9 @@ def attach_dev_to_bridge(tapdev, bridge):
 
 
 def wait_bonds_lp_interval():
-    """ mode 4 (802.3ad) is a relevant bond mode where bonds will attempt
-        to synchronize with each other, sending learning packets to the
-        slaves in intervals set via lp_interval
+    """mode 4 (802.3ad) is a relevant bond mode where bonds will attempt
+    to synchronize with each other, sending learning packets to the
+    slaves in intervals set via lp_interval
     """
     GRACE_PERIOD = 1
     LACP_BOND_MODE = '4'
@@ -968,15 +903,15 @@ def _normalize_caps(netinfo_from_caps):
     """
     netinfo = deepcopy(netinfo_from_caps)
     # TODO: When production code drops compatibility normalization, remove it.
-    for dev in six.itervalues(netinfo.networks):
+    for dev in netinfo.networks.values():
         dev['mtu'] = int(dev['mtu'])
 
     return netinfo
 
 
 def _normalize_qos_config(qos):
-    for value in six.viewvalues(qos):
-        for attrs in six.viewvalues(value):
+    for value in qos.values():
+        for attrs in value.values():
             if attrs.get('m1') == 0:
                 del attrs['m1']
             if attrs.get('d') == 0:
@@ -986,7 +921,7 @@ def _normalize_qos_config(qos):
 
 def _normalize_bonds(configs):
     for cfg in configs:
-        for bond_name, bond_attrs in six.viewitems(cfg['bonds']):
+        for bond_name, bond_attrs in cfg['bonds'].items():
             opts = dict(
                 pair.split('=', 1) for pair in bond_attrs['options'].split()
             )
@@ -997,7 +932,7 @@ def _normalize_bonds(configs):
 
 def _normalize_bond_opts(opts):
     _normalize_arg_ip_target_option(opts)
-    return [opt + '=' + val for (opt, val) in six.iteritems(opts)]
+    return [opt + '=' + val for (opt, val) in opts.items()]
 
 
 def _normalize_arg_ip_target_option(opts):
@@ -1019,7 +954,7 @@ def _numerize_bond_options(opts):
         return opts
 
     optmap['mode'] = numeric_mode = bond_options.numerize_bond_mode(mode)
-    for opname, opval in six.viewitems(optmap):
+    for opname, opval in optmap.items():
         numeric_val = bond_opts_mapper.get_bonding_option_numeric_val(
             numeric_mode, opname, opval
         )
@@ -1076,4 +1011,8 @@ class DeviceNotInCapsError(Exception):
 
 
 class UnexpectedLinkStateChangeError(Exception):
+    pass
+
+
+class MissingDynamicIPv6Address(Exception):
     pass

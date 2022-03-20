@@ -21,21 +21,22 @@
 from __future__ import absolute_import
 from __future__ import division
 
+from unittest import mock
+
 from vdsm.common import cpuarch
 from vdsm.common import fileutils
 from vdsm.common import systemctl
 from vdsm.tool import configurator
 from vdsm.tool.configurators import YES, NO, MAYBE, InvalidConfig, InvalidRun
 from vdsm.tool.configfile import ConfigFile, ParserWrapper
-from vdsm.tool.configurators import abrt
 from vdsm.tool.configurators import libvirt
 from vdsm.tool.configurators import passwd
 from vdsm.tool import UsageError
 from vdsm.tool import upgrade
 from vdsm import cpuinfo
 import monkeypatch
-from testlib import expandPermutations, make_config, mock, VdsmTestCase
-from testValidation import ValidateRunningAsRoot
+from testlib import expandPermutations, make_config, VdsmTestCase
+from testValidation import brokentest, ValidateRunningAsRoot
 from unittest import TestCase
 import io
 import tempfile
@@ -47,7 +48,6 @@ dirName = os.path.dirname(os.path.realpath(__file__))
 tmp_dir = tempfile.mkdtemp()
 
 FakeLibvirtFiles = libvirt.FILES
-FakeAbrtFiles = abrt.FILES
 LibvirtConnectionConfig = libvirt._LibvirtConnectionConfig
 
 
@@ -107,21 +107,28 @@ def patchConfigurators(mockConfigurers):
 
 class PasswdConfiguratorTest(VdsmTestCase):
     def testCheckIsConfiguredNo(self):
-        tmpfile = tempfile.mktemp()
-        with open(tmpfile, 'w') as f:
-            f.write("\n")
-            f.write("\n")
-            f.write("mech_list: gssapi\n")
+        with tempfile.NamedTemporaryFile(mode='w+') as f:
+            f.write("\n"
+                    "\n"
+                    "mech_list: gssapi\n")
+            f.flush()
 
-        passwd._SASL2_CONF = tmpfile
-        self.assertEqual(passwd.libvirt_sasl_isconfigured(), NO)
+            passwd._SASL2_CONF = f.name
+            self.assertEqual(passwd.libvirt_sasl_isconfigured(), NO)
+
+    def testCheckIsConfiguredNoWithWrongSha(self):
+        with tempfile.NamedTemporaryFile(mode='w+') as f:
+            f.write("\nmech_list: scram-sha-1\n")
+            f.flush()
+            passwd._SASL2_CONF = f.name
+            self.assertEqual(passwd.libvirt_sasl_isconfigured(), NO)
 
     def testCheckIsConfiguredMaybe(self):
-        tmpfile = tempfile.mktemp()
-        with open(tmpfile, 'w') as f:
-            f.write("\n")
-        passwd._SASL2_CONF = tmpfile
-        self.assertEqual(passwd.libvirt_sasl_isconfigured(), MAYBE)
+        with tempfile.NamedTemporaryFile(mode='w+') as f:
+            f.write("\nmech_list: scram-sha-256\n")
+            f.flush()
+            passwd._SASL2_CONF = f.name
+            self.assertEqual(passwd.libvirt_sasl_isconfigured(), MAYBE)
 
 
 @expandPermutations
@@ -336,68 +343,6 @@ class ExposedFunctionsFailuresTests(VdsmTestCase):
                           "remove-config")
 
 
-class AbrtModuleConfigureTests(TestCase):
-    srcPath = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    test_env = {}
-
-    def setUp(self):
-        self._test_dir = tempfile.mkdtemp()
-        self.test_env['ABRT_CONF'] = self._test_dir + '/abrt.conf'
-        self.test_env['CCPP_CONF'] = self._test_dir + '/CCPP.conf'
-        self.test_env['VMCORE_CONF'] = self._test_dir + '/vmcore.conf'
-        self.test_env['PKG_CONF'] = self._test_dir + \
-            '/abrt-action-save-package-data.conf'
-
-        for key, val in self.test_env.items():
-            FakeAbrtFiles[key]['path'] = val
-
-        self.patch = monkeypatch.Patch([
-            (
-                abrt,
-                'FILES',
-                FakeAbrtFiles
-            )
-        ])
-
-        self.patch.apply()
-
-    def tearDown(self):
-        self.patch.revert()
-        fileutils.rm_tree(self._test_dir)
-
-    def testIsConfiguredNegative(self):
-        _setConfig(self,
-                   ('ABRT_CONF', 'abrt'),
-                   ('CCPP_CONF', 'CCPP'),
-                   ('VMCORE_CONF', 'empty'),
-                   ('PKG_CONF', 'abrt-action-save-package-data'),
-                   )
-        self.assertEqual(
-            abrt.isconfigured(),
-            NO
-        )
-
-    def testAbrtConfigure(self):
-        _setConfig(self,
-                   ('ABRT_CONF', 'empty'),
-                   ('CCPP_CONF', 'empty'),
-                   ('VMCORE_CONF', 'empty'),
-                   ('PKG_CONF', 'empty'),
-                   )
-
-        self.assertEqual(
-            abrt.isconfigured(),
-            NO
-        )
-
-        abrt.configure()
-
-        self.assertEqual(
-            abrt.isconfigured(),
-            MAYBE
-        )
-
-
 class LibvirtModuleConfigureTests(TestCase):
 
     test_env = {}
@@ -458,9 +403,8 @@ class LibvirtModuleConfigureTests(TestCase):
         self.patch.revert()
         fileutils.rm_tree(self._test_dir)
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
     def testValidatePositive(self):
         self.vdsm_cfg.set('vars', 'ssl', 'true')
         _setConfig(self,
@@ -470,9 +414,8 @@ class LibvirtModuleConfigureTests(TestCase):
 
         self.assertTrue(libvirt.validate())
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
     def testValidateNegative(self):
         self.vdsm_cfg.set('vars', 'ssl', 'false')
         _setConfig(self,
@@ -482,9 +425,9 @@ class LibvirtModuleConfigureTests(TestCase):
 
         self.assertFalse(libvirt.validate())
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
+    @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled', lambda _: True)
     def testIsConfiguredPositive(self):
         _setConfig(self,
                    ('LCONF', 'lconf_ssl'),
@@ -495,9 +438,9 @@ class LibvirtModuleConfigureTests(TestCase):
             MAYBE
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
+    @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled', lambda _: True)
     def testIsConfiguredNegative(self):
         _setConfig(self,
                    ('LCONF', 'lconf_ssl'),
@@ -508,18 +451,12 @@ class LibvirtModuleConfigureTests(TestCase):
             NO
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_read_libvirt_connection_config',
-                             lambda: LibvirtConnectionConfig(
-                                 auth_tcp='',
-                                 listen_tcp=1,
-                                 listen_tls=0,
-                                 spice_tls=0))
     @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled',
                              lambda u: u != libvirt._LIBVIRT_TCP_SOCKET_UNIT)
     def testIsConfiguredTcpSocketDisabled(self):
+        self.vdsm_cfg.set('vars', 'ssl', 'false')
         _setConfig(self,
                    ('LCONF', 'lconf_ssl'),
                    ('QCONF', 'qemu_ssl'),
@@ -529,18 +466,12 @@ class LibvirtModuleConfigureTests(TestCase):
             NO
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_read_libvirt_connection_config',
-                             lambda: LibvirtConnectionConfig(
-                                 auth_tcp='',
-                                 listen_tcp=1,
-                                 listen_tls=0,
-                                 spice_tls=0))
     @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled',
                              lambda u: u == libvirt._LIBVIRT_TCP_SOCKET_UNIT)
     def testIsConfiguredTcpSocketEnabled(self):
+        self.vdsm_cfg.set('vars', 'ssl', 'false')
         _setConfig(self,
                    ('LCONF', 'lconf_ssl'),
                    ('QCONF', 'qemu_ssl'),
@@ -550,14 +481,11 @@ class LibvirtModuleConfigureTests(TestCase):
             MAYBE
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: True)
     @monkeypatch.MonkeyPatch(libvirt, '_read_libvirt_connection_config',
                              lambda: LibvirtConnectionConfig(
                                  auth_tcp='',
-                                 listen_tcp=0,
-                                 listen_tls=1,
                                  spice_tls=0))
     @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled',
                              lambda u: u != libvirt._LIBVIRT_TLS_SOCKET_UNIT)
@@ -571,14 +499,11 @@ class LibvirtModuleConfigureTests(TestCase):
             NO
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: True)
     @monkeypatch.MonkeyPatch(libvirt, '_read_libvirt_connection_config',
                              lambda: LibvirtConnectionConfig(
                                  auth_tcp='',
-                                 listen_tcp=0,
-                                 listen_tls=1,
                                  spice_tls=0))
     @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled',
                              lambda u: u == libvirt._LIBVIRT_TLS_SOCKET_UNIT)
@@ -592,30 +517,38 @@ class LibvirtModuleConfigureTests(TestCase):
             MAYBE
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_read_libvirt_connection_config',
-                             lambda: LibvirtConnectionConfig(
-                                 auth_tcp='',
-                                 listen_tcp=1,
-                                 listen_tls=1,
-                                 spice_tls=0))
     @monkeypatch.MonkeyPatch(systemctl, 'enable', mock.Mock())
-    def testLibvirtConfigureShouldEnableSockets(self):
+    def testLibvirtConfigureShouldEnableTcpSocket(self):
+        self.vdsm_cfg.set('vars', 'ssl', 'false')
         _setConfig(self,
                    ('LCONF', 'lconf_ssl'),
                    ('QCONF', 'qemu_ssl'),
                    )
+
         libvirt.configure()
         systemctl.enable.assert_has_calls([
-            mock.call(libvirt._LIBVIRT_TCP_SOCKET_UNIT),
+            mock.call(libvirt._LIBVIRT_TCP_SOCKET_UNIT)
+        ])
+
+    @brokentest(reason="needs pytest rewrite")
+    @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
+    @monkeypatch.MonkeyPatch(systemctl, 'enable', mock.Mock())
+    def testLibvirtConfigureShouldEnableTlsSocket(self):
+        self.vdsm_cfg.set('vars', 'ssl', 'true')
+        _setConfig(self,
+                   ('LCONF', 'lconf_ssl'),
+                   ('QCONF', 'qemu_ssl'),
+                   )
+
+        libvirt.configure()
+        systemctl.enable.assert_has_calls([
             mock.call(libvirt._LIBVIRT_TLS_SOCKET_UNIT)
         ])
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: True)
     @monkeypatch.MonkeyPatch(systemctl, 'enable', mock.Mock())
     def testLibvirtConfigureSysconfigWithSocketActivation(self):
         _setConfig(self,
@@ -628,29 +561,18 @@ class LibvirtModuleConfigureTests(TestCase):
             text = f.read()
 
         self.assertIn("DAEMON_COREFILE_LIMIT=unlimited\n", text)
-        self.assertNotIn("LIBVIRTD_ARGS=", text)
+        self.assertIn("LIBVIRTD_ARGS=\n", text)
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
     @monkeypatch.MonkeyPatch(systemctl, 'enable', mock.Mock())
-    def testLibvirtConfigureSysconfigWithoutSocketActivation(self):
-        _setConfig(self,
-                   ('LCONF', 'lconf_ssl'),
-                   ('QCONF', 'qemu_ssl'),
-                   )
-        libvirt.configure()
-
-        with open(self.test_env['LDCONF']) as f:
-            text = f.read()
-
-        self.assertIn("DAEMON_COREFILE_LIMIT=unlimited\n", text)
-        self.assertIn("LIBVIRTD_ARGS=--listen\n", text)
-
-    @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
+    @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled', mock.Mock())
     def testLibvirtConfigureToSSLTrue(self):
+        enabled_units = set()
+
+        systemctl.enable = enabled_units.add
+        libvirt._unit_enabled = lambda name: name in enabled_units
+
         self.vdsm_cfg.set('vars', 'ssl', 'true')
         _setConfig(self,
                    ('LCONF', 'empty'),
@@ -669,10 +591,16 @@ class LibvirtModuleConfigureTests(TestCase):
             MAYBE
         )
 
+    @brokentest(reason="needs pytest rewrite")
     @monkeypatch.MonkeyPatch(libvirt, '_is_hugetlbfs_1g_mounted', lambda: True)
-    @monkeypatch.MonkeyPatch(libvirt, '_libvirt_uses_socket_activation',
-                             lambda: False)
+    @monkeypatch.MonkeyPatch(systemctl, 'enable', mock.Mock())
+    @monkeypatch.MonkeyPatch(libvirt, '_unit_enabled', mock.Mock())
     def testLibvirtConfigureToSSLFalse(self):
+        enabled_units = set()
+
+        systemctl.enable = enabled_units.add
+        libvirt._unit_enabled = lambda name: name in enabled_units
+
         self.vdsm_cfg.set('vars', 'ssl', 'false')
         _setConfig(self,
                    ('LCONF', 'empty'),
@@ -689,28 +617,6 @@ class LibvirtModuleConfigureTests(TestCase):
             libvirt.isconfigured(),
             MAYBE
         )
-
-    @monkeypatch.MonkeyPatch(libvirt, '_find_libvirt_socket_units', lambda: [])
-    def test_no_socket_activation_when_no_socket_units(self):
-        self.assertFalse(libvirt._libvirt_uses_socket_activation())
-
-    @monkeypatch.MonkeyPatch(libvirt, '_find_libvirt_socket_units', lambda: [
-        {
-            "Names": "libvirtd-tls.socket",
-            "LoadState": "masked"
-        }
-    ])
-    def test_no_socket_activation_when_socket_units_are_masked(self):
-        self.assertFalse(libvirt._libvirt_uses_socket_activation())
-
-    @monkeypatch.MonkeyPatch(libvirt, '_find_libvirt_socket_units', lambda: [
-        {
-            "Names": "libvirtd-tls.socket",
-            "LoadState": "loaded"
-        }
-    ])
-    def test_socket_activation_enabled(self):
-        self.assertTrue(libvirt._libvirt_uses_socket_activation())
 
     def test_hugetlbfs_mount_false(self):
         path_to_fake_mtab = os.path.join(self.srcPath, 'tests',
@@ -853,9 +759,9 @@ class ConfigFileTests(TestCase):
                         sectionStart="# start conf",
                         sectionEnd="# end conf",
                         prefix="# comment ") as conf:
-                    conf.prefixLines()
-                    conf.prependSection(u"Some text to\n"
-                                        "add at the top\n")
+            conf.prefixLines()
+            conf.prependSection(u"Some text to\n"
+                                "add at the top\n")
         with open(self.tname, 'r') as f:
             self.assertEqual(f.read(),
                              "# start conf-3.4.4\n"
@@ -878,7 +784,7 @@ class ConfigFileTests(TestCase):
                         sectionStart="# start conf",
                         sectionEnd="# end conf",
                         prefix="# comment ") as conf:
-                    conf.prefixLines()
+            conf.prefixLines()
         with open(self.tname, 'r') as f:
             self.assertEqual(f.read(),
                              "# comment /var/log/libvirt/libvirtd.log {\n"
@@ -917,11 +823,11 @@ class ConfigFileTests(TestCase):
                         sectionStart="# start conf",
                         sectionEnd="# end conf",
                         prefix="# comment") as conf:
-                            conf.removeConf()
+            conf.removeConf()
         with open(self.tname, 'r') as f:
-                    self.assertEqual(f.read(), "key=val\n"
-                                               "key=val\n"
-                                               "# comment line\n")
+            self.assertEqual(f.read(), "key=val\n"
+                                       "key=val\n"
+                                       "# comment line\n")
 
     def testOutOfContext(self):
         conff = ConfigFile(self.tname,

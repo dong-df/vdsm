@@ -1,5 +1,5 @@
 #
-# Copyright 2017-2019 Red Hat, Inc.
+# Copyright 2017-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,10 +24,8 @@ from __future__ import division
 from __future__ import print_function
 
 import logging
-import xml.etree.ElementTree as ET
 
 from vdsm.virt.domain_descriptor import DomainDescriptor
-from vdsm.virt.vmdevices import hwclass
 from vdsm.virt.vmdevices import lookup
 from vdsm.virt import metadata
 from vdsm.virt import vmdevices
@@ -35,14 +33,14 @@ from vdsm.virt import vmxml
 from vdsm.common import hostdev
 from vdsm.common import xmlutils
 
-from monkeypatch import MonkeyPatchScope, MonkeyPatch
+from monkeypatch import MonkeyPatchScope
 from testlib import permutations, expandPermutations
 from testlib import read_data
 from testlib import XMLTestCase
 
 import vmfakecon as fake
-import vmfakelib
 import hostdevlib
+import pytest
 
 
 @expandPermutations
@@ -76,8 +74,6 @@ class DeviceToXMLTests(XMLTestCase):
                   'size': 1024, 'node': 0}
         self.assertXMLEqual(vmdevices.core.memory_xml(params), memoryXML)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface(self):
         interfaceXML = """
             <interface type="bridge"> <address %s/>
@@ -110,8 +106,6 @@ class DeviceToXMLTests(XMLTestCase):
         iface = vmdevices.network.Interface(self.log, **dev)
         self.assertXMLEqual(xmlutils.tostring(iface.getXML()), interfaceXML)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_filter_parameters(self):
         interfaceXML = """
             <interface type="bridge"> <address %s/>
@@ -144,52 +138,6 @@ class DeviceToXMLTests(XMLTestCase):
 
         iface = vmdevices.network.Interface(self.log, **dev)
         self.assertXMLEqual(xmlutils.tostring(iface.getXML()), interfaceXML)
-
-    @MonkeyPatch(vmdevices.network.net_api, 'net2vlan', lambda x: 101)
-    def test_interface_on_ovs_with_vlan(self):
-        proxy = FakeProxy(ovs_bridge={
-            'ovn_net_1': {
-                'name': 'vdsmbr_fffffff',
-                'dpdk_enabled': False
-            }
-        })
-        interfaceXML = """
-            <interface type="bridge">
-                <address %s/>
-                <mac address="52:54:00:59:F5:3F"/>
-                <model type="virtio"/>
-                <source bridge="vdsmbr_fffffff"/>
-                <virtualport type="openvswitch" />
-                <vlan>
-                    <tag id="101" />
-                </vlan>
-                <filterref filter="no-mac-spoofing"/>
-                <link state="up"/>
-                <boot order="1"/>
-                <driver name="vhost" queues="7"/>
-                <tune>
-                    <sndbuf>0</sndbuf>
-                </tune>
-            </interface>""" % self.PCI_ADDR
-
-        dev = {
-            'nicModel': 'virtio',
-            'macAddr': '52:54:00:59:F5:3F',
-            'network': 'ovn_net_1',
-            'address': self.PCI_ADDR_DICT,
-            'device': 'bridge',
-            'type': 'interface',
-            'bootOrder': '1',
-            'filter': 'no-mac-spoofing',
-            'custom': {'queues': '7'},
-            'vm_custom': {'vhost': 'ovirtmgmt:true', 'sndbuf': '0'},
-        }
-        with MonkeyPatchScope([
-            (vmdevices.network.supervdsm, 'getProxy', lambda: proxy)
-        ]):
-            iface = vmdevices.network.Interface(self.log, **dev)
-            self.assertXMLEqual(xmlutils.tostring(iface.getXML()),
-                                interfaceXML)
 
     @permutations([
         # base_spec_params:
@@ -227,13 +175,10 @@ class DeviceToXMLTests(XMLTestCase):
           </bandwidth>
         </interface>
         """
-        with MonkeyPatchScope([
-            (vmdevices.network.supervdsm, 'getProxy', lambda: FakeProxy())
-        ]):
-            dev = vmdevices.network.Interface(self.log, **conf)
-            vnic_xml = dev.getXML()
-            vmdevices.network.update_bandwidth_xml(dev, vnic_xml, specParams)
-            self.assertXMLEqual(xmlutils.tostring(vnic_xml), XML)
+        dev = vmdevices.network.Interface(self.log, **conf)
+        vnic_xml = dev.getXML()
+        vmdevices.network.update_bandwidth_xml(dev, vnic_xml, specParams)
+        self.assertXMLEqual(xmlutils.tostring(vnic_xml), XML)
 
 
 @expandPermutations
@@ -259,8 +204,8 @@ class ParsingHelperTests(XMLTestCase):
         dev = xmlutils.fromstring(XML)
         found_addr = vmdevices.core.find_device_guest_address(dev)
         found_alias = vmdevices.core.find_device_alias(dev)
-        self.assertEqual(found_addr, self.ADDR)
-        self.assertEqual(found_alias, self.ALIAS)
+        assert found_addr == self.ADDR
+        assert found_alias == self.ALIAS
 
     def test_missing_address(self):
         XML = u"""<device type='fake'>
@@ -269,8 +214,8 @@ class ParsingHelperTests(XMLTestCase):
         dev = xmlutils.fromstring(XML)
         found_addr = vmdevices.core.find_device_guest_address(dev)
         found_alias = vmdevices.core.find_device_alias(dev)
-        self.assertIs(found_addr, None)
-        self.assertEqual(found_alias, self.ALIAS)
+        assert found_addr is None
+        assert found_alias == self.ALIAS
 
     def test_missing_alias(self):
         params = self.ADDR.copy()
@@ -281,37 +226,37 @@ class ParsingHelperTests(XMLTestCase):
         dev = xmlutils.fromstring(XML)
         found_addr = vmdevices.core.find_device_guest_address(dev)
         found_alias = vmdevices.core.find_device_alias(dev)
-        self.assertEqual(found_addr, self.ADDR)
-        self.assertEqual(found_alias, '')
+        assert found_addr == self.ADDR
+        assert found_alias == ''
 
     def test_missing_address_alias(self):
         XML = u"<device type='fake' />"
         dev = xmlutils.fromstring(XML)
         found_addr = vmdevices.core.find_device_guest_address(dev)
         found_alias = vmdevices.core.find_device_alias(dev)
-        self.assertIs(found_addr, None)
-        self.assertEqual(found_alias, '')
+        assert found_addr is None
+        assert found_alias == ''
 
     def test_attrs(self):
         XML = u"<device type='fake' />"
         attrs = vmdevices.core.parse_device_attrs(
             xmlutils.fromstring(XML), ('type',)
         )
-        self.assertEqual(attrs, {'type': 'fake'})
+        assert attrs == {'type': 'fake'}
 
     def test_attrs_missing(self):
         XML = u"<device type='fake' />"
         attrs = vmdevices.core.parse_device_attrs(
             xmlutils.fromstring(XML), ('type', 'foo')
         )
-        self.assertEqual(attrs, {'type': 'fake'})
+        assert attrs == {'type': 'fake'}
 
     def test_attrs_partial(self):
         XML = u"<device foo='bar' ans='42' fizz='buzz' />"
         attrs = vmdevices.core.parse_device_attrs(
             xmlutils.fromstring(XML), ('foo', 'fizz')
         )
-        self.assertEqual(attrs, {'foo': 'bar', 'fizz': 'buzz'})
+        assert attrs == {'foo': 'bar', 'fizz': 'buzz'}
 
     @permutations([
         # xml_data, dev_type
@@ -322,10 +267,8 @@ class ParsingHelperTests(XMLTestCase):
         [u'''<tpm model='tpm-tis'/>''', 'tpm'],
     ])
     def test_find_device_type(self, xml_data, dev_type):
-        self.assertEqual(
-            dev_type,
+        assert dev_type == \
             vmdevices.core.find_device_type(xmlutils.fromstring(xml_data))
-        )
 
     @permutations([
         # xml_data, alias
@@ -336,10 +279,8 @@ class ParsingHelperTests(XMLTestCase):
         [u'''<controller><alias>foobar</alias></controller>''', ''],
     ])
     def test_find_device_alias(self, xml_data, alias):
-        self.assertEqual(
-            alias,
+        assert alias == \
             vmdevices.core.find_device_alias(xmlutils.fromstring(xml_data))
-        )
 
     @permutations([
         # xml_data, address
@@ -368,27 +309,10 @@ class ParsingHelperTests(XMLTestCase):
           'function': '0x0', 'slot': '0x04', 'type': 'pci'}],
     ])
     def test_find_device_guest_address(self, xml_data, address):
-        self.assertEqual(
-            address,
+        assert address == \
             vmdevices.core.find_device_guest_address(
                 xmlutils.fromstring(xml_data)
             )
-        )
-
-
-class FakeProxy(object):
-
-    def __init__(self, ovs_bridge=None):
-        self._ovs_bridge = {} if ovs_bridge is None else ovs_bridge
-
-    def ovs_bridge(self, name):
-        return self._ovs_bridge.get(name, None)
-
-    def appropriateHwrngDevice(self, vmid):
-        pass
-
-    def rmAppropriateHwrngDevice(self, vmid):
-        pass
 
 
 # the alias is not rendered by getXML, so having it would make
@@ -518,7 +442,7 @@ _STORAGE_TEST_DATA = [
         </disk>''',
      {}],
     [u'''<disk device="cdrom" snapshot="no" type="file">
-            <source file="/var/run/vdsm/payload/{guid}.{hashsum}.img"
+            <source file="/run/vdsm/payload/{guid}.{hashsum}.img"
                 startupPolicy="optional">
                 <seclabel model="dac" relabel="no" type="none" />
             </source>
@@ -631,10 +555,8 @@ class DeviceXMLRoundTripTests(XMLTestCase):
                 meta={'vmid': 'VMID'}
             )
         except NotImplementedError as exc:
-            self.assertEqual(
-                vmdevices.core.Base.__name__,
+            assert vmdevices.core.Base.__name__ == \
                 str(exc)
-            )
         except Exception as ex:
             raise AssertionError('from_xml_tree raise unexpected %s', ex)
         else:
@@ -649,8 +571,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
         </lease>'''
         self._check_roundtrip(vmdevices.lease.Device, lease_xml)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface(self):
         interface_xml = u'''
             <interface type="bridge">
@@ -678,8 +598,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
         self._check_roundtrip(
             vmdevices.network.Interface, interface_xml, meta=meta)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_mtu(self):
         interface_xml = u'''
             <interface type="bridge">
@@ -696,13 +614,26 @@ class DeviceXMLRoundTripTests(XMLTestCase):
         self._check_roundtrip(
             vmdevices.network.Interface, interface_xml, meta=meta)
 
+    def test_interface_isolated(self):
+        interface_xml = u'''
+            <interface type="bridge">
+                <address bus="0x00" domain="0x0000"
+                    function="0x0" slot="0x03" type="pci"/>
+                <mac address="52:54:00:59:F5:3F"/>
+                <model type="virtio"/>
+                <source bridge="ovirtmgmt"/>
+                <port isolated="yes"/>
+                <link state="up"/>
+            </interface>'''
+        meta = {'vmid': 'VMID'}
+        self._check_roundtrip(
+            vmdevices.network.Interface, interface_xml, meta=meta)
+
     @permutations([
         # link state
         ('up',),
         ('down',),
     ])
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_link_state(self, link_state):
         interface_xml = u'''
             <interface type="bridge">
@@ -718,8 +649,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
         self._check_roundtrip(
             vmdevices.network.Interface, interface_xml, meta=meta)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_empty_bridge(self):
         interface_xml = u'''
             <interface type="bridge">
@@ -749,8 +678,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
             expected_xml=expected_xml
         )
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_vmfex(self):
         interface_xml = u'''
             <interface type='network'>
@@ -778,8 +705,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
             expected_xml=expected_xml
         )
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_sriov_only_host_address(self):
         """
         This is what we expect on the very first run. The device has not
@@ -807,8 +732,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
             self._check_roundtrip(
                 vmdevices.network.Interface, interface_xml, meta=meta)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_sriov_with_host_and_guest_address(self):
         """
         This is what we could get from the second run, and following.
@@ -838,8 +761,6 @@ class DeviceXMLRoundTripTests(XMLTestCase):
             self._check_roundtrip(
                 vmdevices.network.Interface, interface_xml, meta=meta)
 
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
     def test_interface_hostdev(self):
         interface_xml = u'''
             <interface type='hostdev' managed='no'>
@@ -864,98 +785,11 @@ class DeviceXMLRoundTripTests(XMLTestCase):
             self._check_roundtrip(
                 vmdevices.network.Interface, interface_xml, meta=meta)
 
-    @MonkeyPatch(vmdevices.network.net_api, 'net2vlan', lambda x: 101)
-    def test_interface_ovs(self):
-        proxy = FakeProxy(ovs_bridge={
-            'ovn_net_1': {
-                'name': 'vdsmbr_fffffff',
-                'dpdk_enabled': False
-            }
-        })
-
-        interface_xml = u'''
-            <interface type="bridge">
-                <address bus="0x00" domain="0x0000"
-                    function="0x0" slot="0x03" type="pci"/>
-                <mac address="52:54:00:59:F5:3F"/>
-                <model type="virtio"/>
-                <source bridge="ovn_net_1"/>
-                <boot order="1"/>
-                <driver name="vhost" queues="4"/>
-                <tune>
-                    <sndbuf>128</sndbuf>
-                </tune>
-            </interface>'''
-
-        expected_xml = u'''
-            <interface type="bridge">
-                <address bus="0x00" domain="0x0000"
-                    function="0x0" slot="0x03" type="pci"/>
-                <mac address="52:54:00:59:F5:3F"/>
-                <model type="virtio"/>
-                <source bridge="vdsmbr_fffffff"/>
-                <virtualport type="openvswitch" />
-                <vlan>
-                    <tag id="101" />
-                </vlan>
-                <link state="up"/>
-                <boot order="1"/>
-                <driver name="vhost" queues="4"/>
-                <tune>
-                    <sndbuf>128</sndbuf>
-                </tune>
-            </interface>'''
-        meta = {'vmid': 'VMID'}
-
-        with MonkeyPatchScope([
-            (vmdevices.network.supervdsm, 'getProxy', lambda: proxy)
-        ]):
-            self._check_roundtrip(
-                vmdevices.network.Interface,
-                interface_xml,
-                expected_xml=expected_xml,
-                meta=meta
-            )
-
-    # TODO: add test with OVS and DPDK enabled
-
-    @permutations(_HOSTDEV_XML)
-    @MonkeyPatch(vmdevices.network.supervdsm,
-                 'getProxy', lambda: FakeProxy())
-    def test_hostdev(self, hostdev_xml):
-        with MonkeyPatchScope([
-            (hostdev.libvirtconnection, 'get', hostdevlib.Connection),
-            (vmdevices.hostdevice, 'detach_detachable',
-                lambda *args, **kwargs: None),
-            (vmdevices.hostdevice, 'reattach_detachable',
-                lambda *args, **kwargs: None),
-        ]):
-            self._check_roundtrip(vmdevices.hostdevice.HostDevice, hostdev_xml)
-
-    def test_hostdev_mdev(self):
-        with MonkeyPatchScope([
-            (hostdev.libvirtconnection, 'get', hostdevlib.Connection),
-            (vmdevices.hostdevice, 'spawn_mdev',
-                lambda *args, **kwargs: None),
-            (vmdevices.hostdevice, 'despawn_mdev',
-                lambda *args, **kwargs: None),
-            (vmdevices.hostdevice, 'detach_detachable',
-                lambda *args, **kwargs: None),
-            (vmdevices.hostdevice, 'reattach_detachable',
-                lambda *args, **kwargs: None),
-        ]):
-            self._check_roundtrip(
-                vmdevices.hostdevice.HostDevice, _MDEV_XML
-            )
-
     def test_storage(self):
-        self.assertRaises(
-            NotImplementedError,
-            vmdevices.storage.Drive.from_xml_tree,
-            self.log,
-            None,
-            {}
-        )
+        with pytest.raises(NotImplementedError):
+            vmdevices.storage.Drive.from_xml_tree(
+                self.log, None, {}
+            )
 
     @permutations(_STORAGE_TEST_DATA)
     def test_storage_from_xml(self, storage_xml, meta):
@@ -975,9 +809,7 @@ class DeviceXMLRoundTripTests(XMLTestCase):
                 {} if meta is None else meta
             )
         )
-        self.assertEqual(
-            dev.shared, vmdevices.storage.DRIVE_SHARED_TYPE.TRANSIENT
-        )
+        assert dev.shared == vmdevices.storage.DRIVE_SHARED_TYPE.TRANSIENT
 
     def test_storage_from_incomplete_xml(self):
         storage_xml = '''<disk device="disk" snapshot="no" type="file">
@@ -1078,10 +910,10 @@ class DeviceXMLRoundTripTests(XMLTestCase):
         self._check_device_xml(dev, dev_xml, expected_xml)
 
     def _check_device_attrs(self, dev):
-        self.assertTrue(hasattr(dev, 'specParams'))
+        assert hasattr(dev, 'specParams')
         if (isinstance(dev, vmdevices.network.Interface) or
                 isinstance(dev, vmdevices.storage.Drive)):
-            self.assertTrue(hasattr(dev, 'vm_custom'))
+            assert hasattr(dev, 'vm_custom')
 
     def _check_device_xml(self, dev, dev_xml, expected_xml=None):
         dev.setup()
@@ -1156,7 +988,7 @@ class DeviceFromXMLTests(XMLTestCase):
             dev_obj = vmdevices.storage.Drive(
                 self.log, **vmdevices.storagexml.parse(dev_xml, meta)
             )
-            self.assertEqual(dev_obj.specParams['vmPayload'], vmPayload)
+            assert dev_obj.specParams['vmPayload'] == vmPayload
 
     def test_payload_from_metadata_dump(self):
         expected_xml = u'''<ovirt-vm:vm xmlns:ovirt-vm='http://ovirt.org/vm/1.0'>
@@ -1184,14 +1016,14 @@ class DeviceFromXMLTests(XMLTestCase):
         for devices in dev_objs.values():
             for dev in devices:
                 print(dev)  # debug aid
-                self.assertIsNot(dev.type, None)
-                self.assertIsNot(dev.device, None)
+                assert dev.type is not None
+                assert dev.device is not None
 
     def test_erroneous_device_init(self):
         dom_desc = DomainDescriptor(_INVALID_DEVICE_XML)
         for dom in dom_desc.get_device_elements('graphics'):
             dev = vmdevices.graphics.Graphics(dom, '1234')
-            with self.assertRaises(vmxml.NotFound):
+            with pytest.raises(vmxml.NotFound):
                 dev._display_network()
 
 
@@ -1206,6 +1038,20 @@ _DOMAIN_MD_MATCH_XML = u"""<domain type='kvm' id='2'>
     <ovirt-vm:vm>
       <ovirt-vm:device devtype="disk" name="sda">
         <ovirt-vm:RBD>/dev/rbd/pool/volume-uuid</ovirt-vm:RBD>
+      </ovirt-vm:device>
+      <ovirt-vm:device devtype="disk" name="sdb">
+        <ovirt-vm:GUID>3600a098038304479363f4c4870455167</ovirt-vm:GUID>
+        <ovirt-vm:imageID>3600a098038304479363f4c4870455167</ovirt-vm:imageID>
+        <ovirt-vm:managed type="bool">True</ovirt-vm:managed>
+      </ovirt-vm:device>
+      <ovirt-vm:device devtype="disk" name="sdc">
+        <ovirt-vm:GUID>3600a098038304479363f4c4870455162</ovirt-vm:GUID>
+        <ovirt-vm:imageID>3600a098038304479363f4c4870455162</ovirt-vm:imageID>
+      </ovirt-vm:device>
+      <ovirt-vm:device devtype="disk" name="sdd">
+        <ovirt-vm:GUID>3600a098038304479363f4c4870455163</ovirt-vm:GUID>
+        <ovirt-vm:imageID>3600a098038304479363f4c4870455163</ovirt-vm:imageID>
+        <ovirt-vm:managed type="bool">False</ovirt-vm:managed>
       </ovirt-vm:device>
       <ovirt-vm:device mac_address="00:1a:4a:16:01:00">
         <ovirt-vm:portMirroring>
@@ -1241,6 +1087,40 @@ _DOMAIN_MD_MATCH_XML = u"""<domain type='kvm' id='2'>
         <alias name='ua-44ab108a-62e6-480e-b44c-aac301227f94'/>
         <address type='drive' controller='0' bus='0' target='0' unit='0'/>
     </disk>
+    <disk type='block' device='disk' snapshot='no'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source dev='/dev/mapper/3600a098038304479363f4c4870455167' index='2'>
+        <seclabel model='dac' relabel='no'/>
+      </source>
+      <backingStore/>
+      <target dev='sdb' bus='scsi'/>
+      <serial>ead4a539-6b93-4f6e-8a92-3eea28e91d4e</serial>
+      <alias name='ua-ead4a539-6b93-4f6e-8a92-3eea28e91d4e'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+    <disk type='block' device='disk' snapshot='no'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source dev='/dev/mapper/3600a098038304479363f4c4870455162' index='2'>
+        <seclabel model='dac' relabel='no'/>
+      </source>
+      <backingStore/>
+      <target dev='sdc' bus='scsi'/>
+      <serial>ead4a529-6b93-4f6e-8a92-3eea28e91d4e</serial>
+      <alias name='ua-ead4a529-6b93-4f6e-8a92-3eea28e91d4e'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+    <disk type='block' device='disk' snapshot='no'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source dev='/dev/mapper/3600a098038304479363f4c4870455163' index='2'>
+        <seclabel model='dac' relabel='no'/>
+      </source>
+      <backingStore/>
+      <target dev='sdd' bus='scsi'/>
+      <serial>ead4a529-6b93-4f6e-8a92-3eea28e91d5e</serial>
+      <alias name='ua-ead4a529-6b93-4f6e-8a92-3eea28e91d5e'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source startupPolicy='optional'/>
@@ -1318,14 +1198,14 @@ class DeviceMetadataMatchTests(XMLTestCase):
             'TESTING', self.dom_desc, self.md_desc, self.log
         )
         nic = self._find_nic_by_mac(dev_objs, '00:1a:4a:16:01:51')
-        self.assertEqual(nic.network, 'INVALID0')
+        assert nic.network == 'INVALID0'
 
     def test_match_interface_by_mac_only_succeeds(self):
         dev_objs = vmdevices.common.dev_map_from_domain_xml(
             'TESTING', self.dom_desc, self.md_desc, self.log
         )
         nic = self._find_nic_by_mac(dev_objs, '00:1a:3b:16:10:16')
-        self.assertEqual(nic.network, 'ovirtmgmt1')
+        assert nic.network == 'ovirtmgmt1'
 
     def test_match_interface_by_mac_and_alias_succeeds(self):
         # mac is enough, but we match extra arguments if given
@@ -1333,7 +1213,7 @@ class DeviceMetadataMatchTests(XMLTestCase):
             'TESTING', self.dom_desc, self.md_desc, self.log
         )
         nic = self._find_nic_by_mac(dev_objs, '00:1a:55:ff:20:26')
-        self.assertEqual(nic.network, 'ovirtmgmt2')
+        assert nic.network == 'ovirtmgmt2'
 
     def test_port_mirroring(self):
         dev_objs = vmdevices.common.dev_map_from_domain_xml(
@@ -1341,19 +1221,19 @@ class DeviceMetadataMatchTests(XMLTestCase):
         )
         # random MAC, any nic with portMirroring configured is fine
         nic1 = self._find_nic_by_mac(dev_objs, '00:1a:55:ff:20:26')
-        self.assertEqual(nic1.portMirroring, [])
+        assert nic1.portMirroring == []
 
         nic2 = self._find_nic_by_mac(dev_objs, '00:1a:4a:16:01:00')
-        self.assertEqual(nic2.portMirroring, ['network1', 'network2'])
+        assert nic2.portMirroring == ['network1', 'network2']
 
     def test_attributes_present(self):
         dev_objs = vmdevices.common.dev_map_from_domain_xml(
             'TESTING', self.dom_desc, self.md_desc, self.log
         )
         nic = self._find_nic_by_mac(dev_objs, '00:1a:55:ff:30:36')
-        self.assertEqual(nic.filterParameters, [])
-        self.assertEqual(nic.portMirroring, [])
-        self.assertEqual(nic.vm_custom, {})
+        assert nic.filterParameters == []
+        assert nic.portMirroring == []
+        assert nic.vm_custom == {}
 
     def _find_nic_by_mac(self, dev_objs, mac_addr):
         for nic in dev_objs[vmdevices.hwclass.NIC]:
@@ -1374,6 +1254,46 @@ class DeviceMetadataMatchTests(XMLTestCase):
         rbd_drive = lookup.drive_by_name(disk_objs, 'sda')
 
         assert getattr(rbd_drive, 'RBD') == '/dev/rbd/pool/volume-uuid'
+
+    def test_managed_device_parameter_present(self):
+        drives = vmdevices.common.storage_device_params_from_domain_xml(
+            'TESTING', self.dom_desc, self.md_desc, self.log
+        )
+
+        disk_objs = [
+            vmdevices.storage.Drive(self.log, **params)
+            for params in drives
+        ]
+
+        drive = lookup.drive_by_name(disk_objs, 'sdb')
+
+        assert drive.managed
+
+    def test_no_managed_device_parameter(self):
+        drives = vmdevices.common.storage_device_params_from_domain_xml(
+            'TESTING', self.dom_desc, self.md_desc, self.log
+        )
+
+        disk_objs = [
+            vmdevices.storage.Drive(self.log, **params)
+            for params in drives
+        ]
+
+        drive = lookup.drive_by_name(disk_objs, 'sdc')
+        assert not drive.managed
+
+    def test_not_managed_device_parameter(self):
+        drives = vmdevices.common.storage_device_params_from_domain_xml(
+            'TESTING', self.dom_desc, self.md_desc, self.log
+        )
+
+        disk_objs = [
+            vmdevices.storage.Drive(self.log, **params)
+            for params in drives
+        ]
+
+        drive = lookup.drive_by_name(disk_objs, 'sdd')
+        assert not drive.managed
 
 
 _VM_MDEV_XML = """<?xml version='1.0' encoding='utf-8'?>
@@ -1399,83 +1319,6 @@ _VM_MDEV_XML = """<?xml version='1.0' encoding='utf-8'?>
   </metadata>
 </domain>
 """
-
-_VM_METADATA_MDEV_XML = """<?xml version='1.0' encoding='utf-8'?>
-<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
-        xmlns:ovirt-vm="http://ovirt.org/vm/1.0" type="kvm">
-  <name>vm</name>
-  <uuid>6a28e9f6-6627-49b8-8c24-741ab810ecc0</uuid>
-  <devices/>
-  <metadata>
-    <ovirt-vm:vm>
-      <clusterVersion>4.2</clusterVersion>
-      <ovirt-vm:custom>
-        <ovirt-vm:mdev_type>graphics-card-1</ovirt-vm:mdev_type>
-      </ovirt-vm:custom>
-    </ovirt-vm:vm>
-  </metadata>
-</domain>
-"""
-
-_VM_NO_MDEV_XML = """<?xml version='1.0' encoding='utf-8'?>
-<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
-        xmlns:ovirt-vm="http://ovirt.org/vm/1.0" type="kvm">
-  <name>vm</name>
-  <uuid>6a28e9f6-6627-49b8-8c24-741ab810ecc0</uuid>
-  <devices/>
-  <metadata>
-    <ovirt-vm:vm>
-      <clusterVersion>4.2</clusterVersion>
-    </ovirt-vm:vm>
-  </metadata>
-</domain>
-"""
-
-_MDEV_CUSTOM = {'mdev_type': 'graphics-card-1'}
-
-_MDEV_XML_WITH_ALIAS = '''<devices>
-  <hostdev mode="subsystem" model="vfio-pci" type="mdev">
-    <source>
-      <address uuid="c1f343ae-99a5-4d82-9d5c-203cd4b7dac0"/>
-    </source>
-    <alias name="hostdev0"/>
-  </hostdev>
-</devices>
-'''
-
-
-@expandPermutations
-class MdevTests(XMLTestCase):
-
-    @permutations([
-        # placement_string, placement
-        ['', hostdev.MdevPlacement.COMPACT],
-        ['|compact', hostdev.MdevPlacement.COMPACT],
-        ['|separate', hostdev.MdevPlacement.SEPARATE],
-    ])
-    def test_mdev_creation(self, placement_string, placement):
-        params = {'xml': _VM_MDEV_XML % {'placement': placement_string}}
-        with vmfakelib.VM(params=params, create_device_objects=True) as vm:
-            self.assertNotRaises(vm._buildDomainXML)
-            self._check_mdev_device(vm, 'c1f343ae-99a5-4d82-9d5c-203cd4b7dac0',
-                                    placement)
-
-    def test_update_from_xml(self):
-        params = {'xml': _VM_MDEV_XML % {'placement': ''}}
-        dom = ET.fromstring(_MDEV_XML_WITH_ALIAS)
-        with vmfakelib.VM(params=params, create_device_objects=True) as vm:
-            mdev = self._mdev_device(vm)
-            vmdevices.hostdevice.MdevDevice.update_from_xml(vm, [mdev], dom)
-            self.assertEqual(mdev.alias, 'hostdev0')
-
-    def _check_mdev_device(self, vm, mdev_uuid, placement):
-        mdev = self._mdev_device(vm)
-        self.assertEqual(mdev.mdev_type, 'graphics-card-1')
-        self.assertEqual(mdev.mdev_uuid, mdev_uuid)
-        self.assertEqual(mdev.mdev_placement, placement)
-
-    def _mdev_device(self, vm):
-        return vm._devices[hwclass.HOSTDEV][0]
 
 
 class FakeLibvirtConnection(object):

@@ -39,7 +39,6 @@ import six
 
 from vdsm.common import cmdutils
 from vdsm.common.units import MiB
-from vdsm.storage import blockSD
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import qemuimg
@@ -69,7 +68,7 @@ def _v3_reset_meta_volsize(vol):
     if vol.getFormat() == sc.COW_FORMAT:
         qemuVolInfo = qemuimg.info(vol.getVolumePath(),
                                    qemuimg.FORMAT.QCOW2)
-        virtual_vol_size = qemuVolInfo["virtualsize"]
+        virtual_vol_size = qemuVolInfo["virtual-size"]
     else:
         virtual_vol_size = vol.getVolumeSize()
 
@@ -120,7 +119,7 @@ def v3DomainConverter(repoPath, hostId, domain, isMsd):
             return
 
         leasesSize = domain.getLeasesFileSize() // MiB
-        metaMaxSlot = leasesSize - blockSD.RESERVED_LEASES - 1
+        metaMaxSlot = leasesSize - sd.RESERVED_LEASES - 1
 
         log.debug("Starting metadata reallocation check for domain %s with "
                   "metaMaxSlot %s (leases volume size %s)", domain.sdUUID,
@@ -245,7 +244,7 @@ def v3DomainConverter(repoPath, hostId, domain, isMsd):
                           "volume chain looks damaged", imgUUID,
                           exc_info=True)
 
-            except se.MetaDataKeyNotFoundError:
+            except se.InvalidMetadata:
                 log.error("It is not possible to prepare the image %s, the "
                           "volume metadata looks damaged", imgUUID,
                           exc_info=True)

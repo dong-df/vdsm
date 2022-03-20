@@ -84,9 +84,12 @@ class TestTerminating(TestCaseBase):
         self.proc_wait = self.proc.wait
 
     def tearDown(self):
-        if self.proc_poll() is None:
-            self.proc_kill()
-            self.proc_wait()
+        self.proc.poll = self.proc_poll
+        self.proc.kill = self.proc_kill
+        self.proc.wait = self.proc_wait
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
 
     def test_process_running(self):
         with commands.terminating(self.proc):
@@ -503,6 +506,7 @@ class TestRollbackContext(TestCaseBase):
 class TestExecCmdAffinity(TestCaseBase):
 
     CPU_SET = frozenset([0])
+    ONLINE_CPUS = online_cpus()
 
     @forked
     @MonkeyPatch(cmdutils, '_USING_CPU_AFFINITY', False)
@@ -522,7 +526,7 @@ class TestExecCmdAffinity(TestCaseBase):
 
         proc = commands.start((EXT_SLEEP, '30s'))
         try:
-            self.assertEqual(taskset.get(proc.pid), online_cpus())
+            self.assertEqual(taskset.get(proc.pid), self.ONLINE_CPUS)
         finally:
             proc.kill()
 

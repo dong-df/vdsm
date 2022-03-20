@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2019 Red Hat, Inc.
+# Copyright 2014-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,6 +21,10 @@
 from __future__ import absolute_import
 from __future__ import division
 import logging
+import os
+import random
+import string
+import subprocess
 import sys
 import time
 
@@ -34,12 +38,23 @@ shared utilities and common code for the virt package
 import os.path
 import threading
 
-from vdsm.common import supervdsm
+from collections import namedtuple
+
+from vdsm.common import cmdutils, supervdsm
+from vdsm.common.commands import start, terminating
 from vdsm.common.fileutils import rm_file
 from vdsm.common.time import monotonic_time
+from vdsm.config import config
+from vdsm.constants import P_VDSM_LOG
 
+
+_COMMANDS_LOG_DIR = os.path.join(P_VDSM_LOG, 'commands')
 
 log = logging.getLogger('virt.utils')
+
+
+VolumeSize = namedtuple("VolumeSize",
+                        ["apparentsize", "truesize"])
 
 
 def isVdsmImage(drive):
@@ -132,6 +147,8 @@ class ExpiringCache(object):
 
 
 def cleanup_guest_socket(sock):
+    if sock is None:
+        return
     if os.path.islink(sock):
         rm_file(os.path.realpath(sock))
     rm_file(sock)
@@ -329,3 +346,115 @@ def sasl_enabled():
     for VNC console.
     """
     return supervdsm.getProxy().check_qemu_conf_contains('vnc_sasl', '1')
+
+
+class LoggingError(cmdutils.Error):
+    msg = ('Command {self.cmd} failed with rc={self.rc} log={self.log_path!r}')
+
+    def __init__(self, cmd, rc, log_path):
+        super().__init__(cmd, rc, None, None)
+        self.log_path = log_path
+
+
+def run_logging(args, log_tag=None):
+    """
+    Start a command storing its stdout/stderr into a file, communicate with it,
+    and wait until the command terminates. Ensures that the command is killed
+    if an unexpected error is raised. Note that since the stdout/stderr is
+    redirected to the file it is not piped to VDSM.
+
+    args are logged when command starts, and are included in the exception if a
+    command has failed. If args contain sensitive information that should not
+    be logged, such as passwords, they must be wrapped with ProtectedPassword.
+    While access to the directory with log files is restricted caution should
+    be taken when logging commands. Avoid storing output of commands that may
+    leak passwords or other sensitive information.
+
+    The child process stdout and stderr are always buffered. If you have
+    special needs, such as running the command without buffering stdout, or
+    create a pipeline of several commands, use the lower level start()
+    function.
+
+    If log_tag is not used the log file name is
+    'virtcmd-<command>-<datetime>-<random_string>.log'. If
+    log_tag is used the format is
+    'virtcmd-<command>-<log_tag>-<datetime>-<random_string>.log'.
+
+    The granularity of <datetime> part of the file name is one second. To
+    minimize file collision there is a random string of characters appended to
+    the name.
+
+    Arguments:
+        args (list): Command arguments
+        log_tag (str): Optional string to be included in log file name to
+            better distinguish the log files and avoid potential name
+            collisions. This could be for example VM ID.
+
+    Returns:
+        Path to the log file.
+
+    Raises:
+        LoggingError if the command terminated with a non-zero exit code.
+        TerminatingFailure if command could not be terminated.
+    """
+    stdout = subprocess.DEVNULL
+    stderr = subprocess.DEVNULL
+    cmd_log_file = None
+
+    timestamp = time.strftime('%Y%m%dT%H%M%S')
+    command = os.path.basename(str(args[0]))
+    log_tag = '' if log_tag is None else '-%s' % log_tag
+    suffix = ''.join(random.choice(string.ascii_lowercase) for _ in range(4))
+    cmd_log_path = os.path.join(
+        _COMMANDS_LOG_DIR, 'virtcmd-%s%s-%s-%s.log' % (
+            command, log_tag, timestamp, suffix))
+    try:
+        os.makedirs(_COMMANDS_LOG_DIR, mode=0o750, exist_ok=True)
+        cmd_log_file = os.open(
+            cmd_log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode=0o640)
+    except OSError:
+        log.exception('Failed to open log file')
+        cmd_log_path = None
+    else:
+        stdout = cmd_log_file
+        stderr = cmd_log_file
+        log.debug('Running command %r with logs in %s', args, cmd_log_path)
+
+    p = start(args,
+              stdin=subprocess.PIPE,
+              stdout=stdout,
+              stderr=stderr)
+
+    with terminating(p):
+        p.communicate()
+
+    log.debug(cmdutils.retcode_log_line(p.returncode))
+
+    if cmd_log_file is not None:
+        os.close(cmd_log_file)
+    if p.returncode != 0:
+        raise LoggingError(args, p.returncode, cmd_log_path)
+
+    return cmd_log_path
+
+
+class LibguestfsCommand(object):
+    def __init__(self, path):
+        self._args = [path, '-v', '-x']
+
+    def run(self, args_, log_tag=None):
+        args = self._args + args_
+        run_logging(args, log_tag=log_tag)
+
+
+def vm_kill_paused_timeout():
+    """
+    Return a safe timeout in seconds for killing paused VMs.
+
+    The value determines how many seconds to wait before killing VMs with
+    ResumeBehavior.KILL paused due to an I/O error. The value is equal to
+    sanlock kill interval. Note that setting sanlock I/O timeout to too
+    high values may have unexpected consequences and it may also require using
+    longer, non-default, timeouts in Engine.
+    """
+    return 8 * config.getint('sanlock', 'io_timeout')

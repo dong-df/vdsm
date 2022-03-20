@@ -39,6 +39,16 @@ types:
             description: The amount of memory requested (in KiB)
             name: balloon_target
             type: string
+
+        -   defaultvalue: true
+            description: Flag indicating whether ballooning is enabled or
+                disabled for the VM. Even though we want to prevent certain VMs
+                from ballooning the memory, we still want to keep the balloon
+                device in such VMs because that's how we get memory statistics
+                from the guest.
+            name: ballooning_enabled
+            type: boolean
+            added: '4.4.6'
         type: object
 
     BandwidthCurve: &BandwidthCurve
@@ -122,6 +132,15 @@ types:
         values:
             active: The path is active
             failed: The path has failed
+
+    DiskBackupMode: &DiskBackupMode
+        added: '4.4.3'
+        description: Enumeration of possible backup modes for a disk.
+        name: DiskBackupMode
+        type: enum
+        values:
+            full: Full backup should be taken for the disk
+            incremental: Incremental backup should be taken for the disk
 
     BlockDevicePathInfo: &BlockDevicePathInfo
         added: '3.1'
@@ -503,11 +522,11 @@ types:
         type: map
         value-type: *CpuCoreStats
 
-    DiskType: &DiskType
+    DiskContentType: &DiskContentType
         added: '3.1'
-        modified: '4.3'
+        modified: '4.4.5'
         description: Disk content type.
-        name: DiskType
+        name: DiskContentType
         type: enum
         values:
             DATA: This volume is for data (>=4.2)
@@ -555,66 +574,6 @@ types:
         values:
             COW: The Volume uses the Qemu Qcow image format
             RAW: The Volume writes raw data directly to the backing image
-
-    ParentVolumeInfo: &ParentVolumeInfo
-        added: '4.0'
-        description: A reference to a parent volume.
-        name: ParentVolumeInfo
-        properties:
-        -   description: ''
-            name: img_id
-            type: *UUID
-
-        -   description: ''
-            name: vol_id
-            type: *UUID
-        type: object
-
-    CreateVolumeInfo: &CreateVolumeInfo
-        added: '4.0'
-        description: Parameters used for creating a new volume.
-        name: CreateVolumeInfo
-        properties:
-        -   description: The Storage Domain associated with the Volume
-            name: sd_id
-            type: *UUID
-
-        -   defaultvalue: needs updating
-            description: If specified, the initial allocated size of volume in
-                bytes.  Allowed only when creating a thinly provisioned volume
-                on block storage.
-            name: initial_size
-            type: uint
-
-        -   description: The Volume size in bytes
-            name: virtual_size
-            type: uint
-
-        -   description: The Image associated with the Volume
-            name: img_id
-            type: *UUID
-
-        -   description: The data format to use for the destination Volume
-            name: vol_format
-            type: *VolumeFormat
-
-        -   description: The UUID of the Volume
-            name: vol_id
-            type: *UUID
-
-        -   description: The Volume description (up to 210 bytes)
-            name: description
-            type: string
-
-        -   description: An advisory disk usage type
-            name: disk_type
-            type: *DiskType
-
-        -   defaultvalue: needs updating
-            description: Derive from the indicated parent Volume
-            name: parent
-            type: *ParentVolumeInfo
-        type: object
 
     DeviceVisibilityMap: &DeviceVisibilityMap
         added: '3.1'
@@ -758,19 +717,12 @@ types:
             type: *UUID
         type: object
 
-    LegacyCdromPath: &LegacyCdromPath
-        added: '3.1'
-        deprecated: '4.0'
-        description: Cdrom specification that only supplies path to an image.
-            Should not be used at all.
-        name: LegacyCdromPath
-        sourcetype: string
-        type: alias
-
-    DriveSpecCdrom: &DriveSpecCdrom
+    DriveSpecPathCdrom: &DriveSpecPathCdrom
         added: '4.0'
+        deprecated: '4.4.5'
         description: A cdrom specification that allows directly indexing the
-            cdrom.
+            cdrom. Kept for backward compatibility with older engines.
+            Shouldn't be used. DriveSpecVolumeCdrom should be used instead.
         name: DriveSpecCdrom
         type: object
         properties:
@@ -786,6 +738,38 @@ types:
             name: index
             type: int
 
+    DriveSpecVolumeCdrom: &DriveSpecVolumeCdrom
+        added: '4.4.5'
+        description: A cdrom specification that allows directly indexing
+            the cdrom. CD is specified by PDIV. In the new code all
+            images should be specified this way.
+        name: DriveSpecCdrom
+        type: object
+        properties:
+        - description: Image PDIV specification.
+          name: drive_spec
+          type: *DriveSpecVolume
+
+        - description: Bus that the cdrom resides on.
+          name: iface
+          type: string
+
+        - description: Index on the iface used.
+          name: index
+          type: int
+
+    DriveSpecCdrom: &DriveSpecCdrom
+        added: '4.4.5'
+        description: A cdrom specification that allows directly indexing
+            the cdrom. DriveSpecPathCdrom is kept for backward
+            compatibility, current code should use only
+            DriveSpecVolumeCdrom.
+        name: DriveSpecCdrom
+        type: union
+        values:
+        - *DriveSpecPathCdrom
+        - *DriveSpecVolumeCdrom
+
     DriveSpec: &DriveSpec
         added: '3.1'
         description: A discriminated record containing a VM drive specification
@@ -796,7 +780,6 @@ types:
         - *DriveSpecGUID
         - *DriveSpecPayload
         - *DriveSpecPath
-        - *LegacyCdromPath
         - *DriveSpecCdrom
 
     ErrorInfo: &ErrorInfo
@@ -1488,6 +1471,34 @@ types:
             type: int
         type: object
 
+    GuestPCIDevice: &GuestPCIDevice
+        added: '4.4'
+        description: Infomation about PCI device and driver in the guest
+        name: GuestPCIDevice
+        properties:
+        -   description: PCI Device ID
+            name: device_id
+            type: int
+
+        -   defaultvalue: null
+            description: Creation date of the driver assigned to device
+            name: driver_date
+            type: string
+
+        -   description: Name of the driver assigned to device
+            name: driver_name
+            type: string
+
+        -   defaultvalue: null
+            description: Version of the driver assigned to device
+            name: driver_version
+            type: string
+
+        -   description: PCI Vendor ID
+            name: vendor_id
+            type: int
+        type: object
+
     GuestSessionState: &GuestSessionState
         added: '3.1'
         description: An enumeration of user session states.
@@ -1771,9 +1782,44 @@ types:
             type: string
 
         -   defaultvalue: no-default
+            description: device block path
+            name: block_path
+            type: string
+
+        -   defaultvalue: no-default
             description: device address
             name: address
             type: *HostDeviceAddress
+
+        -   defaultvalue: no-default
+            description: Device path
+            name: device_path
+            type: string
+            added: '4.4'
+
+        -   defaultvalue: no-default
+            description: NUMA node of the device
+            name: numa_node
+            type: string
+            added: '4.4'
+
+        -   defaultvalue: no-default
+            description: Device mode
+            name: mode
+            type: string
+            added: '4.4'
+
+        -   defaultvalue: no-default
+            description: Device alignment in bytes
+            name: align_size
+            type: ulong
+            added: '4.4'
+
+        -   defaultvalue: no-default
+            description: Size of the device in bytes
+            name: device_size
+            type: ulong
+            added: '4.4'
         type: object
 
     HostDevice: &HostDevice
@@ -1999,6 +2045,27 @@ types:
           type: int
         type: object
 
+    NumaNodeHugePagesStats: &NumaNodeHugePagesStats
+        added: '4.4'
+        description: Statistics about the hugepages
+                of a given size for a numa node
+        name: NumaNodeHugePagesStats
+        properties:
+        -   description: The number of free hugepages
+                of a given size in a numa node
+            name: freePages
+            type: string
+        type: object
+
+    NumaNodeHugePagesStatsMap: &NumaNodeHugePagesStatsMap
+        added: '4.4'
+        description: A mapping of hugepages statistics
+                indexed by hugepages size in KiB
+        name: NumaNodeHugePageStatsMap
+        key-type: uint
+        type: map
+        value-type: *NumaNodeHugePagesStats
+
     NumaNodeMemoryStats: &NumaNodeMemoryStats
         added: '3.4'
         description: Statistics about the memory of a numa node.
@@ -2012,6 +2079,11 @@ types:
         -   description: The ratio of used memory
             name: memPercent
             type: uint
+
+        -   description: Hugepages statistics
+            added: '4.4'
+            name: hugepages
+            type: *NumaNodeHugePagesStatsMap
         type: object
 
     NumaNodeMemoryStatsMap: &NumaNodeMemoryStatsMap
@@ -2181,11 +2253,6 @@ types:
         description: Statistics about this host.
         name: HostStats
         properties:
-        -   description: Amount of memory available to run virtual machines (in
-                MB)
-            name: memAvailable
-            type: int
-
         -   description: Ratio of CPU time spent in userspace by vdsm
             name: cpuUserVdsmd
             type: string
@@ -2210,7 +2277,7 @@ types:
             name: ksmPages
             type: int
 
-        -   description: The percentage of memory used (not including caches)
+        -   description: The percentage of memory used
             name: memUsed
             type: string
             datatype: uint
@@ -2277,10 +2344,6 @@ types:
             name: cpuStatistics
             added: '3.4'
             type: *CpuCoreStatsMap
-
-        -   description: Amount of memory committed to running VMs (in MB)
-            name: memCommitted
-            type: int
 
         -   description: The amount of free swap space remaining (in MB)
             name: swapFree
@@ -2974,6 +3037,7 @@ types:
         type: enum
         values:
             e1000: Emulated Intel(R) Gigabit Ethernet NIC
+            e1000e: Emulated PCIe Intel(R) Gigabit Ethernet NIC
             i82551: Emulated Intel(R) 82551ER NIC
             i82557b: Emulated Intel i82557B NIC
             i82559er: Emulated Intel i82559ER NIC
@@ -3450,6 +3514,14 @@ types:
             type: int
             added: '4.0'
 
+        -   name: parallel
+            type: uint
+            defaultvalue: null
+            description: The number of parallel migration connections
+                to use. If unspecified or 0, parallel connections are not
+                used.
+            added: '4.5'
+
         -   description: The UUID of the virtual machine to migrate
             name: vmId
             type: *UUID
@@ -3524,6 +3596,15 @@ types:
             name: incomingLimit
             type: uint
             added: '4.0'
+
+        -   defaultvalue: null
+            description: A list of cpuset definitions (e.g. '1,3-5') for all
+                CPUs. Items of the list correspond to vCPUs and, if specified,
+                length of the list must match number of vCPUs.
+            name: cpusets
+            type:
+            -   string
+            added: '4.5'
 
         type: object
 
@@ -5084,6 +5165,27 @@ types:
         type: map
         value-type: *NetworkInterfaceStats
 
+    NumaNodeHugePages: &NumaNodeHugePages
+        added: '4.4'
+        description: Information about hugepages
+                of a given size for a numa node
+        name: NumaNodeHugePages
+        properties:
+        -   description: The number of hugepages
+                of a given size in a numa node
+            name: totalPages
+            type: string
+        type: object
+
+    NumaNodeHugePagesMap: &NumaNodeHugePagesMap
+        added: '4.4'
+        description: A mapping of hugepages information
+                indexed by hugepages size in KiB
+        name: NumaNodeHugePagesMap
+        key-type: uint
+        type: map
+        value-type: *NumaNodeHugePages
+
     NumaNode: &NumaNode
         added: '3.4'
         description: Information about a host numa cell
@@ -5100,6 +5202,10 @@ types:
             name: totalMemory
             type: string
             datatype: uint
+        -   description: Hugepages statistics
+            added: '4.4'
+            name: hugepages
+            type: *NumaNodeHugePagesMap
         type: object
 
     NumaNodeDistanceMap: &NumaNodeDistanceMap
@@ -5460,6 +5566,13 @@ types:
             datatype: uint
             added: '3.6'
 
+        -   description: Indicates whether all the CPU stats (cpuUser,
+                cpuSys, cpuUsage) are based on actual values rather
+                than initial fake values.
+            name: cpuActual
+            type: boolean
+            added: '4.5'
+
         -   description: Ratio of CPU time spent by the guest VM
             name: cpuUser
             type: string
@@ -5649,10 +5762,30 @@ types:
             name: hash
             type: string
             datatype: int
+            defaultvalue: no-default
+            modified: '4.4'
+
+        -   description:
+            name: tpmHash
+            type: string
+            defaultvalue: null
+            added: '4.4'
+
+        -   description:
+            name: nvramHash
+            type: string
+            defaultvalue: null
+            added: '4.4'
 
         -   description: The current VM status
             name: status
             type: *VmStatus
+
+        -   defaultvalue: null
+            description: List of PCI devices and their drivers
+            name: pci_devices
+            type:
+            - *GuestPCIDevice
         type: object
 
     SELinuxStatus: &SELinuxStatus
@@ -6961,6 +7094,32 @@ types:
             type: string
             added: '4.2'
 
+    CpuInfo: &CpuInfo
+        added: '4.4.8'
+        description: Information about single CPU/thread
+        name: CpuInfo
+        properties:
+        -   description: ID of the CPU on host
+            name: cpu_id
+            type: int
+
+        -   description: To which NUMA cell the CPU belongs
+            name: numa_cell_id
+            type: int
+
+        -   description: On which socket this CPU is
+            name: socket_id
+            type: int
+
+        -   description: On which die of the socket this CPU is
+            name: die_id
+            type: int
+
+        -   description: On which core of the die this CPU is
+            name: core_id
+            type: int
+        type: object
+
     VdsmCapabilities: &VdsmCapabilities
         added: '3.6'
         description: Host information and capabilities.
@@ -7003,6 +7162,12 @@ types:
             type: string
             added: '3.5'
 
+        -   description: Detailed CPU topology
+            name: cpuTopology
+            type:
+            - *CpuInfo
+            added: '4.4.8'
+
         -   description: The speed of each CPU (in MHz)
             name: cpuSpeed
             type: string
@@ -7011,6 +7176,11 @@ types:
         -   description: VDSM version (x.y.z)
             name: software_version
             type: string
+
+        -   description: CPU affinity of the VDSM process
+            name: vdsmToCpusAffinity
+            type:
+            - int
 
         -   description: A list of supported virtual machine types
             name: vmTypes
@@ -7256,6 +7426,18 @@ types:
             name: tscScaling
             type: boolean
             added: '4.4'
+
+        -   defaultvalue: null
+            description: Boot partition UUID
+            name: boot_uuid
+            type: string
+            added: '4.4'
+
+        -   defaultvalue: false
+            description: Indicates if the host has OVN configured
+            name: ovnConfigured
+            type: boolean
+            added: '4.5'
 
         type: object
 
@@ -7524,6 +7706,18 @@ types:
             name: xml
             type: string
 
+        -   added: '4.4'
+            defaultvalue: null
+            description: TPM data of the VM
+            name: _X_tpmdata
+            type: string
+
+        -   added: '4.4'
+            defaultvalue: null
+            description: NVRAM data of the VM
+            name: _X_nvramdata
+            type: string
+
         type: object
 
     VmStats: &VmStats
@@ -7787,7 +7981,7 @@ types:
         properties:
         -   description: An advisory code indicating the Volume's planned usage
             name: disktype
-            type: *DiskType
+            type: *DiskContentType
 
         -   description: Indicates whether the Volume and metadata are valid
             name: status
@@ -7994,6 +8188,13 @@ types:
         -   description: The desired connection password
             name: password
             type: string
+
+        -   description: If Console Disconnect Action is set to Shutdown, this
+                parameter sets the length of the delay before vm shutdown is
+                initiated, in minutes.
+            name: consoleDisconnectActionDelay
+            type: uint
+            added: '4.5'
         type: object
 
     vmUpdateXMLDeviceParams: &vmUpdateXMLDeviceParams
@@ -8029,6 +8230,8 @@ types:
         type: enum
         values:
             div: A vdsm volume identified by domain, image, and volume UUIDs
+            external: An endpoint that is not managed by vdsm, represented as
+                      a url.
 
     CopyDataDIVEndpoint: &CopyDataDIVEndpoint
         added: '4.1'
@@ -8053,6 +8256,47 @@ types:
             defaultvalue: null
         type: object
 
+    CopyDataExternalEndpoint: &CopyDataExternalEndpoint
+        added: '4.4.6'
+        description: An endpoint describing an external path to copy.
+        name: CopyDataExternalEndpoint
+        properties:
+        -   description: The expected url of the image, like rbd:pool/vol
+                See https://qemu.readthedocs.io/en/latest/system/images.html
+            name: url
+            type: string
+
+        -   description: The lease to be used for job tracking.
+            name: lease
+            type: *Lease
+
+        -   description: The expected generation of the lease.
+            name: generation
+            type: uint
+
+        -   description: Format of the target image. Only officially supported
+                formats are raw and qcow2.
+            name: format
+            type: string
+
+        -   defaultvalue: False
+            description: True if the image is sparse, False if preallocated.
+            name: sprase
+            type: boolean
+
+        -   defaultvalue: True
+            description: True if the image needs to be created.
+                In cases where the image is not created and the format is
+                qcow2, the caller has to create qcow2 image.
+            name: create
+            type: boolean
+
+        -   description: False if the target should be zeroed, True if it is
+                already zeroed. Can only be used with create=False.
+            name: is_zero
+            type: boolean
+        type: object
+
     CopyDataEndpoint: &CopyDataEndpoint
         added: '4.1'
         description: A discriminated record containing an endpoint for a
@@ -8062,6 +8306,13 @@ types:
         -   description: The specific type of endpoint.
             name: endpoint_type
             type: *CopyDataEndpointType
+
+        -   defaultvalue: false
+            description: A flag indicating whether the volume is already
+                prepared on the host.
+            name: prepared
+            type: boolean
+            added: '4.4'
         type: union
         values:
         - *CopyDataDIVEndpoint
@@ -8181,6 +8432,130 @@ types:
             type: *UUID
         type: object
 
+    DiskType: &DiskType
+        added: '4.4.5'
+        description: Disk type.
+        name: DiskType
+        type: enum
+        values:
+            FILE: This volume is based on file storage domain
+            BLOCK: This volume is based on block storage domain
+
+    FileScratchDisk: &FileScratchDisk
+        added: '4.4.5'
+        description: VM backup file-based scratch disk parameters
+            for usage when starting a backup.
+        name: FileScratchDisk
+        properties:
+        -   description: The path to the prepared scratch disk
+            name: path
+            type: string
+
+        -   description: Indicates the type of the storage domain that the
+                volume resides on ('file').
+            name: type
+            type: *DiskType
+
+        -   description: The UUID of the Storage Domain containing the Volume
+            name: domainID
+            type: *UUID
+            added: '4.5'
+
+        -   description: The UUID of the Image
+            name: imageID
+            type: *UUID
+            added: '4.5'
+
+        -   description: The UUID of the Volume
+            name: volumeID
+            type: *UUID
+            added: '4.5'
+        type: object
+
+    BlockScratchDisk: &BlockScratchDisk
+        added: '4.4.5'
+        description: VM backup block-based scratch disk parameters
+            for usage when starting a backup.
+        name: BlockScratchDisk
+        properties:
+        -   description: The path to the prepared scratch disk
+            name: path
+            type: string
+
+        -   description: Indicates the type of the storage domain that the
+                volume resides on ('block').
+            name: type
+            type: *DiskType
+
+        -   description: The UUID of the Storage Domain containing the Volume
+            name: domainID
+            type: *UUID
+            added: '4.5'
+
+        -   description: The UUID of the Image
+            name: imageID
+            type: *UUID
+            added: '4.5'
+
+        -   description: The UUID of the Volume
+            name: volumeID
+            type: *UUID
+            added: '4.5'
+        type: object
+
+    ScratchDisk: &ScratchDisk
+        added: '4.4.5'
+        description: A discriminated record containing
+            a scratch disk specification.
+        name: ScratchDisk
+        type: union
+        values:
+        - *FileScratchDisk
+        - *BlockScratchDisk
+
+    BackupDisk: &BackupDisk
+        added: '4.4'
+        description: Backup disk descriptor.
+        name: BackupDisk
+        properties:
+        -   description: The UUID of the storage domain
+            name: sd_id
+            type: *UUID
+
+        -   description: The UUID of the image
+            name: img_id
+            type: *UUID
+
+        -   description: The UUID of the volume
+            name: vol_id
+            type: *UUID
+
+        -   description: Should the disk be included in a checkpoint
+            name: checkpoint
+            type: boolean
+
+        -   defaultvalue: null
+            description: If specified during an incremental backup,
+                it allows full backup for disks that cannot be used
+                in the incremental backup. If not specified, all disks
+                included in the incremental backup will be prepared
+                for an incremental backup. If one of the disks cannot
+                be prepared for an incremental backup the entire
+                request will fail.
+                Using "incremental" when full backup requested
+                (from_checkpoint_id == None) is not supported.
+            name: backup_mode
+            type: *DiskBackupMode
+
+        -   defaultvalue: null
+            description: Information on the scratch disk created
+                by the engine for the backup disk, if this is not
+                specified a temporary scratch disk will be created
+                on the host storage.
+            name: scratch_disk
+            type: *ScratchDisk
+        type: object
+
     NBDServerConfig: &NBDServerConfig
         added: '4.3'
         description: NBD server configuration.
@@ -8205,28 +8580,32 @@ types:
 
         -   defaultvalue: false
             description: Pass discard requests to underlying filesystem. By
-                default discard requests are ignored.
+                default discard requests are ignored. Recommended when
+                uploading to sparse volume.
             name: discard
             type: boolean
 
-    Checkpoint: &Checkpoint
-        added: '4.3'
-        description: Configuration of the checkpoint
-        name: Checkpoint
-        properties:
-            -   description: UUID of the checkpoint
-                name: id
-                type: *UUID
+        -   defaultvalue: false
+            description: Try to keep the volume sparse by converting zeroes in
+              write commands to optimized write zeroes commands. If discard is
+              enabled, zeroes writes deallocate space. By default zeroes are
+              not detected. Recommended when uploading to a sparse volume.
+            name: detect_zeroes
+            type: boolean
+            added: '4.5'
 
-            -   description: List of disks to be backed up
-                name: disks
-                type:
-                - *VolumeInfo
+        -   defaultvalue: true
+            description: If true, expose the backing chain of volume using
+                qcow2 format. If false, expose only the specified volume.
+            name: backing_chain
+            type: boolean
 
-            -   descripton: Timestamp when checkpoint was created
-                name: created
-                type: uint
-        type: object
+        -   defaultvalue: null
+            description: If set, the NBD server exports the specified dirty
+              bitmap. NBD client can use the dirty bitmap to download changed
+              blocks when a VM is powered off.
+            name: bitmap
+            type: *UUID
 
     BackupInfo: &BackupInfo
         added: '4.3'
@@ -8237,6 +8616,12 @@ types:
                     (imageId -> "nbd:unix:/path:exportname=sdx")
                 name: disks
                 type: *StringMap
+
+            -   description: Checkpoint XML description returned from libvirt.
+                             This XML can be used to redefine the
+                             checkpoint later.
+                name: checkpoint
+                type: string
         type: object
 
     BackupConfig: &BackupConfig
@@ -8254,7 +8639,7 @@ types:
                 created on all the disks.
             name: disks
             type:
-            - *VolumeInfo
+            - *BackupDisk
 
         -   defaultvalue: null
             description: If specified, perform incremental backup
@@ -8271,6 +8656,412 @@ types:
                 this checkpoint.
             name: to_checkpoint_id
             type: *UUID
+
+        -   defaultvalue: null
+            description: Not used since 4.4.6.
+                In older versions, this was used to create
+                a checkpoint with a parent checkpoint to
+                keep the checkpoints chained.
+            name: parent_checkpoint_id
+            type: *UUID
+
+        -   defaultvalue: false
+            description: Boolean value set to true if the backup
+              should fail if the VM failed to freeze in order to prevent
+              an option of inconsistent data in the backup.
+            name: require_consistency
+            type: boolean
+
+        -   defaultvalue: null
+            description: Long value to indicate the time since
+                epoch for the backup creation date.
+            name: creation_time
+            type: ulong
+
+    CheckpointInfo: &CheckpointInfo
+        added: '4.4'
+        description: A checkpoint info entity.
+        name: CheckpointInfo
+        properties:
+            -   description: The XML description of the given checkpoint
+                name: checkpoint
+                type: string
+
+    Checkpoint: &Checkpoint
+        added: '4.3'
+        description: Configuration of the checkpoint, can be the checkpoint XML
+            or the backup configuration to compose the checkpoint XML from it.
+        name: Checkpoint
+        properties:
+            -   description: UUID of the checkpoint
+                name: id
+                type: *UUID
+
+            -   defaultvalue: null
+                description: Checkpoint XML description returned from libvirt.
+                name: xml
+                type: string
+
+            -   defaultvalue: null
+                description: The backup configuration
+                name: config
+                type: *BackupConfig
+
+        type: object
+
+    CheckpointsResponse: &CheckpointsResponse
+        added: '4.4'
+        description: Checkpoints operation response.
+        name: CheckpointsResponse
+        properties:
+        -   description: List of checkpoint UUIDs that were
+                     successfully performed by the operation.
+            name: checkpoint_ids
+            type: *UUID
+
+        -   defaultvalue: null
+            description: Optional error if operation failed.
+            name: error
+            type:
+            - *ErrorInfo
+
+    JobStatus: &JobStatus
+        added: '4.4.6'
+        description: The status of the job stored on a lease's metadata
+        name: JobStatus
+        type: enum
+        values:
+            PENDING: Job was created on engine, but was not started yet.
+            FAILED: Job has failed to run and the host reported the failure.
+            SUCCEEDED: Job completed successfully.
+            FENCED: Job was fenced by another host.
+
+    LeaseMetadataType: &LeaseMetadataType
+        added: '4.4.6'
+        description: The type of metadata stored on the lease
+        name: LeaseMetadataType
+        type: enum
+        values:
+          JOB: The metadata will be used to store job related information.
+
+    JobMetadata: &JobMetadata
+        added: '4.4.6'
+        description: Job attributes to be set on a Lease's metadata (LVB)
+        name: JobMetadata
+        properties:
+        -   description: The type of metadata (always JOB).
+            name: type
+            type: *LeaseMetadataType
+
+        -   description: The status of the job.
+            name: job_status
+            type: *JobStatus
+
+        -   description: The generation of the job. Will be used to
+                         determine whether the job succeeded or needs to
+                         be fenced. The generation will be increased by the
+                         host running the job when it successfully completes
+                         the job. It will be increased by another host when it
+                         is determine that the host originally running the job
+                         is no longer running it (no longer holds the lease).
+            name: generation
+            type: uint
+
+        -   description: The ID of the submitted job.
+            name: job_id
+            type: *UUID
+
+        -   defaultvalue: null
+            description: Time of metadata creation.
+            name: created
+            type: uint
+
+        -   defaultvalue: null
+            description: Time of metadata modification.
+            name: modified
+            type: uint
+
+        -   defaultvalue: null
+            description: Hardware ID of the host that changed the metadata
+            name: host_hardware_id
+            type: *UUID
+        type: object
+
+    LeaseMetadata: &LeaseMetadata
+        added: '4.4.6'
+        description: Type of lease metadata, this will be used to provide
+            context about what values are stored on lease's metadata.
+        name: LeaseMetadata
+        type: union
+        values:
+        - *JobMetadata
+
+    ExternalLeaseStatus: &ExternalLeaseStatus
+        added: '4.4.6'
+        description: The status of an external lease
+        name: ExternalLeaseStatus
+        properties:
+        -   description: The host ids of the hosts owning this lease. If
+                empty, the lease is free; otherwise the lease is acquired.
+                If a lease is exclusive, contains the host id of the
+                single host owning this lease.
+            name: owners
+            type: uint
+
+        -   description: A monotonically increasing unsigned 64 bit
+                integer, incremented each time a lease is acquired
+                successfully.
+            name: version
+            type: uint
+
+        -   defaultvalue: null
+            description: The lease metadata read from lease's LVB.
+            name: metadata
+            type: *LeaseMetadata
+
+        type: object
+
+    VolumeMeasureResult: &VolumeMeasureResult
+        added: '4.4'
+        description: 'Volume size measured by qemu-img measure'
+        name: VolumeMeasureResult
+        properties:
+        -   description: The required size of the volume measured by qemu-img
+            name: required
+            type: int
+        type: object
+
+    VolumeDump: &VolumeDump
+        added: '4.4'
+        description: Volume raw metadata.
+        name: VolumeDump
+        properties:
+        -   defaultvalue: null
+            description: Advisory code indicating the Volume's planned usage.
+                         Available if volume metadata is valid.
+            name: disktype
+            type: *DiskContentType
+
+        -   description: Indicates whether the Volume and metadata are valid.
+            name: status
+            type: *VolumeStatus
+
+        -   defaultvalue: null
+            description: The size of the Volume in bytes. Available if volume
+                         metadata is valid.
+            name: capacity
+            type: uint
+
+        -   defaultvalue: null
+            description: The direct ancestor of this Volume if it exists.
+                         Available if volume metadata is valid or LV has
+                         a parent UUID tag, in case of a volume in a FC
+                         or an ISCSI storage domain.
+            name: parent
+            type: *UUID
+
+        -   defaultvalue: null
+            description: A human-readable description of the Volume.
+                         Available if volume metadata is valid
+            name: description
+            type: string
+
+        -   defaultvalue: null
+            description: Indicates whether the volume is legal to use.
+                         Available if volume metadata is valid.
+            name: legality
+            type: *VolumeLegality
+
+        -   defaultvalue: null
+            description: The Volume creation time in seconds since the epoch.
+                         Available if volume metadata is valid.
+            name: ctime
+            type: int
+
+        -   defaultvalue: null
+            description: The format used to write data to the Volume.
+                         Available if volume metadata is valid.
+            name: format
+            type: *VolumeFormat
+
+        -   description: The Image associated with the Volume.
+            name: image
+            type: *UUID
+
+        -   defaultvalue: null
+            description: The Volume allocation type (sparse, preallocated).
+                         Available if volume metadata is valid.
+            name: type
+            type: *VolumeAllocation
+
+        -   defaultvalue: null
+            description: The metadata slot index, available only for a volume
+                         on ISCSI or FC storage domain. Available if volume
+                         has a metadata slot LV tag.
+            name: mdslot
+            type: uint
+
+        -   defaultvalue: null
+            description: A monotonically increasing number, incremented each
+                         time a volume operation is completed successfully.
+                         The maximum value is 999 and the next increment will
+                         reset the value to 0. Available if volume metadata
+                         is valid.
+            name: generation
+            type: uint
+
+        -   defaultvalue: null
+            description: The Volume role. Available if volume metadata is
+                         valid.
+            name: voltype
+            type: *VolumeRole
+
+        -   description: The amount of underlying storage allocated in bytes.
+                         Available of volume is accessible.
+            name: truesize
+            type: uint
+
+        -   description: The size of the disk in bytes. Availbale if volume
+                         is accessible.
+            name: apparentsize
+            type: uint
+        type: object
+
+    VolumesDumpMap: &VolumesDumpMap
+        added: '4.4'
+        description: A mapping of volumes UUIDs to their dumped raw metadata.
+        key-type: *UUID
+        name: VolumesDumpMap
+        type: map
+        value-type: *VolumeDump
+
+    LeaseDump: &LeaseDump
+        added: '4.4'
+        description: Lease metadata.
+        name: LeaseDump
+        properties:
+        -   description: Lease file offset.
+            name: offset
+            type: ulong
+
+        -   description: Lockspace name.
+            name: lockspace
+            type: string
+
+        -   description: Resource name.
+            name: resource
+            type: string
+
+        -   description: Modification timestamp.
+            name: timestamp
+            type: uint
+
+        -   description: Owner host id.
+            name: own
+            type: uint
+
+        -   description: Generation.
+            name: gen
+            type: uint
+
+        -   defaultvalue: null
+            description: Lease version. Only for volume leases.
+            name: lver
+            type: uint
+        type: object
+
+    XleaseDump: &XleaseDump
+        added: '4.4'
+        description: Xlease metadata.
+        name: XleaseDump
+        properties:
+        -   description: The offset of the lease in the xlease file.
+            name: offset
+            type: ulong
+
+        -   description: xlease update indicator.
+            name: updating
+            type: boolean
+        type: object
+
+    XleasesDumpMap: &XleasesDumpMap
+        added: '4.4'
+        description: A mapping of VM UUIDs to their xleases.
+        key-type: *UUID
+        name: XleasesDumpMap
+        type: map
+        value-type: *XleaseDump
+
+    StorageDomainDump: &StorageDomainDump
+        added: '4.4'
+        description: Storage domain raw metadata.
+        name: StorageDomainDump
+        properties:
+        -   description: Storage domain metadata.
+            name: metadata
+            type: *StorageDomainInfo
+
+        -   description: Volumes metadata.
+            name: volumes
+            type: *VolumesDumpMap
+
+        -   defaultvalue: null
+            description: Leases metadata. For a storage domain using sanlock
+                to manage volumes leases, applies to non-local FS SD type
+                from version 3 or later. Available only when using
+                StorageDoamin.dump(full=True).
+            name: leases
+            type: *LeaseDump
+
+        -   defaultvalue: null
+            description: Lockspace metadata. For a storage domain using sanlock
+                to manage domain leases, applies to non-local FS SD type
+                from version 3 or later. Available only when using
+                StorageDoamin.dump(full=True).
+            name: lockspace
+            type: *LeaseDump
+
+        -   defaultvalue: null
+            description: External leases metadata. For a storage domain using
+                sanlock volumes leases, applies to non-local FS SD type
+                from version 4 or later. Available only when using
+                StorageDoamin.dump(full=True).
+            name: xleases
+            type: *XleasesDumpMap
+
+        type: object
+
+    VmDataMap: &VmDataMap
+        name: VmDataMap
+        description: VM data and related information
+        added: '4.4'
+        properties:
+        -   name: _X_data
+            description: The encoded data, suitable for use in VM.create. If
+              only changed data was requested and the data is unchanged, or if
+              there is no data, then this item is omitted.
+            type: string
+            defaultvalue: null
+        -   name: hash
+            description: Hash of the data, whether the data itself is present
+              here or not (it may be empty in the latter case).
+            type: string
+        type: object
+
+    ScreenshotResponse: &ScreenshotResponse
+        added: '4.5'
+        description: VM Screenshot dump operation response.
+        name: ScreenshotResponse
+        properties:
+            -   name: data
+                description: Encoded image data
+                type: string
+            -   name: encoding
+                description: Image data response encoding
+                type: string
+            -   name: mime_type
+                description: Mime type of the image
+                type: string
 
 Host.setupNetworks:
     added: '3.1'
@@ -8511,6 +9302,13 @@ Host.getDeviceList:
         name: checkStatus
         type: boolean
         added: '3.6'
+
+    - defaultvalue: true
+      description: Indicates if storage refresh is required
+      name: refresh
+      type: boolean
+      added: '4.4.5'
+
     return:
         description: An array of BlockDeviceInfo
         type:
@@ -9337,6 +10135,12 @@ Lease.create:
         type: *Lease
         description: The lease to create
 
+    -   defaultvalue: null
+        name: metadata
+        type: *LeaseMetadata
+        description: If specified, the lease metadata will be written to
+            lease's LVB.
+        added: '4.4.6'
     return:
         description: A task UUID
         type: *UUID
@@ -9387,7 +10191,21 @@ Lease.status:
 
     return:
         description: Information about the sanlock lease status
-        type: *VolumeLeaseStatus
+        type: *ExternalLeaseStatus
+
+Lease.fence:
+    added: '4.4.6'
+    description: Fence a lease. For example, if used for job fencing,
+        the operation will increase the generation and change the job
+        status.
+    params:
+    -   name: lease
+        type: *Lease
+        description: Lease to fence
+
+    -   name: metadata
+        type: *LeaseMetadata
+        description: Expected lease metadata read from lease's LVB.
 
 LVMVolumeGroup.create:
     added: '3.1'
@@ -9711,6 +10529,25 @@ StorageDomain.validate:
     -   description: The UUID of the Storage Domain
         name: storagedomainID
         type: *UUID
+
+StorageDomain.dump:
+    added: '4.4'
+    description: Get raw storage domain metadata from storage.
+    params:
+    -   description: The UUID of the Storage Domain.
+        name: sd_id
+        type: *UUID
+
+    -   defaultvalue: false
+        description: If set to True, will also dump leases, lockspace and
+           xleases information along with SD metadata and volumes information.
+           Taking a full dump may be up to 10 times slower.
+        name: full
+        type: boolean
+
+    return:
+        description: Storage domain metadata.
+        type: *StorageDomainDump
 
 StoragePool.connect:
     added: '3.1'
@@ -10190,6 +11027,29 @@ StoragePool.reduceVolume:
         description: A task UUID
         type: *UUID
 
+StoragePool.switchMaster:
+    added: '4.4.3'
+    description: Switch the master role to the requested storage domain.
+    params:
+        -   description: The storage pool associated with the storage domains
+            name: storagepoolID
+            type: *UUID
+
+        -   description: The current master storage domain UUID
+            name: oldMasterUUID
+            type: *UUID
+
+        -   description: The new master storage domain UUID
+            name: newMasterUUID
+            type: *UUID
+
+        -   description: The new master storage domain version
+            name: masterVersion
+            type: int
+    return:
+        description: A task UUID
+        type: *UUID
+
 Task.clear:
     added: '3.1'
     description: Discard information about a finished Task.
@@ -10358,6 +11218,33 @@ VM.destroy:
         type: uint
         added: '4.0'
 
+VM.getExternalData:
+    description: Retrieve VM data stored outside the VM, typically in
+      a local file system.
+    added: '4.4'
+    params:
+    -   name: vmID
+        description: The UUID of the VM
+        type: *UUID
+    -   name: kind
+        description: Which data is requested. The only currently supported data
+          kinds are "tpm" and "nvram".
+        type: string
+    -   name: lastHash
+        description: The hash, if provided, is compared to the hash of the
+          current data. If both hashes are the same, data is not returned.
+        type: string
+        defaultvalue: null
+    -   name: forceUpdate
+        description: Whether to force data update before returning the
+          data (true) or whether it's possible to use data recently
+          retrieved by Vdsm without checking for an update.
+        type: boolean
+        defaultvalue: true
+    return:
+        description: Return requested VM data and related information.
+        type: *VmDataMap
+
 VM.getInfo:
     added: '3.1'
     description: Get detailed information about a VM.
@@ -10420,37 +11307,37 @@ VM.updateDevice:
         description: The VM definition, as updated
         type: *VmDefinition
 
-VM.hostdevHotplug:
-    added: '4.0'
+VM.hotplugHostdev:
+    added: '4.4'
     description: Add a new host device to a running VM.
     params:
     -   description: The UUID of the VM
         name: vmID
         type: *UUID
 
-    -   description: List of host device specifications
+    -   description: List of device XMLs
         name: devices
         type:
-        - *VmHostDevice
+        - string
     return:
-        description: List of hotplugged libvirt device names
+        description: List of hot plugged device XMLs
         type:
         - string
 
-VM.hostdevHotunplug:
-    added: '4.0'
+VM.hotunplugHostdev:
+    added: '4.4'
     description: Remove a host device from a running VM
     params:
     -   description: The UUID of the VM
         name: vmID
         type: *UUID
 
-    -   description: List of device libvirt names
+    -   description: List of device XMLs
         name: devices
         type:
         - string
     return:
-        description: List of libvirt device names, indicating which
+        description: List of device XMLs, indicating which
             devices were successfully hotunplugged.
         type:
         - string
@@ -10731,6 +11618,25 @@ VM.snapshot:
         type: boolean
         added: '3.6'
 
+    -   defaultvalue: null
+        description: Assign a UUID to this operation which can be used to
+            identify it in VmStats
+        name: jobUUID
+        type: *UUID
+        added: '4.4'
+
+    -   defaultvalue: 30
+        description: Timeout in minutes for the snapshot operation
+        name: timeout
+        type: uint
+        added: '4.4'
+
+    -   defaultvalue: 8
+        description: Timeout in minutes for non-memory snapshot operation
+        name: freeze_timeout
+        type: uint
+        added: '4.5'
+
 VM.setBalloonTarget:
     added: '3.1'
     description: Dynamically change the target amount of physical memory
@@ -10803,11 +11709,12 @@ VM.diskSizeExtend:
         name: vmID
         type: *UUID
 
-    -   description: A DriveSpecVolume structure representing the disk
+    -   description: A DriveSpec structure representing the disk.
+            Supported types are DriveSpecVolume and DriveSpecGuid.
         name: driveSpecs
-        type: *DriveSpecVolume
+        type: *DriveSpec
 
-    -   description: The new desired size (in bytes)
+    -   description: The new desired size (in bytes).
         name: newSize
         type: string
     return:
@@ -10972,7 +11879,7 @@ Volume.create:
 
     -   description: An advisory disk usage type
         name: diskType
-        type: *DiskType
+        type: *DiskContentType
 
     -   description: The Volume description Up to 210 bytes; longer values will
             be truncated
@@ -10994,6 +11901,40 @@ Volume.create:
         name: initialSize
         type: string
         added: '3.6'
+
+    -   defaultvalue: false
+        description: if specified, instruct to add new empty bitmaps
+            with the same names as they had in the source volume to the
+            newly created volume. Allowed only when creating a snapshot from
+            cow-sparse volume. Must not be used when a VM is running.
+            In this case libvirt adds the bitmaps when creating a snapshot.
+        name: addBitmaps
+        type: boolean
+        added: '4.4'
+
+    -   defaultvalue: true
+        description: Create legal volume that can be used by the system
+            immediately. Set to false to create illegal volume that cannot
+            be used by the system. To use the volume it must be set to legal.
+        name: legal
+        type: boolean
+
+    -   defaultvalue: 0
+        description: The sequence number of the volume. Newer volume will have
+            a higher number.
+        name: sequence
+        type: int
+        added: '4.5'
+
+    -   defaultvalue: null
+        description: If specified, create a new empty bitmap with the specified
+            UUID. Allowed only when creating a snapshot or when creating a new
+            volume in COW format. The new bitmap records the changes in the
+            volume since the volume was created.
+        name: bitmap
+        type: *UUID
+        added: '4.5'
+
     return:
         description: A task UUID
         type: *UUID
@@ -11110,6 +12051,40 @@ Volume.getInfo:
     return:
         description: Volume information
         type: *VolumeInfoResponse
+
+Volume.measure:
+    added: '4.4'
+    description: Measure required allocation for copying source volume to
+      destination volume.
+    params:
+    -   description: The UUID of the source volume
+        name: volumeID
+        type: *UUID
+
+    -   description: The Storage Pool associated with the source volume
+        name: storagepoolID
+        type: *UUID
+
+    -   description: The Storage Domain associated with the source volume
+        name: storagedomainID
+        type: *UUID
+
+    -   description: The Image associated with the source volume
+        name: imageID
+        type: *UUID
+
+    -   description: The volume format to use for the destination volume
+        name: dstVolFormat
+        type: *VolumeFormat
+
+    -   defaultvalue: true
+        description: A flag indicating whether to measure a single volume
+          or the entire chain.
+        name: backing_chain
+        type: boolean
+    return:
+        description: Measured result
+        type: *VolumeMeasureResult
 
 Volume.getQemuImageInfo:
     added: '4.1'
@@ -11231,6 +12206,26 @@ Volume.setLegality:
         name: legality
         type: *VolumeLegality
 
+
+Volume.teardown:
+    added: '4.4'
+    description: Teardown a volume. Called when a volume is detached from
+        a prepared image during live merge flow. In this case, the volume
+        will not be torn down when the image is torn down.
+    params:
+    -   description: The Storage Domain associated with the Volume.
+        name: storagedomainID
+        type: *UUID
+
+    -   description: The UUID of the image containing the Volume.
+        name: imageID
+        type: *UUID
+
+    -   description: The UUID of the Volume.
+        name: volumeID
+        type: *UUID
+
+
 VM.hotplugMemory:
     added: '3.6'
     description: Hotplug memory to a running VM NUMA node
@@ -11269,6 +12264,15 @@ VM.setNumberOfCpus:
     -   description: The new number of cpus
         name: numberOfCpus
         type: int
+
+    -   defaultvalue: null
+        description: A list of cpuset definitions (e.g. '1,3-5') for all CPUs.
+            Items of the list correspond to vCPUs and, if specified, length
+            of the list must match numberOfCpus.
+        name: cpusets
+        type:
+        - string
+        added: '4.5'
     return:
         description: The VM definition, as updated
         type: *VmDefinition
@@ -11374,6 +12378,14 @@ SDM.copy_data:
         name: destination
         type: *CopyDataEndpoint
 
+    -   defaultvalue: false
+        description: if specified, copy the bitmaps from the copied
+            volume to the new volume. Allowed only when copying a
+            single qcow2 volume to a qcow2 volume.
+        name: copy_bitmaps
+        type: boolean
+        added: '4.4'
+
 SDM.sparsify_volume:
     added: '4.1'
     description: Perform an in-place sparsify (e.g. not creating a new image)
@@ -11398,6 +12410,14 @@ SDM.merge:
     -   description: Subchain to merge
         name: subchain_info
         type: *SubchainInfo
+
+    -   defaultvalue: false
+        description: if specified, merge the bitmaps from the removed volume
+            to the base volume. Allowed only when merging into a cow-sparse
+            volume.
+        name: merge_bitmaps
+        type: boolean
+        added: '4.4'
 
 SDM.amend_volume:
     added: '4.1'
@@ -11463,6 +12483,57 @@ SDM.update_volume:
                      in a volume.
         name: vol_attr
         type: *VolumeAttributes
+
+SDM.add_bitmap:
+    added: '4.4.4'
+    description: Add a bitmap to the volume for cold backup operation.
+        Allowed only for a volume with qcow2 format, this volume must
+        not be used by a VM or any other processes.
+    params:
+    -   description: A UUID to be used for tracking the job progress
+        name: job_id
+        type: *UUID
+
+    -   description: The volume to add the bitmap to.
+        name: vol_info
+        type: *CopyDataDIVEndpoint
+
+    -   description: The name of the bitmap that will be added to the volume.
+        name: bitmap
+        type: string
+
+SDM.remove_bitmap:
+    added: '4.4.4'
+    description: Remove a bitmap from the volume for fixing manually
+        backup chain. Allowed only for a volume with qcow2 format,
+        this volume must not be used by a VM or any other processes.
+    params:
+    -   description: A UUID to be used for tracking the job progress
+        name: job_id
+        type: *UUID
+
+    -   description: The volume to remove the bitmap from.
+        name: vol_info
+        type: *CopyDataDIVEndpoint
+
+    -   description: The name of the bitmap that will be removed
+            from the volume.
+        name: bitmap
+        type: string
+
+SDM.clear_bitmaps:
+    added: '4.4.7'
+    description: Remove all the bitmaps from the volume.
+        Allowed only for a volume with qcow2 format, this volume
+        must not be used by a VM or any other processes.
+    params:
+    -   description: A UUID to be used for tracking the job progress
+        name: job_id
+        type: *UUID
+
+    -   description: The volume to remove the bitmap from.
+        name: vol_info
+        type: *CopyDataDIVEndpoint
 
 NBD.start_server:
     added: '4.3'
@@ -11530,6 +12601,13 @@ VM.backup_info:
     -   description: A UUID of the backup
         name: backup_id
         type: *UUID
+
+    -   defaultvalue: null
+        description: A UUID of the checkpoint, must be the same value as
+                     to_checkpoint_id argument that was used for
+                     starting a backup (optional).
+        name: checkpoint_id
+        type: *UUID
     return:
         description: Information about the backup identified by backup_id.
         type: *BackupInfo
@@ -11542,11 +12620,15 @@ VM.delete_checkpoints:
         name: vmID
         type: *UUID
 
-    -   description: List of checkpoints ids to delete, order from
+    -   description: List of checkpoints ids to delete, ordered from
             oldest to newest.
         name: checkpoint_ids
         type:
         - string
+    return:
+        description: Delete checkpoints response.
+        type:
+        - *CheckpointsResponse
 
 VM.redefine_checkpoints:
     added: '4.3'
@@ -11563,3 +12645,68 @@ VM.redefine_checkpoints:
         name: checkpoints
         type:
         - *Checkpoint
+    return:
+        description: Redefine checkpoints response.
+        type:
+        - *CheckpointsResponse
+
+VM.list_checkpoints:
+    added: '4.4'
+    description: Returns a List of checkpoint ids defined on the VM.
+    params:
+    -   description: A UUID of the VM
+        name: vmID
+        type: *UUID
+
+    return:
+        description: List of checkpoint ids ordered by creation order
+                     (from oldest to newest).
+        type:
+        - *UUID
+
+VM.dump_checkpoint:
+    added: '4.4'
+    description: Returns VM backup checkpoint XML.
+    params:
+    -   description: A UUID of the VM.
+        name: vmID
+        type: *UUID
+
+    -   description: A UUID of the checkpoint.
+        name: checkpoint_id
+        type: *UUID
+
+    return:
+        description: Requested checkpoint info.
+        type:
+        - *CheckpointInfo
+
+VM.refresh_disk:
+    added: '4.4.7'
+    description: Refresh VM drive volume. Reload LVM and update disk
+        size on the host. Reload runs only on block based storage
+        disks, on file based storage disks only disk size is refreshed.
+        Should be run in case the disk size was changed on one host and
+        this change should be visible on another host.
+    params:
+    -   description: The UUID of the VM
+        name: vmID
+        type: *UUID
+    -   description: The specification (PDIV) of drive to be refreshed.
+        name: drive
+        type: *DriveSpecVolume
+
+    return:
+        description: Disk volume size information after refresh.
+        type: *VolumeSizeInfo
+
+VM.screenshot:
+    added: '4.5'
+    description: Returns a screenshot of the guest console
+    params:
+    -   description: The UUID of the VM
+        name: vmID
+        type: *UUID
+    return:
+        description: Screenshot response
+        type: *ScreenshotResponse

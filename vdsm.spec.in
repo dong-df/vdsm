@@ -9,28 +9,19 @@
 %global snlk_group sanlock
 %global snlk_user sanlock
 %global cdrom_group cdrom
+%global imageio_user ovirtimg
+%global imageio_group ovirtimg
 
 # Features
-%{!?with_ovirt_imageio: %global with_ovirt_imageio 1}
 %{!?with_ovirt_vmconsole: %global with_ovirt_vmconsole 1}
 %{!?with_gluster_mgmt: %global with_gluster_mgmt 1}
 %{!?with_hooks: %global with_hooks 1}
 %{!?with_vhostmd: %global with_vhostmd 1}
 
-%ifarch ppc64le
-%global with_openvswitch_default 0
-%else
-%global with_openvswitch_default 1
-%endif
-%{!?with_openvswitch: %global with_openvswitch %{with_openvswitch_default}}
 
 %{!?vdsm_repo: %global vdsm_repo /rhev/data-center}
 
-%if 0%{?centos} || 0%{?fedora}
-%global gluster_version 3.12
-%else #rhel
-%global gluster_version 3.8
-%endif
+%global gluster_version 6.0
 
 # Default to skipping autoreconf.  Distros can change just this one line
 # (or provide a command-line override) if they backport any patches that
@@ -48,19 +39,6 @@
 # Disable debuginfo package, since vdsm is a meta-package
 %global debug_package %{nil}
 
-%{!?target_py: %global target_py py3}
-
-%if %{target_py} == py2
-%global python2_or_python3 python2
-%global python_or_python3 python
-%global python_pyyaml PyYAML
-%else
-%global python2_or_python3 python3
-%global python_or_python3 python3
-%global python_pyyaml python3-pyyaml
-%endif
-
-%if %{target_py} == py3
 # RPM packaging guidelines require all files outside of '/usr/lib[64]/pythonX.X'
 # to be compiled manually [1]. Some distros try to find '*.py' files outside of the aforementioned
 # dirs and compile them for us, but using hard-coded '__python' macro, which points to Python 2.
@@ -68,15 +46,6 @@
 #
 # [1] https://docs.fedoraproject.org/en-US/packaging-guidelines/Python_Appendix/#manual-bytecompilation
 %global _python_bytecompile_extra 0
-
-%global python_sitelib %{python3_sitelib}
-%endif
-
-%if %{target_py} == py2
-%global python_libvirt libvirt-python
-%else
-%global python_libvirt python3-libvirt
-%endif
 
 # Release must be generated dynamically and that can't be done here.
 # It must be either:
@@ -87,25 +56,22 @@
 %{!?vdsm_release: %global vdsm_release @PACKAGE_RELEASE@}
 
 Name:           %{vdsm_name}
-Version:        4.40.0
+Version:        4.50.0.10
 Release:        %{vdsm_release}%{?dist}%{?extra_release}
 Summary:        Virtual Desktop Server Manager
 
 Group:          Applications/System
 License:        GPLv2+
 Url:            http://www.ovirt.org/develop/developer-guide/vdsm/vdsm/
-Source0:        %{vdsm_name}-%{version}.tar.gz
+Source0:        https://github.com/oVirt/vdsm/releases/download/v%{version}/%{vdsm_name}-%{version}.tar.gz
 
 %{!?_licensedir:%global license %%doc}
 
 BuildRequires: openssl
-BuildRequires: %{python_or_python3}
-BuildRequires: %{python_or_python3}-six >= 1.9.0
-BuildRequires: %{python_or_python3}-dateutil
-%if %{target_py} == py2
-BuildRequires: python-subprocess32
-%endif
-BuildRequires: %{python2_or_python3}-devel
+BuildRequires: python3
+BuildRequires: python3-six >= 1.9.0
+BuildRequires: python3-dateutil
+BuildRequires: python3-devel
 BuildRequires: rpm-build
 BuildRequires: systemd-units
 
@@ -114,14 +80,6 @@ BuildRequires: systemd-units
 BuildRequires: autoconf
 BuildRequires: automake
 BuildRequires: util-linux
-%endif
-
-%if %{target_py} == py2
-%if 0%{?rhel}
-BuildRequires: python-enum34
-%else  # fedora
-BuildRequires: python2-enum34
-%endif
 %endif
 
 %if 0%{?rhel} >= 8
@@ -135,37 +93,24 @@ Requires: numactl
 %endif
 
 %ifarch x86_64
-Requires: %{python_or_python3}-dmidecode
+Requires: python3-dmidecode
 Requires: dmidecode
 Requires: virt-v2v
 %endif
 
 Requires: chrony
+Requires: crontabs
 Requires: which
 Requires: sudo >= 1.7.3
 Requires: logrotate
 Requires: lshw
+Requires: lsof
+Requires: ndctl
+Requires: swtpm-tools
 Requires: xz
-Requires: %{python_or_python3}-netaddr
-%if %{target_py} == py2
-Requires: python-pthreading >= 0.1.3-3
-Requires: rpm-python
-%else
 Requires: python3-rpm
-%endif
-Requires: %{python_or_python3}-six >= 1.9.0
-Requires: %{python_or_python3}-requests
-Requires: abrt-cli
-Requires: abrt-addon-vmcore
-Requires: abrt-addon-ccpp
-%if %{target_py} == py3
-Requires: python3-abrt-addon
-%else
-# python2 abrt-addon-python doesn't exist in Fedora anymore
-%if ! 0%{?fedora}
-Requires: abrt-addon-python
-%endif
-%endif
+Requires: python3-six >= 1.9.0
+Requires: python3-requests
 Requires: curl
 Requires: %{name}-http = %{version}-%{release}
 Requires: %{name}-jsonrpc = %{version}-%{release}
@@ -180,103 +125,65 @@ Requires(pre): shadow-utils
 
 Obsoletes: %{name}-infra < 4.19
 
-%if 0%{?rhel}
-# Required for supporting minorversion mount option
-# See https://bugzilla.redhat.com/1547681 for details.
-Requires: nfs-utils >= 1.3.0-0.48.el7_4.2
-%else # fedora
 Requires: nfs-utils
-%endif
 
-%if %{with_ovirt_imageio}
+# For kvm2ovirt
 Requires: ovirt-imageio-common
-# For GET /tickets/*
-Requires: ovirt-imageio-daemon >= 1.2.0
-%endif
+# For controlling /tickets
+# 2.2.0-1 for https://bugzilla.redhat.com/1971182
+Requires: ovirt-imageio-daemon >= 2.2.0-1
 
 %if %{with_ovirt_vmconsole}
 Requires: ovirt-vmconsole >= 1.0.0-0
 %endif
 
-# Python
-%if %{target_py} == py2
-# For https://bugzilla.redhat.com/1518676
-%if 0%{?rhel}
-Requires: %{python_or_python3} >= 2.7.5-65.el7
-%else
-Requires: %{python_or_python3} >= 2.7.14-4
-%endif
-%else  # target_py
 Requires: python3 >= 3.6
-%endif
 
 Requires: libvirt-client
 Requires: libvirt-daemon-config-nwfilter
 Requires: libvirt-lock-sanlock
-
-%if 0%{?rhel}
-%if 0%{?rhel} < 8
-# 7.6 baseline
-Requires: %{python_libvirt} >= 4.5.0-1.el7
-# CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
-Requires: libvirt-daemon-kvm >= 4.5.0-10.el7_6.9
-%else # RHEL 8
-Requires: libvirt-daemon-kvm
-Requires: %{python_libvirt}
-%endif
-%else # fedora
-%ifnarch s390 s390x
-# virt-preview is not available for s390
-# Required to fix order of VM life cycle events.
-# See https://bugzilla.redhat.com/1612943 for details.
-Requires: libvirt-daemon-kvm >= 4.9.0-1
-Requires: %{python_libvirt} >= 4.9
+%if 0%{?centos}
+# TODO: require 7.6.0-4+ once available on Centos
+Requires: libvirt-daemon-kvm >= 7.6.0-2
 %else
-Requires: libvirt-daemon-kvm
-# Required for preventing an HotPlug disk failure due to cgroups.
-# See https://bugzilla.redhat.com/1540872 for details.
-Requires: %{python_libvirt} >= 3.7.0
+# AV 8.5, https://bugzilla.redhat.com/2003644
+Requires: libvirt-daemon-kvm >= 7.6.0-4.module+el8.5.0+12786+c4633d9a
 %endif
-%endif
+
+Requires: python3-libvirt
 
 # iscsi-intiator versions
 Requires: iscsi-initiator-utils >= 6.2.0.873-21
 
-%if %{target_py} == py2
-# Adding 4k support.
-Requires: sanlock-python >= 3.7.3
-%else
-Requires: python3-sanlock
-%endif
-
-# device-mapper-multipath
-
 %if 0%{?rhel}
-# Required for blacklisting multipath devices by protocol.
-# See https://bugzilla.redhat.com/1016535 for more details.
-Requires: device-mapper-multipath >= 0.4.9-119.el7_5.1
-%endif #rhel
-
-%if 0%{?fedora}
-Requires: device-mapper-multipath >= 0.7.4-3
+# For https://bugzilla.redhat.com/1961752
+Requires: python3-sanlock >= 3.8.3-3
+Requires: sanlock >= 3.8.3-3
 %endif
+
+Requires: device-mapper-multipath
 
 # augeas
 
 %if 0%{?rhel}
-Requires: %{python_or_python3}-augeas
+Requires: python3-augeas
+%endif
+
+# fence-agents
+
+%if 0%{?centos}
+# TODO: Require 4.2.1-53+ when CentOS 8.3 is released
+Requires: fence-agents-all
+%else
+# fence-agents package without telnet dependency
+Requires: fence-agents-all >= 4.2.1-53
 %endif
 
 %if 0%{?fedora}
-Requires: %{python2_or_python3}-augeas
+Requires: python3-augeas
 %endif
 
-%if %{target_py} == py2
-Requires: policycoreutils-python
-%else
 Requires: python3-policycoreutils
-%endif
-Requires: fence-agents-all
 Requires: systemd >= 219-11
 Requires: initscripts >= 9.49.31
 Requires: cyrus-sasl-scram
@@ -284,63 +191,31 @@ Requires: cyrus-sasl-scram
 # Required for solving bug 1575762
 Requires: lvm2 >= 2.02.177-5
 %else
-Requires: lvm2 >= 2.02.145
+# EL 8.1 baseline.
+Requires: lvm2 >= 8:2.03
 %endif
 
-%if 0%{?rhel}
-# TODO - use baseline el8.1 kernel version once available
-%if 0%{?centos}
-# CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
-Requires: kernel >= 3.10.0-957.12.2.el7
-%else # rhel
-# CVE-2019-14835
-Requires: kernel >= 4.18.0-145.el8
-%endif
+# EL 8.4 baseline
+Requires: kernel >= 4.18.0-305
+
 Requires: e2fsprogs
-Requires: selinux-policy-targeted >= 3.13.1-166.el7_4.3
-%else # fedora
-# CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
-Requires: kernel >=  5.0.16-100
-Requires: e2fsprogs >= 1.41.14
-Requires: %{python_or_python3}-policycoreutils
-Requires: sed >= 4.2.1-10
+Requires: selinux-policy-targeted
+
+%if 0%{?fedora}
 Requires: ed
-Requires: selinux-policy-targeted >= 3.13-1
-# In order to avoid a policycoreutils bug (rhbz 889698) when selinux is
-# disabled we now require the version 2.1.13-55 (or newer) of Fedora.
-Requires: policycoreutils >= 2.1.13-55
+Requires: sed
+Requires: policycoreutils
+Requires: python3-policycoreutils
 %endif
 
 # qemu-kvm
 
-%if 0%{?rhel} >= 8
 %if 0%{?centos}
-# Advanced virt stream not available yet on CentOS.
-Requires: qemu-kvm
+Requires: qemu-kvm >= 15:6.0.0-28
 %else
-# 4.4. Baseline.
-Requires: qemu-kvm >= 15:4.1.0-14.module+el8.1.0+4548+ed1300f4
-%endif #centos
-%endif #rhel
-
-%if 0%{?rhel} == 7
-# 4k not supported yet on rhel 7.
-# https://bugzilla.redhat.com/1745443
-# CVE-2018-12126, CVE-2018-12127, CVE-2018-12130, CVE-2019-11091
-Requires: qemu-kvm-rhev >= 10:2.12.0-18.el7_6.5
+# AV 8.5 - https://bugzilla.redhat.com/1946084
+Requires: qemu-kvm >= 6.0.0-28.module+el8.5.0+12271+fffa967b
 %endif
-
-%if 0%{?fedora}
-%ifarch s390 s390x
-# virt-preview is not available on s390 arch.
-Requires: qemu-kvm >= 2:2.11.2
-%else
-# For 4k support:
-# - https://bugzilla.redhat.com/1737256
-# - https://bugzilla.redhat.com/1738657
-Requires: qemu-kvm >= 2:4.1.0-2
-%endif # s390
-%endif # fedora
 
 # GlusterFS client-side RPMs needed for Gluster SD
 %ifnarch ppc64le
@@ -367,14 +242,14 @@ Requires: sos >= 3.7-3
 
 Requires: tree
 Requires: dosfstools
-Requires: genisoimage
-%if %{target_py} == py2
-Requires: libselinux-python >= 2.5-2
+%if 0%{?rhel} >= 9
+# xorriso replaced genisoimage on RHEL 9
+Requires: xorriso
 %else
-Requires: python3-libselinux
+Requires: genisoimage
 %endif
+Requires: python3-libselinux
 Requires: %{name}-python = %{version}-%{release}
-Requires: %{name}-hook-vmfex-dev = %{version}-%{release}
 Requires: libguestfs-tools-c
 
 Requires(post): /usr/sbin/saslpasswd2
@@ -391,23 +266,24 @@ Requires(post): /bin/hostname
 %ifarch x86_64 %{arm}
 %if 0%{?rhel}
 Requires: OVMF
-%else # fedora
+%else
+# fedora
 Requires: edk2-ovmf
 %endif
 %endif
 
-Requires: %{python_or_python3}-pyudev
-
 Conflicts: ovirt-hosted-engine-ha < 2.3.6
 
 Conflicts: vdsm-hook-sriov
-Obsoletes: vdsm-hook-vfio-mdev
+Obsoletes: vdsm-hook-vfio-mdev < %{version}-%{release}
 Provides: vdsm-hook-vfio-mdev
-Obsoletes: %{name}-hook-floppy
-Obsoletes: %{name}-hook-numa
-Obsoletes: %{name}-hook-pincpu
-Obsoletes: %{name}-hook-vmdisk
-Obsoletes: %{name}-hook-hostdev-scsi
+Obsoletes: %{name}-hook-floppy < %{version}-%{release}
+Obsoletes: %{name}-hook-numa < %{version}-%{release}
+Obsoletes: %{name}-hook-pincpu < %{version}-%{release}
+Obsoletes: %{name}-hook-vmdisk < %{version}-%{release}
+Obsoletes: %{name}-hook-hostdev-scsi < %{version}-%{release}
+Obsoletes: %{name}-hook-vmfex-dev < 4.40.70
+
 
 %description
 The VDSM service is required by a Virtualization Manager to manage the
@@ -442,7 +318,7 @@ Access vdsm API from the command line.
 %package api
 Summary:        VDSM API
 BuildArch:      noarch
-BuildRequires:  %{python_pyyaml}
+BuildRequires:  python3-pyyaml
 
 %description api
 Contains api schema files
@@ -461,11 +337,7 @@ A Json-based RPC interface that serves as the protocol for libvdsm.
 %package yajsonrpc
 Summary:        JSON RPC server and client implementation
 BuildArch:      noarch
-%if %{target_py} == py2
-Requires:       python >= 2.6
-%else
 Requires:       python3 >= 3.6
-%endif
 
 %description yajsonrpc
 A JSON RPC server and client implementation.
@@ -475,23 +347,16 @@ Summary:        common VDSM python libraries, required by all subsystems
 BuildArch:      noarch
 Requires:       systemd
 Requires:       glibc
-Requires:       %{python_or_python3}-dateutil
-Requires:       %{python_or_python3}-six >= 1.9.0
-%if %{target_py} == py2
-Requires:       python-subprocess32
+Requires:       python3-dbus
+Requires:       python3-dateutil
+Requires:       python3-six >= 1.9.0
 %if 0%{?rhel}
-Requires:       python-enum34
-%else  # fedora
-Requires:       python2-enum34
-%endif
-%endif
-%if 0%{?rhel}
-Requires:       %{python_or_python3}-decorator
-Requires:       %{python_libvirt} >= 3.2.0-3.el7_4.1
+Requires:       python3-decorator
+Requires:       python3-libvirt >= 3.2.0-3.el7_4.1
 %endif
 %if 0%{?fedora}
-Requires:       %{python2_or_python3}-decorator
-Requires:       %{python_libvirt} >= 3.7.0
+Requires:       python3-decorator
+Requires:       python3-libvirt >= 3.7.0
 %endif
 
 %description common
@@ -500,40 +365,19 @@ VDSM libraries that are imported by all subsystems
 %package network
 Summary:        VDSM network python libraries
 Requires:       NetworkManager-config-server
-%if %{target_py} == py2
-Requires:       dbus-python
-%else
-Requires:       python3-dbus
-%endif
-Requires:       dhclient
+Requires:       NetworkManager-ovs
 Requires:       ethtool
-Requires:       initscripts
 Requires:       iproute
-%if 0%{?fedora} >= 25
 Requires:       iproute-tc
-%endif
-%if 0%{?fedora} >= 29 || 0%{?rhel} >= 8
-# remove when nmstate is finished
-Requires: network-scripts
-Requires: nmstate
-%endif
+Requires:       ovirt-openvswitch >= 2.15
+# Workaround for BZ#1966143
+Requires:       ovirt-python-openvswitch >= 2.15
+Requires:       nmstate >= 1.0
+Requires:       nmstate-plugin-ovsdb
 Requires:       libnl3
-%if %{target_py} == py2
-Requires:       libselinux-python
-%else
-Requires:       python3-libselinux
-%endif
 Requires:       lldpad
-%if %{with_openvswitch}
-Requires:       openvswitch >= 2.7.0
-%endif
-Requires:       %{python_or_python3}-inotify
-%if %{target_py} == py2
-Requires:       python-ipaddress
-%endif
-Requires:       %{python_or_python3}-netaddr
-Requires:       %{python_or_python3}-six
-Requires:       systemd
+Requires:       python3-six
+Requires:       python3-cryptography
 Requires:       %{name}-common = %{version}-%{release}
 
 %description network
@@ -543,8 +387,8 @@ VDSM network python libraries
 Summary:        VDSM python libraries
 Requires:       %{name}-api = %{version}-%{release}
 BuildArch:      noarch
-# Provides probe_block_size(), see https://bugzilla.redhat.com/1753898
-Requires:       %{python2_or_python3}-ioprocess >= 1.3.0
+# Fix compatibility with gluster shard, https://bugzilla.redhat.com/1820283
+Requires:       python3-ioprocess >= 1.4.1
 Requires:       %{name}-common = %{version}-%{release}
 Requires:       %{name}-network = %{version}-%{release}
 
@@ -578,7 +422,7 @@ using the QEMU disk image utility.
 
 %package hook-checkips
 Summary:        Check connectivity from the host to designated IPs
-Requires:       %{name} = %{version}-%{release}
+Requires:       %{name}
 
 %description hook-checkips
 VDSM hook used to check connectivity from the host network to designated IPs
@@ -600,7 +444,7 @@ VDSM hooks which allow to activate disk UNMAP.
 %package hook-ethtool-options
 Summary:        Allow setting custom ethtool options for vdsm controlled nics
 BuildArch:      noarch
-Requires:       %{name} = %{version}-%{release}
+Requires:       %{name}
 
 %description hook-ethtool-options
 VDSM hook used for applying custom network properties that define ethtool
@@ -658,7 +502,7 @@ VDSM hooks which allow to bind a vNIC to a Bridge, managed or not by engine.
 %package hook-extnet
 Summary:        Force a vNIC to connect to a specific libvirt network
 BuildArch:      noarch
-Requires:       %{name} = %{version}-%{release}
+Requires:       %{name}
 
 %description hook-extnet
 VDSM hook which allows to connect a vNIC to a libvirt network that is managed
@@ -677,7 +521,7 @@ To enable this hook on your host, set vars.fake_vmstats_enable=true in your
 %package hook-fileinject
 Summary:        Allow uploading file to VMs disk
 BuildArch:      noarch
-Requires:       %{python_or_python3}-libguestfs
+Requires:       python3-libguestfs
 
 %description hook-fileinject
 Hook is getting target file name and its content and
@@ -746,7 +590,7 @@ the spice optimization attributes and values..
 %package hook-vmfex-dev
 Summary:        VM-FEX vNIC support for VDSM
 BuildArch:      noarch
-Requires:       %{name} = %{version}-%{release}
+Requires:       %{name}
 Conflicts:      hook-vmfex
 
 %description hook-vmfex-dev
@@ -756,7 +600,7 @@ VM-FEX Virtual Function (SR-IOV with macvtap mode).
 %package hook-fcoe
 Summary:        Hook to enable FCoE support
 BuildArch:      noarch
-Requires:       %{name} = %{version}-%{release}
+Requires:       %{name}
 Requires:       fcoe-utils
 
 %description hook-fcoe
@@ -790,13 +634,10 @@ Requires: glusterfs-server >= %{gluster_version}
 Requires: glusterfs-api >= %{gluster_version}
 Requires: glusterfs-geo-replication >= %{gluster_version}
 Requires: glusterfs-events >= %{gluster_version}
-Requires: %{python_or_python3}-magic
-Requires: %{python_pyyaml}
-%if 0%{?fedora} && %{target_py} == py2
-Requires: python2-blivet1 >= 1.20.4-1
-%else
-Requires: %{python_or_python3}-blivet
-%endif
+Requires: python3-magic
+Requires: python3-pyyaml
+Requires: python3-blivet
+Requires: libblockdev-plugins-all
 Requires: xfsprogs
 %ifarch x86_64
 Requires: vdo
@@ -816,11 +657,6 @@ Gluster plugin enables VDSM to serve Gluster functionalities.
 autoreconf -if
 %endif
 
-%if %{with_ovirt_imageio}
-%define enable_ovirt_imageio yes
-%else
-%define enable_ovirt_imageio no
-%endif
 %if %{with_ovirt_vmconsole}
 %define enable_ovirt_vmconsole yes
 %else
@@ -841,14 +677,13 @@ autoreconf -if
 %else
 %define enable_vhostmd no
 %endif
-%configure --with-qemu-user=%{qemu_user} --with-qemu-group=%{qemu_group} --enable-ovirt-imageio=%{enable_ovirt_imageio} --enable-ovirt-vmconsole=%{enable_ovirt_vmconsole} --enable-gluster-mgmt=%{enable_gluster_mgmt} --enable-hooks=%{enable_hooks} --enable-vhostmd=%{enable_vhostmd} --with-data-center=%{vdsm_repo}
+%configure --with-qemu-user=%{qemu_user} --with-qemu-group=%{qemu_group} --enable-ovirt-vmconsole=%{enable_ovirt_vmconsole} --enable-gluster-mgmt=%{enable_gluster_mgmt} --enable-hooks=%{enable_hooks} --enable-vhostmd=%{enable_vhostmd} --with-data-center=%{vdsm_repo}
 make
 
 %install
 make DESTDIR=%{buildroot} install
 
-%if %{target_py} == py3
-%py_byte_compile python3 %{buildroot}/%{_datadir}/%{vdsm_name}/sitecustomize.py
+%py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/sitecustomize.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/after_device_create/openstacknet_utils.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/openstacknet_utils.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/openstacknet_utils.py
@@ -858,17 +693,22 @@ make DESTDIR=%{buildroot} install
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/before_device_create/openstacknet_utils.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/openstacknet_utils.py
 %py_byte_compile python3 %{buildroot}/%{_libexecdir}/%{vdsm_name}/vm_libvirt_hook.py
-%endif
 
 %pre
 # Force standard locale behavior (English)
-export LC_ALL=C
+export LC_ALL=C.UTF8
 
 /usr/bin/getent passwd %{vdsm_user} >/dev/null || \
     /usr/sbin/useradd -r -u 36 -g %{vdsm_group} -d /var/lib/vdsm \
         -s /sbin/nologin -c "Node Virtualization Manager" %{vdsm_user}
 /usr/sbin/usermod -a -G %{qemu_group},%{snlk_group} %{vdsm_user}
 /usr/sbin/usermod -a -G %{cdrom_group} %{qemu_user}
+# imageio has to be part of kvm group to be able to read/write nbd
+# socket and part of qemu group to be able to access images.
+/usr/sbin/usermod -a -G %{qemu_group},%{vdsm_group} %{imageio_user}
+# vdsm has to be part of imageio group to be able to read/write imageio
+# control socket.
+/usr/sbin/usermod -a -G %{imageio_group} %{vdsm_user}
 
 # We keep the previous rpm version number in a file for managing upgrade flow
 if [ "$1" -gt 1 ]; then
@@ -906,15 +746,6 @@ fi
 # refresh vdsm kernel modules requirements to start on boot
 /bin/systemctl restart systemd-modules-load.service >/dev/null 2>&1 || :
 
-# The following triggers vdsmd.preset file and enables vdsm required services
-%systemd_post dev-hugepages1G.mount
-%systemd_post vdsmd.service
-%systemd_post supervdsmd.service
-%systemd_post vdsm-network.service
-%systemd_post vdsm-network-init.service
-%systemd_post mom-vdsm.service
-%systemd_post ksmtuned.service
-
 # VDSM installs unit files - daemon-reload will refresh systemd
 /bin/systemctl daemon-reload >/dev/null 2>&1 || :
 exit 0
@@ -926,7 +757,6 @@ fi
 %systemd_preun dev-hugepages1G.mount
 %systemd_preun vdsmd.service
 %systemd_preun vdsm-network.service
-%systemd_preun vdsm-network-init.service
 %systemd_preun supervdsmd.service
 %systemd_preun mom-vdsm.service
 %systemd_preun ksmtuned.service
@@ -939,28 +769,28 @@ if  [ -f "%{_localstatedir}/lib/%{vdsm_name}/upgraded_version" ]; then
     if [ -f "%{_localstatedir}/lib/%{vdsm_name}/vdsmd_start_required" ]; then
         vdsmd_start_required='yes'
         /bin/rm -f "%{_localstatedir}/lib/%{vdsm_name}/vdsmd_start_required"
-        /bin/systemctl stop vdsmd >/dev/null 2>&1 || :
+        /bin/systemctl stop vdsmd >/dev/null || :
     fi
 
     if [ -f "%{_localstatedir}/lib/%{vdsm_name}/supervdsmd_start_required" ]; then
         supervdsmd_start_required='yes'
         /bin/rm -f "%{_localstatedir}/lib/%{vdsm_name}/supervdsmd_start_required"
-        /bin/systemctl stop supervdsmd >/dev/null 2>&1 || :
+        /bin/systemctl stop supervdsmd >/dev/null || :
     fi
 
-    if /bin/systemctl status vdsm-network >/dev/null 2>&1; then
-        /bin/systemctl stop vdsm-network >/dev/null 2>&1 || :
+    if /bin/systemctl status vdsm-network >/dev/null; then
+        /bin/systemctl stop vdsm-network >/dev/null || :
     fi
 
-    if ! %{_bindir}/vdsm-tool is-configured >/dev/null 2>&1; then
-        %{_bindir}/vdsm-tool configure --force >/dev/null 2>&1
+    if ! %{_bindir}/vdsm-tool is-configured >/dev/null; then
+        %{_bindir}/vdsm-tool configure --force >/dev/null
     fi
 
     if [ "${supervdsmd_start_required}" = 'yes' ]; then
-        /bin/systemctl start supervdsmd >/dev/null 2>&1 || :
+        /bin/systemctl start supervdsmd >/dev/null || :
     fi
     if [ "${vdsmd_start_required}" = 'yes' ]; then
-        /bin/systemctl start vdsmd >/dev/null 2>&1 || :
+        /bin/systemctl start vdsmd >/dev/null || :
     fi
 fi
 exit 0
@@ -971,11 +801,9 @@ exit 0
 %doc README.logging
 %doc ChangeLog
 %license COPYING
-%{_presetdir}/85-vdsmd.preset
 %{_unitdir}/dev-hugepages1G.mount
 %{_unitdir}/vdsmd.service
 %{_unitdir}/vdsm-network.service
-%{_unitdir}/vdsm-network-init.service
 %{_unitdir}/supervdsmd.service
 %{_unitdir}/mom-vdsm.service
 %{_sysconfdir}/systemd/system/libvirtd.service.d/unlimited-core.conf
@@ -994,13 +822,11 @@ exit 0
 %dir %{_sysconfdir}/%{vdsm_name}
 %dir %{_sysconfdir}/%{vdsm_name}/mom.d
 %dir %{_datadir}/%{vdsm_name}
-%{_datadir}/%{vdsm_name}/daemonAdapter
-%{_datadir}/%{vdsm_name}/sitecustomize.py*
-%if %{target_py} == py3
-%{_datadir}/%{vdsm_name}/__pycache__/*
-%endif
-%{_datadir}/%{vdsm_name}/supervdsmd
-%{_datadir}/%{vdsm_name}/vdsmd
+%{_libexecdir}/%{vdsm_name}/daemonAdapter
+%{_libexecdir}/%{vdsm_name}/sitecustomize.py
+%{_libexecdir}/%{vdsm_name}/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/supervdsmd
+%{_libexecdir}/%{vdsm_name}/vdsmd
 
 %config(noreplace) %{_sysconfdir}/%{vdsm_name}/vdsm.conf
 %config(noreplace) %{_sysconfdir}/%{vdsm_name}/logger.conf
@@ -1010,36 +836,28 @@ exit 0
 %config(noreplace) %{_sysconfdir}/%{vdsm_name}/logrotate/vdsm
 %config(noreplace) %{_sysconfdir}/sysctl.d/vdsm.conf
 %config(noreplace) %{_sysconfdir}/modules-load.d/vdsm.conf
+%{_sysconfdir}/ovirt-imageio/conf.d/60-vdsm.conf
 %{_tmpfilesdir}/%{vdsm_name}.conf
-%{_sysconfdir}/dhcp/dhclient.d/dhclientmon.sh
 %{_sysconfdir}/modprobe.d/vdsm-bonding-modprobe.conf
 %{_sysconfdir}/NetworkManager/conf.d/vdsm.conf
-%{_sysconfdir}/sudoers.d/50_vdsm
+%attr(440, root, root) %{_sysconfdir}/sudoers.d/50_vdsm
 %{_sysconfdir}/cron.hourly/vdsm-logrotate
 %{_sysconfdir}/libvirt/hooks/qemu
-%{_exec_prefix}/lib/dracut/dracut.conf.d/99-vdsm_protect_ifcfg.conf
 %{_libexecdir}/%{vdsm_name}/curl-img-wrap
 %{_libexecdir}/%{vdsm_name}/fc-scan
 %{_libexecdir}/%{vdsm_name}/managedvolume-helper
 %{_libexecdir}/%{vdsm_name}/vdsm-gencerts.sh
 %{_libexecdir}/%{vdsm_name}/vdsmd_init_common.sh
-%{_libexecdir}/%{vdsm_name}/vm_libvirt_hook.py*
+%{_libexecdir}/%{vdsm_name}/vm_libvirt_hook.py
 %{_libexecdir}/%{vdsm_name}/kvm2ovirt
 %{_libexecdir}/%{vdsm_name}/fallocate
-%{_libexecdir}/%{vdsm_name}/wait_for_ipv4s
 %{_libexecdir}/%{vdsm_name}/spmprotect.sh
 %{_libexecdir}/%{vdsm_name}/spmstop.sh
-%if %{target_py} == py3
 %{_libexecdir}/%{vdsm_name}/__pycache__/*
-%endif
 %dir %{_libexecdir}/%{vdsm_name}/hooks
 %dir %{_libexecdir}/%{vdsm_name}/hooks/*
-%if %{target_py} == py3 && ( ! 0%{?rhel} || 0%{?rhel} >= 8 )
 %{python3_sitelib}/dnf-plugins/*.py
 %{python3_sitelib}/dnf-plugins/__pycache__/*
-%else
-%exclude %{python_sitelib}/dnf-plugins
-%endif
 
 %{_libexecdir}/%{vdsm_name}/get-conf-item
 %{_udevrulesdir}/12-vdsm-lvm.rules
@@ -1065,6 +883,7 @@ exit 0
 %dir %{_localstatedir}/lib/%{vdsm_name}/upgrade
 %dir %{_localstatedir}/log/%{vdsm_name}
 %dir %{_localstatedir}/log/%{vdsm_name}/backup
+%dir %attr(750, %{vdsm_user}, %{vdsm_group}) %{_localstatedir}/log/%{vdsm_name}/commands
 %dir %{_localstatedir}/log/%{vdsm_name}/import
 %defattr(644, %{vdsm_user}, %{vdsm_group}, -)
 %{_datadir}/%{vdsm_name}/lvmlocal.conf
@@ -1072,67 +891,19 @@ exit 0
 
 
 %files common
-%{python_sitelib}/%{vdsm_name}/__init__.py*
-%if %{target_py} == py3
+%{python3_sitelib}/%{vdsm_name}/__init__.py
 %{python3_sitelib}/%{vdsm_name}/__pycache__/__init__.*.pyc
-%endif
-%{python_sitelib}/%{vdsm_name}/common
+%{python3_sitelib}/%{vdsm_name}/common
 
 %files network
-%{python_sitelib}/%{vdsm_name}/network
+%{python3_sitelib}/%{vdsm_name}/network
 
 %files python
 %{_mandir}/man1/vdsm-tool.1*
 %{_bindir}/vdsm-tool
-%{python_sitelib}/%{vdsm_name}/alignmentScan.py*
-%{python_sitelib}/%{vdsm_name}/API.py*
-%{python_sitelib}/%{vdsm_name}/client.py*
-%{python_sitelib}/%{vdsm_name}/clientIF.py*
-%{python_sitelib}/%{vdsm_name}/hook/
-%{python_sitelib}/%{vdsm_name}/host/
-%{python_sitelib}/%{vdsm_name}/config.py*
-%{python_sitelib}/%{vdsm_name}/constants.py*
-%{python_sitelib}/%{vdsm_name}/cpuinfo.py*
-%{python_sitelib}/%{vdsm_name}/dmidecodeUtil.py*
-%{python_sitelib}/%{vdsm_name}/executor.py*
-# gluster.exception is used in many places like Bridge.py. So it is required
-# even without vdsm-gluster package
-%{python_sitelib}/%{vdsm_name}/gluster/__init__.py*
-%{python_sitelib}/%{vdsm_name}/gluster/cli.py*
-%{python_sitelib}/%{vdsm_name}/gluster/exception.py*
-%{python_sitelib}/%{vdsm_name}/health.py*
-%{python_sitelib}/%{vdsm_name}/hugepages.py*
-%{python_sitelib}/%{vdsm_name}/jobs.py*
-%{python_sitelib}/%{vdsm_name}/jsonrpcvdscli.py*
-%{python_sitelib}/%{vdsm_name}/kvm2ovirt.py*
-%{python_sitelib}/%{vdsm_name}/logUtils.py*
-%{python_sitelib}/%{vdsm_name}/machinetype.py*
-%{python_sitelib}/%{vdsm_name}/metrics/
-%{python_sitelib}/%{vdsm_name}/moduleloader.py*
-%{python_sitelib}/%{vdsm_name}/momIF.py*
-%{python_sitelib}/%{vdsm_name}/mkimage.py*
-%{python_sitelib}/%{vdsm_name}/numa.py*
-%{python_sitelib}/%{vdsm_name}/osinfo.py*
-%{python_sitelib}/%{vdsm_name}/ppc64HardwareInfo.py*
-%{python_sitelib}/%{vdsm_name}/protocoldetector.py*
-%{python_sitelib}/%{vdsm_name}/schedule.py*
-%{python_sitelib}/%{vdsm_name}/sslutils.py*
-%{python_sitelib}/%{vdsm_name}/supervdsm_server.py*
-%{python_sitelib}/%{vdsm_name}/taskset.py*
-%{python_sitelib}/%{vdsm_name}/throttledlog.py*
-%{python_sitelib}/%{vdsm_name}/utils.py*
-%{python_sitelib}/%{vdsm_name}/v2v.py*
-%{python_sitelib}/%{vdsm_name}/vdsmd.py*
-%{python_sitelib}/%{vdsm_name}/virtsparsify.py*
-%{python_sitelib}/%{vdsm_name}/virtsysprep.py*
-%{python_sitelib}/%{vdsm_name}/profiling/
-%{python_sitelib}/%{vdsm_name}/storage/
-%{python_sitelib}/%{vdsm_name}/supervdsm_api/
-%{python_sitelib}/%{vdsm_name}/tool/
-%{python_sitelib}/%{vdsm_name}/virt/
-%if %{target_py} == py3
-%{python3_sitelib}/%{vdsm_name}/__pycache__/alignmentScan.*.pyc
+%{python3_sitelib}/%{vdsm_name}/API.py
 %{python3_sitelib}/%{vdsm_name}/__pycache__/API.*.pyc
+%{python3_sitelib}/%{vdsm_name}/__pycache__/alignmentScan.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/client.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/clientIF.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/config.*.pyc
@@ -1147,9 +918,9 @@ exit 0
 %{python3_sitelib}/%{vdsm_name}/__pycache__/kvm2ovirt.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/logUtils.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/machinetype.*.pyc
+%{python3_sitelib}/%{vdsm_name}/__pycache__/mkimage.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/moduleloader.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/momIF.*.pyc
-%{python3_sitelib}/%{vdsm_name}/__pycache__/mkimage.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/numa.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/osinfo.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/ppc64HardwareInfo.*.pyc
@@ -1164,41 +935,83 @@ exit 0
 %{python3_sitelib}/%{vdsm_name}/__pycache__/vdsmd.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/virtsparsify.*.pyc
 %{python3_sitelib}/%{vdsm_name}/__pycache__/virtsysprep.*.pyc
+%{python3_sitelib}/%{vdsm_name}/alignmentScan.py
+%{python3_sitelib}/%{vdsm_name}/client.py
+%{python3_sitelib}/%{vdsm_name}/clientIF.py
+%{python3_sitelib}/%{vdsm_name}/config.py
+%{python3_sitelib}/%{vdsm_name}/constants.py
+%{python3_sitelib}/%{vdsm_name}/cpuinfo.py
+%{python3_sitelib}/%{vdsm_name}/dmidecodeUtil.py
+%{python3_sitelib}/%{vdsm_name}/executor.py
+# gluster.exception is used in many places like Bridge.py. So it is required
+# even without vdsm-gluster package
+%{python3_sitelib}/%{vdsm_name}/gluster/__init__.py
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/__init__.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/cli.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/exception.*.pyc
-%endif
+%{python3_sitelib}/%{vdsm_name}/gluster/cli.py
+%{python3_sitelib}/%{vdsm_name}/gluster/exception.py
+%{python3_sitelib}/%{vdsm_name}/health.py
+%{python3_sitelib}/%{vdsm_name}/hook/
+%{python3_sitelib}/%{vdsm_name}/host/
+%{python3_sitelib}/%{vdsm_name}/hugepages.py
+%{python3_sitelib}/%{vdsm_name}/jobs.py
+%{python3_sitelib}/%{vdsm_name}/jsonrpcvdscli.py
+%{python3_sitelib}/%{vdsm_name}/kvm2ovirt.py
+%{python3_sitelib}/%{vdsm_name}/logUtils.py
+%{python3_sitelib}/%{vdsm_name}/machinetype.py
+%{python3_sitelib}/%{vdsm_name}/metrics/
+%{python3_sitelib}/%{vdsm_name}/mkimage.py
+%{python3_sitelib}/%{vdsm_name}/moduleloader.py
+%{python3_sitelib}/%{vdsm_name}/momIF.py
+%{python3_sitelib}/%{vdsm_name}/numa.py
+%{python3_sitelib}/%{vdsm_name}/osinfo.py
+%{python3_sitelib}/%{vdsm_name}/ppc64HardwareInfo.py
+%{python3_sitelib}/%{vdsm_name}/profiling/
+%{python3_sitelib}/%{vdsm_name}/protocoldetector.py
+%{python3_sitelib}/%{vdsm_name}/schedule.py
+%{python3_sitelib}/%{vdsm_name}/sslutils.py
+%{python3_sitelib}/%{vdsm_name}/storage/
+%{python3_sitelib}/%{vdsm_name}/supervdsm_api/
+%{python3_sitelib}/%{vdsm_name}/supervdsm_server.py
+%{python3_sitelib}/%{vdsm_name}/taskset.py
+%{python3_sitelib}/%{vdsm_name}/throttledlog.py
+%{python3_sitelib}/%{vdsm_name}/tool/
+%{python3_sitelib}/%{vdsm_name}/utils.py
+%{python3_sitelib}/%{vdsm_name}/v2v.py
+%{python3_sitelib}/%{vdsm_name}/vdsmd.py
+%{python3_sitelib}/%{vdsm_name}/virt/
+%{python3_sitelib}/%{vdsm_name}/virtsparsify.py
+%{python3_sitelib}/%{vdsm_name}/virtsysprep.py
 
 %files hook-openstacknet
-%{_sysconfdir}/sudoers.d/50_vdsm_hook_openstacknet
+%attr(440, root, root) %{_sysconfdir}/sudoers.d/50_vdsm_hook_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/after_device_create/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/after_device_create/openstacknet_utils.py*
-%{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/openstacknet_utils.py*
-%{_libexecdir}/%{vdsm_name}/hooks/after_nic_hotplug/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/after_nic_hotplug/openstacknet_utils.py*
-%{_libexecdir}/%{vdsm_name}/hooks/after_vm_start/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/after_vm_start/openstacknet_utils.py*
-%{_libexecdir}/%{vdsm_name}/hooks/before_device_create/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/before_device_create/openstacknet_utils.py*
-%{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/openstacknet_utils.py*
-%{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/50_openstacknet
-%{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/openstacknet_utils.py*
-%if %{target_py} == py3
 %{_libexecdir}/%{vdsm_name}/hooks/after_device_create/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/hooks/after_device_create/openstacknet_utils.py
+%{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/50_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/hooks/after_device_migrate_destination/openstacknet_utils.py
+%{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/50_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/hooks/after_get_caps/openstacknet_utils.py
+%{_libexecdir}/%{vdsm_name}/hooks/after_nic_hotplug/50_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/after_nic_hotplug/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/hooks/after_nic_hotplug/openstacknet_utils.py
+%{_libexecdir}/%{vdsm_name}/hooks/after_vm_start/50_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/after_vm_start/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/hooks/after_vm_start/openstacknet_utils.py
+%{_libexecdir}/%{vdsm_name}/hooks/before_device_create/50_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/before_device_create/__pycache__/*
+%{_libexecdir}/%{vdsm_name}/hooks/before_device_create/openstacknet_utils.py
+%{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/50_openstacknet
 %{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/__pycache__/*
-%endif
+%{_libexecdir}/%{vdsm_name}/hooks/before_nic_hotplug/openstacknet_utils.py
 
 %if %{with_vhostmd}
 %files hook-vhostmd
 %license COPYING
-%{_sysconfdir}/sudoers.d/50_vdsm_hook_vhostmd
+%attr(440, root, root) %{_sysconfdir}/sudoers.d/50_vdsm_hook_vhostmd
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_vhostmd
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_migrate_destination/50_vhostmd
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_dehibernate/50_vhostmd
@@ -1223,7 +1036,7 @@ exit 0
 %{_libexecdir}/%{vdsm_name}/hooks/before_network_setup/50_fcoe
 
 %files hook-localdisk
-%{_sysconfdir}/sudoers.d/50_vdsm_hook_localdisk
+%attr(440, root, root) %{_sysconfdir}/sudoers.d/50_vdsm_hook_localdisk
 %{_libexecdir}/%{vdsm_name}/hooks/after_disk_prepare/localdisk
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_migrate_source/localdisk
 %{_libexecdir}/%{vdsm_name}/localdisk-helper
@@ -1250,10 +1063,8 @@ exit 0
 %files hook-checkips
 %{_libexecdir}/%{vdsm_name}/hooks/after_get_stats/10_checkips
 %{_libexecdir}/%{vdsm_name}/hooks/checkipsd
-%{_libexecdir}/%{vdsm_name}/hooks/after_get_stats/checkips_utils.py*
-%if %{target_py} == py3
+%{_libexecdir}/%{vdsm_name}/hooks/after_get_stats/checkips_utils.py
 %{_libexecdir}/%{vdsm_name}/hooks/after_get_stats/__pycache__/checkips_utils.*.pyc
-%endif
 %{_unitdir}/vdsm-checkips.service
 
 %files hook-extra-ipv4-addrs
@@ -1295,65 +1106,55 @@ exit 0
 %endif
 
 %files http
-%{python_sitelib}/%{vdsm_name}/rpc/http.py*
-%if %{target_py} == py3
 %{python3_sitelib}/%{vdsm_name}/rpc/__pycache__/http.*.pyc
-%endif
+%{python3_sitelib}/%{vdsm_name}/rpc/http.py
 
 %files client
 %{_bindir}/vdsm-client
-%dir %{python_sitelib}/vdsmclient
-%{python_sitelib}/vdsmclient/__init__.py*
-%{python_sitelib}/vdsmclient/client.py*
-%{python_sitelib}/yajsonrpc/__init__.py*
-%if %{target_py} == py3
+%dir %{python3_sitelib}/vdsmclient
+%{python3_sitelib}/vdsmclient/__init__.py
 %{python3_sitelib}/vdsmclient/__pycache__/*
+%{python3_sitelib}/vdsmclient/client.py
+%{python3_sitelib}/yajsonrpc/__init__.py
 %{python3_sitelib}/yajsonrpc/__pycache__/__init__.*.pyc
-%endif
 %{_mandir}/man1/vdsm-client.1*
 
 %files jsonrpc
-%{python_sitelib}/%{vdsm_name}/rpc/__init__.py*
-%{python_sitelib}/%{vdsm_name}/rpc/bindingjsonrpc.py*
-%{python_sitelib}/%{vdsm_name}/rpc/Bridge.py*
-%{python_sitelib}/yajsonrpc/__init__.py*
-%{python_sitelib}/yajsonrpc/jsonrpcclient.py*
-%if %{target_py} == py3
+%{python3_sitelib}/%{vdsm_name}/rpc/Bridge.py
+%{python3_sitelib}/%{vdsm_name}/rpc/__init__.py
+%{python3_sitelib}/%{vdsm_name}/rpc/__pycache__/Bridge.*.pyc
 %{python3_sitelib}/%{vdsm_name}/rpc/__pycache__/__init__.*.pyc
 %{python3_sitelib}/%{vdsm_name}/rpc/__pycache__/bindingjsonrpc.*.pyc
-%{python3_sitelib}/%{vdsm_name}/rpc/__pycache__/Bridge.*.pyc
+%{python3_sitelib}/%{vdsm_name}/rpc/bindingjsonrpc.py
+%{python3_sitelib}/yajsonrpc/__init__.py
 %{python3_sitelib}/yajsonrpc/__pycache__/__init__.*.pyc
 %{python3_sitelib}/yajsonrpc/__pycache__/jsonrpcclient.*.pyc
-%endif
+%{python3_sitelib}/yajsonrpc/jsonrpcclient.py
 
 %files api
 %doc lib/vdsm/api/vdsm-api.html
-%dir %{python_sitelib}/%{vdsm_name}
-%dir %{python_sitelib}/%{vdsm_name}/api
-%dir %{python_sitelib}/%{vdsm_name}/rpc
-%{python_sitelib}/%{vdsm_name}/api/*.py*
-%{python_sitelib}/%{vdsm_name}/rpc/vdsm-api.pickle
-%{python_sitelib}/%{vdsm_name}/rpc/vdsm-events.pickle
-%if %{target_py} == py3
+%dir %{python3_sitelib}/%{vdsm_name}
+%dir %{python3_sitelib}/%{vdsm_name}/api
+%dir %{python3_sitelib}/%{vdsm_name}/rpc
+%{python3_sitelib}/%{vdsm_name}/api/*.py
+%{python3_sitelib}/%{vdsm_name}/rpc/vdsm-api.pickle
+%{python3_sitelib}/%{vdsm_name}/rpc/vdsm-events.pickle
 %{python3_sitelib}/%{vdsm_name}/api/__pycache__/*
-%endif
 %if ! %{with_gluster_mgmt}
-%exclude %{python_sitelib}/%{vdsm_name}/rpc/vdsm-api-gluster.pickle
+%exclude %{python3_sitelib}/%{vdsm_name}/rpc/vdsm-api-gluster.pickle
 %endif
 
 %files yajsonrpc
-%{python_sitelib}/yajsonrpc/betterAsyncore.py*
-%{python_sitelib}/yajsonrpc/exception.py*
-%{python_sitelib}/yajsonrpc/stomp.py*
-%{python_sitelib}/yajsonrpc/stompclient.py*
-%{python_sitelib}/yajsonrpc/stompserver.py*
-%if %{target_py} == py3
 %{python3_sitelib}/yajsonrpc/__pycache__/betterAsyncore.*.pyc
 %{python3_sitelib}/yajsonrpc/__pycache__/exception.*.pyc
 %{python3_sitelib}/yajsonrpc/__pycache__/stomp.*.pyc
 %{python3_sitelib}/yajsonrpc/__pycache__/stompclient.*.pyc
 %{python3_sitelib}/yajsonrpc/__pycache__/stompserver.*.pyc
-%endif
+%{python3_sitelib}/yajsonrpc/betterAsyncore.py
+%{python3_sitelib}/yajsonrpc/exception.py
+%{python3_sitelib}/yajsonrpc/stomp.py
+%{python3_sitelib}/yajsonrpc/stompclient.py
+%{python3_sitelib}/yajsonrpc/stompserver.py
 
 %files hook-faqemu
 %license COPYING
@@ -1363,33 +1164,31 @@ exit 0
 %if %{with_gluster_mgmt}
 %files gluster
 %license COPYING
-%{python_sitelib}/%{vdsm_name}/gluster/api.py*
-%{python_sitelib}/%{vdsm_name}/gluster/apiwrapper.py*
-%{python_sitelib}/%{vdsm_name}/gluster/events.py*
-%{python_sitelib}/%{vdsm_name}/gluster/fstab.py*
-%{python_sitelib}/%{vdsm_name}/gluster/fence.py*
-%{python_sitelib}/%{vdsm_name}/gluster/gfapi.py*
-%{python_sitelib}/%{vdsm_name}/gluster/hooks.py*
-%{python_sitelib}/%{vdsm_name}/gluster/services.py*
-%{python_sitelib}/%{vdsm_name}/gluster/storagedev.py*
-%{python_sitelib}/%{vdsm_name}/gluster/tasks.py*
-%{python_sitelib}/%{vdsm_name}/gluster/thinstorage.py*
-%{python_sitelib}/%{vdsm_name}/rpc/vdsm-api-gluster.pickle
-%if %{target_py} == py3
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/api.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/apiwrapper.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/events.*.pyc
-%{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/fstab.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/fence.*.pyc
+%{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/fstab.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/gfapi.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/hooks.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/services.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/storagedev.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/tasks.*.pyc
 %{python3_sitelib}/%{vdsm_name}/gluster/__pycache__/thinstorage.*.pyc
-%endif
+%{python3_sitelib}/%{vdsm_name}/gluster/api.py
+%{python3_sitelib}/%{vdsm_name}/gluster/apiwrapper.py
+%{python3_sitelib}/%{vdsm_name}/gluster/events.py
+%{python3_sitelib}/%{vdsm_name}/gluster/fence.py
+%{python3_sitelib}/%{vdsm_name}/gluster/fstab.py
+%{python3_sitelib}/%{vdsm_name}/gluster/gfapi.py
+%{python3_sitelib}/%{vdsm_name}/gluster/hooks.py
+%{python3_sitelib}/%{vdsm_name}/gluster/services.py
+%{python3_sitelib}/%{vdsm_name}/gluster/storagedev.py
+%{python3_sitelib}/%{vdsm_name}/gluster/tasks.py
+%{python3_sitelib}/%{vdsm_name}/gluster/thinstorage.py
+%{python3_sitelib}/%{vdsm_name}/rpc/vdsm-api-gluster.pickle
 %endif
 
 %changelog
-* Tue Feb 26 2019 Milan Zamazal <mzamazal@redhat.com> - 4.40
+* Tue Mar 15 2022 Milan Zamazal <mzamazal@redhat.com> - 4.50.0.10
 - See %{_docdir}/%{vdsm_name}/ChangeLog for the complete list of Vdsm changes.

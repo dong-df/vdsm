@@ -88,6 +88,12 @@ class FakeCheckService(object):
         callback(result)
 
 
+# Domain states
+CREATED = "created"
+SETUP = "setup"
+TEARDOWN = "teardown"
+
+
 class FakeDomain(object):
     """
     Fake storage domain implementing the minimal interface required for domain
@@ -98,6 +104,7 @@ class FakeDomain(object):
         self.sdUUID = sdUUID
         self.version = version
         self.iso_dir = iso_dir
+        self.state = CREATED
         self.acquired = False
         self.stats = {
             'disktotal': '100',
@@ -110,6 +117,18 @@ class FakeDomain(object):
         # Test may set errors here to make method calls raise expected or
         # unexpected errors.
         self.errors = {}
+
+    @maybefail
+    def setup(self):
+        log.debug("Setting up")
+        assert self.state == CREATED
+        self.state = SETUP
+
+    @maybefail
+    def teardown(self):
+        log.debug("Tearing down")
+        assert self.state == SETUP
+        self.state = TEARDOWN
 
     @maybefail
     def selftest(self):
@@ -219,6 +238,26 @@ def monitor_env(shutdown=False, refresh=300):
                 thread.join()
             except RuntimeError as e:
                 log.error("Error joining thread: %s", e)
+
+
+class FakeMonitorThread(object):
+
+    def __init__(self, sd_uuid, host_id, interval, event, checker):
+        self.sdUUID = sd_uuid
+
+    def start(self):
+        pass
+
+    def stop(self, shutdown=False):
+        pass
+
+    def join(self):
+        pass
+
+    def getStatus(self):
+        return monitor.Status(
+            monitor.PathStatus(),
+            monitor.DomainStatus())
 
 
 class TestMonitorThreadIdle(VdsmTestCase):
@@ -347,6 +386,39 @@ class TestMonitorThreadSetup(VdsmTestCase):
             env.wait_for_cycle()
             self.assertNotIn(domain.sdUUID, monitor.sdCache.domains)
 
+    def test_domain_setup_called(self):
+        with monitor_env() as env:
+            domain = FakeDomain("uuid")
+            monitor.sdCache.domains["uuid"] = domain
+            self.assertEqual(domain.state, CREATED)
+            env.thread.start()
+            env.wait_for_cycle()
+            self.assertEqual(domain.state, SETUP)
+
+    def test_setup_retry(self):
+        with monitor_env() as env:
+            domain = FakeDomain("uuid")
+            domain.errors["setup"] = Exception
+            monitor.sdCache.domains["uuid"] = domain
+            env.thread.start()
+            env.wait_for_cycle()
+            # domain.setup() fails
+            del domain.errors["setup"]
+            env.wait_for_cycle()
+            # domain.setup() succeeds
+            self.assertEqual(domain.state, SETUP)
+
+    def test_setup_failed(self):
+        with monitor_env() as env:
+            domain = FakeDomain("uuid")
+            domain.errors["setup"] = Exception
+            monitor.sdCache.domains["uuid"] = domain
+            env.thread.start()
+            env.wait_for_cycle()
+            # domain.setup() fails
+            self.assertEqual(domain.state, CREATED)
+        self.assertEqual(domain.state, CREATED)
+
 
 @expandPermutations
 class TestMonitorThreadMonitoring(VdsmTestCase):
@@ -392,7 +464,8 @@ class TestMonitorThreadMonitoring(VdsmTestCase):
         ("selftest", OSError),
         ("selftest", UnexpectedError),
         ("getStats", se.FileStorageDomainStaleNFSHandle),
-        ("getStats", se.StorageDomainAccessError),
+        # TODO: Uncomment when test is fixed to not check a type.
+        # ("getStats", se.StorageDomainAccessError("fake-sd-id")),
         ("getStats", UnexpectedError),
         ("validateMaster", OSError),
         ("validateMaster", UnexpectedError),
@@ -411,7 +484,11 @@ class TestMonitorThreadMonitoring(VdsmTestCase):
             status = env.thread.getStatus()
             self.assertTrue(status.actual)
             self.assertFalse(status.valid)
+
+            # TODO: Should assert we got an exception set by the test instead
+            # of checking a type.
             self.assertIsInstance(status.error, exception)
+
             self.assertEqual(env.event.received, [(('uuid', False), {})])
 
     @permutations([[se.MiscFileReadException], [UnexpectedError]])
@@ -440,7 +517,7 @@ class TestMonitorThreadMonitoring(VdsmTestCase):
         ("selftest", OSError),
         ("selftest", UnexpectedError),
         ("getStats", se.FileStorageDomainStaleNFSHandle),
-        ("getStats", se.StorageDomainAccessError),
+        ("getStats", se.StorageDomainAccessError("fake-sd-id")),
         ("getStats", UnexpectedError),
         ("validateMaster", OSError),
         ("validateMaster", UnexpectedError),
@@ -517,7 +594,8 @@ class TestMonitorThreadMonitoring(VdsmTestCase):
         ("selftest", OSError),
         ("selftest", UnexpectedError),
         ("getStats", se.FileStorageDomainStaleNFSHandle),
-        ("getStats", se.StorageDomainAccessError),
+        # TODO: Uncomment when test is fixed to not check a type.
+        # ("getStats", se.StorageDomainAccessError("fake-sd-id")),
         ("getStats", UnexpectedError),
         ("validateMaster", OSError),
         ("validateMaster", UnexpectedError),
@@ -540,7 +618,11 @@ class TestMonitorThreadMonitoring(VdsmTestCase):
             env.wait_for_cycle()
             status = env.thread.getStatus()
             self.assertFalse(status.valid)
+
+            # TODO: Should assert we got an exception set by the test instead
+            # of checking a type.
             self.assertIsInstance(status.error, exception)
+
             self.assertEqual(env.event.received, [(('uuid', False), {})])
 
     @permutations([[se.MiscFileReadException], [UnexpectedError]])
@@ -722,6 +804,32 @@ class TestMonitorThreadStopping(VdsmTestCase):
         self.assertFalse(domain.acquired)
         self.assertNotIn(domain.getMonitoringPath(), env.checker.checkers)
 
+    def test_stop_teardown(self):
+        with monitor_env(shutdown=False) as env:
+            domain = FakeDomain("uuid")
+            monitor.sdCache.domains["uuid"] = domain
+            env.thread.start()
+            env.wait_for_cycle()
+        self.assertEqual(domain.state, TEARDOWN)
+
+    def test_shutdown_no_teardown(self):
+        with monitor_env(shutdown=True) as env:
+            domain = FakeDomain("uuid")
+            monitor.sdCache.domains["uuid"] = domain
+            env.thread.start()
+            env.wait_for_cycle()
+        self.assertEqual(domain.state, SETUP)
+
+    def test_teardown_failed(self):
+        with monitor_env() as env:
+            domain = FakeDomain("uuid")
+            domain.errors["teardown"] = Exception
+            monitor.sdCache.domains["uuid"] = domain
+            env.thread.start()
+            env.wait_for_cycle()
+        # teardown fails
+        self.assertEqual(domain.state, SETUP)
+
 
 @expandPermutations
 class TestStatus(VdsmTestCase):
@@ -817,3 +925,24 @@ class TestStatus(VdsmTestCase):
         status = monitor.Status(monitor.PathStatus(), monitor.DomainStatus())
         self.assertEqual(value, getattr(status, attr))
         self.assertRaises(AttributeError, setattr, status, attr, "new")
+
+
+class TestDomainMonitor:
+
+    def test_start_stop(self, monkeypatch):
+        monkeypatch.setattr(monitor, "MonitorThread", FakeMonitorThread)
+
+        mon = monitor.DomainMonitor(MONITOR_INTERVAL)
+        # Start monitoring SD.
+        mon.startMonitoring("uuid", "host-id")
+        assert mon.domains == ["uuid"]
+        assert mon.poolDomains == ["uuid"]
+        sd_uid, status = mon.getDomainsStatus()[0]
+        assert sd_uid == "uuid"
+        assert status.valid
+
+        # Stop monitoring SD.
+        mon.stopMonitoring(["uuid"])
+        assert mon.domains == []
+        assert mon.poolDomains == []
+        assert mon.getDomainsStatus() == []

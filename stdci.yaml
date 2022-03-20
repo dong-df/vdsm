@@ -1,3 +1,4 @@
+---
 release_branches:
   master:
     - ovirt-master
@@ -9,56 +10,7 @@ stages:
       substages:
         - build-py3:
             archs:
-              - ppc64le:
-                  distributions:
-                    - el8
               - x86_64:
                   distributions:
-                    - el8
-                    - fc30
-  - check-patch:
-      archs:
-        - x86_64
-      substages:
-        - install:
-            run-if:
-              file-changed:
-                - 'vdsm.spec.in'
-                - '*Makefile.am'
-                - 'automation/*'
-                - 'build-aux/*'
-            distributions:
-              - el8
-              - fc30
-        - linters:
-            distributions:
-              - fc30
-        - tests-py3:
-            runtime-requirements:
-              host-distro: newer
-            distributions:
-              - el8
-              - fc30
-  - check-network: &check-network
-      archs:
-        - x86_64
-      substages:
-        - functional-linux-bridge-lib:
-            runtime-requirements:
-              host-distro: newer
-            distributions:
-              - fc30
-        - functional-ovs-switch-lib:
-            runtime-requirements:
-              host-distro: newer
-            distributions:
-              - fc30
-        - functional-linux-bridge-nmstate:
-            runtime-requirements:
-              host-distro: newer
-            distributions:
-              - fc30
-  - poll-upstream-sources:
-      <<: *check-network
-      script:
-        from-file: automation/check-network.{{ substage }}.sh
+                    - el8stream
+                    - rhel8

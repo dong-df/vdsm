@@ -20,9 +20,13 @@
 
 from __future__ import absolute_import
 from __future__ import division
-from contextlib import contextmanager
+
 import logging
 import time
+
+from contextlib import contextmanager
+from unittest import mock
+
 from six.moves import queue
 
 from integration.jsonRpcHelper import constructClient
@@ -30,8 +34,7 @@ from integration.sslhelper import generate_key_cert_pair, create_ssl_context
 
 from testlib import \
     VdsmTestCase, \
-    dummyTextGenerator, \
-    mock
+    dummyTextGenerator
 
 from testValidation import broken_on_ci
 from testValidation import slowtest
@@ -132,6 +135,7 @@ class VdsmClientTests(VdsmTestCase):
         except queue.Empty:
             self.fail("Event queue timed out.")
 
+    @broken_on_ci("Fails randomly in CI", name="TRAVIS_CI")
     def test_call(self):
         with self._create_client() as client:
             msg = dummyTextGenerator(1024)
@@ -139,7 +143,7 @@ class VdsmClientTests(VdsmTestCase):
 
             self.assertEqual(msg, res)
 
-    @broken_on_ci("Fails randomly in CI")
+    @broken_on_ci("Fails randomly in CI", name="TRAVIS_CI")
     def test_failing_call(self):
         with self._create_client() as client:
             with self.assertRaises(ServerError) as ex:
@@ -151,7 +155,7 @@ class VdsmClientTests(VdsmTestCase):
             )
             self.assertIn("Test failure", str(ex.exception))
 
-    @broken_on_ci("Fails randomly in CI")
+    @broken_on_ci("Fails randomly in CI", name="TRAVIS_CI")
     def test_missing_method(self):
         with self._create_client() as client:
             with self.assertRaises(ServerError) as ex:
@@ -166,6 +170,7 @@ class VdsmClientTests(VdsmTestCase):
             with self.assertRaises(AttributeError):
                 client.MissingNamespace.missingMethod()
 
+    @broken_on_ci("Fails randomly in CI", name="TRAVIS_CI")
     def test_bad_parameters(self):
         with self._create_client() as client:
             with self.assertRaises(ServerError) as ex:
@@ -206,6 +211,7 @@ class VdsmClientTests(VdsmTestCase):
             with self.assertRaises(TimeoutError):
                 client.Test.slowCall()
 
+    @broken_on_ci(reason="Fails randomly in CI", name="TRAVIS_CI")
     def test_event_handler(self):
         with self._create_client() as client:
             event_queue = queue.Queue()
@@ -223,7 +229,7 @@ class VdsmClientTests(VdsmTestCase):
                 None
             )
 
-    @broken_on_ci(reason="Fails randomly in CI")
+    @broken_on_ci(reason="Fails randomly in CI", name="TRAVIS_CI")
     def test_multiple_queues(self):
         with self._create_client() as client:
             event_queue1 = queue.Queue()
@@ -267,7 +273,7 @@ class VdsmClientTests(VdsmTestCase):
                 None
             )
 
-    @broken_on_ci(reason="Fails randomly in CI")
+    @broken_on_ci(reason="Fails randomly in CI", name="TRAVIS_CI")
     def test_notify(self):
         with self._create_client() as client:
             event_queue = queue.Queue()

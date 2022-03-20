@@ -195,7 +195,7 @@ class StoragePoolDiskBackend(StoragePoolBackendInterface):
 
     __slots__ = ('pool',)
 
-    log = logging.getLogger('storage.StoragePoolDiskBackend')
+    log = logging.getLogger('storage.storagepooldiskbackend')
 
     def __init__(self, pool):
         self.pool = weakref.proxy(pool)
@@ -203,7 +203,7 @@ class StoragePoolDiskBackend(StoragePoolBackendInterface):
     # Read-Only StoragePool Object Accessors ###
 
     def __is_secure__(self):
-        return self.pool.isSecure()
+        return self.pool.is_secure()
 
     @property
     def id(self):
@@ -387,7 +387,7 @@ class StoragePoolMemoryBackend(StoragePoolBackendInterface):
 
     __slots__ = ('pool', 'masterVersion', 'domainsMap')
 
-    log = logging.getLogger('storage.StoragePoolMemoryBackend')
+    log = logging.getLogger('storage.storagepoolmemorybackend')
 
     def __init__(self, pool, masterVersion, domainsMap):
         self.pool = weakref.proxy(pool)
@@ -396,7 +396,7 @@ class StoragePoolMemoryBackend(StoragePoolBackendInterface):
     # Read-Only StoragePool Object Accessors
 
     def __is_secure__(self):
-        return self.pool.isSecure()
+        return self.pool.is_secure()
 
     @property
     def spUUID(self):
@@ -412,12 +412,12 @@ class StoragePoolMemoryBackend(StoragePoolBackendInterface):
     def getSpmStatus(self):
         # FIXME: unify with StoragePoolDiskBackend
         try:
-            lVer, spmId = self.masterDomain.inquireClusterLock()
+            lVer, spmId = self.masterDomain.inspectClusterLock()
         except clusterlock.TemporaryFailure as e:
             raise exception.expected(e)
         return lVer or LVER_INVALID, spmId or SPM_ID_FREE
 
-    def setSpmStatus(self, lVer, spmId):
+    def setSpmStatus(self, lVer=None, spmId=None):
         self.log.debug(
             'this storage pool implementation ignores the set spm '
             'status requests (lver=%s, spmid=%s)', lVer, spmId)

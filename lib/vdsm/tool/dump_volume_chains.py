@@ -27,8 +27,6 @@ import json
 import sqlite3
 import sys
 
-import six
-
 from . import expose
 
 from vdsm import client
@@ -39,6 +37,8 @@ from vdsm import utils
 # constant should be introduced under lib publicly available
 _BLANK_UUID = '00000000-0000-0000-0000-000000000000'
 _NAME = 'dump-volume-chains'
+UNKNOWN_IMAGE = "unknown-image"
+UNKNOWN_PARENT = "unknown-parent"
 
 
 class DumpChainsError(Exception):
@@ -57,6 +57,16 @@ class ChainError(DumpChainsError):
 class DuplicateParentError(ChainError):
     description = ("more than one volume pointing to the same parent volume "
                    "e.g: (_BLANK_UUID<-a), (a<-b), (a<-c)")
+
+
+class UnknownParentError(ChainError):
+    description = ("there are volumes in the chain missing the parent info "
+                   "in their metadata, please check the metadata integrity")
+
+
+class UnknownImageError(ChainError):
+    description = ("there are volumes in the storage missing the image info "
+                   "in their metadata, these are listed here")
 
 
 class NoBaseVolume(ChainError):
@@ -165,37 +175,30 @@ def _dump_sql(volumes_info, sql_file):
 
 
 def _iter_volumes_info(volumes_info):
-    for _, img_volumes in six.iteritems(volumes_info):
-        for _, vol_info in six.iteritems(img_volumes):
+    for _, img_volumes in volumes_info.items():
+        for _, vol_info in img_volumes.items():
             yield vol_info
 
 
 def _get_volumes_info(cli, sd_uuid):
-    """there can be only one storage pool in a single VDSM context"""
-    pools = cli.Host.getConnectedStoragePools()
-    if not pools:
-        raise NoConnectedStoragePoolError('There is no connected storage '
-                                          'pool to this server')
-    sp_uuid, = pools
-    images_uuids = cli.StorageDomain.getImages(storagedomainID=sd_uuid)
+    volumes_info = defaultdict(dict)
 
-    volumes_info = {}
+    volumes = cli.StorageDomain.dump(sd_id=sd_uuid)["volumes"]
 
-    for img_uuid in images_uuids:
-        img_volumes_info = {}
+    # find volumes per image
+    for vol_id, vol_info in volumes.items():
+        image_id = vol_info.get("image", UNKNOWN_IMAGE)
+        # normalize parent info
+        parent = vol_info.get("parent", UNKNOWN_PARENT)
+        vol_info["parent"] = parent
+        volumes_info[image_id][vol_id] = vol_info
 
-        volumes_uuids = cli.StorageDomain.getVolumes(
-            storagedomainID=sd_uuid, storagepoolID=sp_uuid,
-            imageID=img_uuid)
-
-        for vol_uuid in volumes_uuids:
-            vol_info = cli.Volume.getInfo(
-                volumeID=vol_uuid, storagepoolID=sp_uuid,
-                storagedomainID=sd_uuid, imageID=img_uuid)
-
-            img_volumes_info[vol_uuid] = vol_info
-
-        volumes_info[img_uuid] = img_volumes_info
+    # add template volumes
+    for img_volumes in volumes_info.values():
+        for vol in list(img_volumes.values()):
+            parent_id = vol["parent"]
+            if parent_id not in img_volumes and parent_id in volumes:
+                img_volumes[parent_id] = volumes[parent_id]
 
     return volumes_info
 
@@ -203,17 +206,24 @@ def _get_volumes_info(cli, sd_uuid):
 def _get_volumes_chains(volumes_info):
     image_chains = {}
 
-    for img_uuid, volumes in six.iteritems(volumes_info):
+    for img_uuid, volumes in volumes_info.items():
 
         # to avoid 'double parent' bug here we don't use a dictionary
         volumes_children = []  # [(parent_vol_uuid, child_vol_uuid),]
-        for vol_uuid, vol_info in six.iteritems(volumes):
+        for vol_uuid, vol_info in volumes.items():
             volumes_children.append((vol_info['parent'], vol_uuid))
 
-        try:
-            image_chains[img_uuid] = _build_volume_chain(volumes_children)
-        except ChainError as e:
-            image_chains[img_uuid] = e
+        if img_uuid == UNKNOWN_IMAGE:
+            # do not build chain of volumes with unknown image
+            image_chains[img_uuid] = UnknownImageError(volumes_children)
+        elif any(UNKNOWN_PARENT in volume for volume in volumes_children):
+            # do not build chain if any volume has unknown parent
+            image_chains[img_uuid] = UnknownParentError(volumes_children)
+        else:
+            try:
+                image_chains[img_uuid] = _build_volume_chain(volumes_children)
+            except ChainError as e:
+                image_chains[img_uuid] = e
 
     return image_chains
 
@@ -250,7 +260,7 @@ def _print_volume_chains(image_chains, volumes_info):
         return
     print()
     print('Images volume chains (base volume first)')
-    for img_uuid, vol_chain in six.iteritems(image_chains):
+    for img_uuid, vol_chain in image_chains.items():
         img_volumes_info = volumes_info[img_uuid]
         print()
         _print_line(img_uuid, 'image:')

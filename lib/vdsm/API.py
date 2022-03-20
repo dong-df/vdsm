@@ -1,6 +1,6 @@
 #
 # Copyright (C) 2012 Adam Litke, IBM Corporation
-# Copyright (C) 2012-2019 Red Hat, Inc.
+# Copyright (C) 2012-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@ from __future__ import absolute_import
 import errno
 import io
 import logging
+import pickle
 
 import six
 
@@ -47,6 +48,8 @@ from vdsm.common import response
 from vdsm.common import supervdsm
 from vdsm.common import validate
 from vdsm.common import conv
+from vdsm.common.commands import terminating
+from vdsm.common.compat import subprocess
 from vdsm.host import api as hostapi
 from vdsm.host import caps
 # TODO fix name conflict and use from vdsm.storage import sd
@@ -56,12 +59,13 @@ from vdsm.storage import managedvolume
 from vdsm.storage import constants as sc
 from vdsm.virt import migration
 from vdsm.virt import secret
-from vdsm.common.compat import pickle
 from vdsm.common.define import doneCode, errCode
 from vdsm.config import config
 from vdsm.virt import sampling
+from vdsm.virt.domain_descriptor import DomainDescriptor, XmlSource
 import vdsm.virt.jobs
 from vdsm.virt.jobs import seal
+import vdsm.virt.vm
 from vdsm.virt.vmdevices import graphics
 from vdsm.virt.vmdevices import hwclass
 
@@ -129,7 +133,7 @@ class VM(APIBase):
         self._UUID = UUID
 
     @property
-    def vm(self):
+    def vm(self) -> vdsm.virt.vm.Vm:
         vm = self._cif.vmContainer.get(self._UUID)
         if vm is None:
             raise exception.expected(exception.NoSuchVM(vmId=self._UUID))
@@ -185,6 +189,9 @@ class VM(APIBase):
         :param vmParams: required and optional VM parameters.
         :type vmParams: dict
         """
+        # self._UUID is None in this call, it must be retrieved from XML
+        xml = vmParams.get('_srcDomXML') or vmParams['xml']
+        self._UUID = DomainDescriptor(xml, xml_source=XmlSource.INITIAL).id
         vmParams['vmId'] = self._UUID
         try:
             if vmParams.get('vmId') in self._cif.vmContainer:
@@ -300,6 +307,14 @@ class VM(APIBase):
 
     @api.logged(on="api.virt")
     @api.method
+    def getExternalData(self, kind, lastHash=None, forceUpdate=True):
+        """
+        Retrieve and return given kind of VM external data.
+        """
+        return self.vm.getExternalData(kind, lastHash, forceUpdate)
+
+    @api.logged(on="api.virt")
+    @api.method
     def getMigrationStatus(self):
         """
         Report status of a currently outgoing migration.
@@ -364,13 +379,13 @@ class VM(APIBase):
 
     @api.logged(on="api.virt")
     @api.method
-    def hostdevHotplug(self, devices):
-        return self.vm.hostdevHotplug(devices)
+    def hotplugHostdev(self, devices):
+        return self.vm.hotplugHostdev(devices)
 
     @api.logged(on="api.virt")
     @api.method
-    def hostdevHotunplug(self, devices):
-        return self.vm.hostdevHotunplug(devices)
+    def hotunplugHostdev(self, devices):
+        return self.vm.hotunplugHostdev(devices)
 
     @api.logged(on="api.virt")
     @api.method
@@ -413,7 +428,7 @@ class VM(APIBase):
         return self.vm.hotunplugMemory(params)
 
     @api.logged(on="api.virt")
-    def setNumberOfCpus(self, numberOfCpus):
+    def setNumberOfCpus(self, numberOfCpus, cpusets=None):
 
         if self._UUID is None or numberOfCpus is None:
             self.log.error('Missing one of required parameters: \
@@ -421,7 +436,7 @@ class VM(APIBase):
             return {'status': {'code': errCode['MissParam']['status']['code'],
                                'message': 'Missing one of required '
                                           'parameters: vmId, numberOfCpus'}}
-        return self.vm.setNumberOfCpus(int(numberOfCpus))
+        return self.vm.setNumberOfCpus(int(numberOfCpus), cpusets)
 
     @api.logged(on="api.virt")
     @api.method
@@ -562,11 +577,12 @@ class VM(APIBase):
         return self.vm.pause()
 
     @api.logged(on="api.virt")
+    @api.method
     def reset(self):
         """
         Press the virtual reset button for the specified VM.
         """
-        return errCode['noimpl']
+        return self.vm.reset()
 
     @api.logged(on="api.virt")
     @api.method
@@ -666,8 +682,8 @@ class VM(APIBase):
 
     @api.logged(on="api.virt")
     @api.method
-    def backup_info(self, backup_id):
-        return self.vm.backup_info(backup_id)
+    def backup_info(self, backup_id, checkpoint_id=None):
+        return self.vm.backup_info(backup_id, checkpoint_id=checkpoint_id)
 
     @api.logged(on="api.virt")
     @api.method
@@ -681,17 +697,40 @@ class VM(APIBase):
 
     @api.logged(on="api.virt")
     @api.method
-    def snapshot(self, snapDrives, snapMemory=None, frozen=False):
+    def list_checkpoints(self):
+        return self.vm.list_checkpoints()
+
+    @api.logged(on="api.virt")
+    @api.method
+    def dump_checkpoint(self, checkpoint_id):
+        return self.vm.dump_checkpoint(checkpoint_id)
+
+    @api.logged(on="api.virt")
+    @api.method
+    def snapshot(self, snapDrives, snapMemory=None,
+                 frozen=False, jobUUID=None, timeout=30, freeze_timeout=8):
         # for backward compatibility reasons, we need to
         # do the instance check before to run the hooks.
         vm = self.vm
+
+        if timeout <= 0 or freeze_timeout <= 0:
+            # It makes no sense to run a snapshot with timeout <= 0.
+            # It can happen due to an Engine bug running a synchronous
+            # instead of an asynchronous snapshot (bz#1950209).
+            self.log.error("Zero snapshot timeout requested")
+            param = 'timeout' if timeout <= 0 else 'freeze_timeout'
+            raise exception.InvalidParameter(action='VM.snapshot',
+                                             parameter=param, value=0)
 
         memoryParams = {}
         if snapMemory:
             memoryParams['dst'], memoryParams['dstparams'] = \
                 self._getHibernationPathsFromString(snapMemory)
 
-        return vm.snapshot(snapDrives, memoryParams, frozen=frozen)
+        return vm.snapshot(
+            snapDrives, memoryParams, frozen, jobUUID, False, timeout,
+            freeze_timeout
+        )
 
     @api.logged(on="api.virt")
     @api.method
@@ -747,10 +786,23 @@ class VM(APIBase):
         configuration from the filesystem: SSH keys, UDEV rules, MAC addresses,
         system ID, hostname etc.
         """
-        job = seal.Job(job_id, sp_id, images, self._irs)
+        job = seal.Job(self._UUID, job_id, sp_id, images, self._irs)
         jobs.add(job)
         vdsm.virt.jobs.schedule(job)
         return response.success()
+
+    @api.logged(on="api.virt")
+    @api.method
+    def refresh_disk(self, drive):
+        return self.vm.refresh_disk(drive)
+
+    @api.logged(on="api.virt")
+    @api.method
+    def screenshot(self):
+        """
+        Creates screenshot of the VM based on vm id.
+        """
+        return self.vm.screenshot()
 
 
 class Volume(APIBase):
@@ -789,12 +841,17 @@ class Volume(APIBase):
                                    discard)
 
     def create(self, size, volFormat, preallocate, diskType, desc,
-               srcImgUUID, srcVolUUID, initialSize=None):
+               srcImgUUID, srcVolUUID, initialSize=None, addBitmaps=False,
+               legal=True, sequence=0, bitmap=None):
         return self._irs.createVolume(self._sdUUID, self._spUUID,
                                       self._imgUUID, size, volFormat,
                                       preallocate, diskType, self._UUID, desc,
                                       srcImgUUID, srcVolUUID,
-                                      initialSize=initialSize)
+                                      initialSize=initialSize,
+                                      addBitmaps=addBitmaps,
+                                      legal=legal,
+                                      sequence=sequence,
+                                      bitmap=bitmap)
 
     def delete(self, postZero, force, discard=False):
         return self._irs.deleteVolume(self._sdUUID, self._spUUID,
@@ -841,6 +898,15 @@ class Volume(APIBase):
     def setLegality(self, legality):
         return self._irs.setVolumeLegality(self._sdUUID, self._spUUID,
                                            self._imgUUID, self._UUID, legality)
+
+    def measure(self, dstVolFormat, backing_chain=True):
+        return self._irs.measure(
+            self._sdUUID, self._imgUUID, self._UUID, dstVolFormat,
+            backing=backing_chain)
+
+    def teardown(self):
+        return self._irs.teardownVolume(
+            self._sdUUID, self._imgUUID, self._UUID)
 
 
 class Image(APIBase):
@@ -952,7 +1018,7 @@ class ISCSIConnection(APIBase):
 
 
 class StorageDomain(APIBase):
-    ctorArgs = ['storagedomainID']
+    ctorArgs = []
 
     class Types:
         UNKNOWN = vdsm.storage.sd.UNKNOWN_DOMAIN
@@ -971,66 +1037,81 @@ class StorageDomain(APIBase):
 
     BLANK_UUID = vdsm.storage.sd.BLANK_UUID
 
-    def __init__(self, UUID):
-        APIBase.__init__(self)
-        self._UUID = UUID
+    def activate(self, storagedomainID, storagepoolID):
+        return self._irs.activateStorageDomain(storagedomainID, storagepoolID)
 
-    def activate(self, storagepoolID):
-        return self._irs.activateStorageDomain(self._UUID, storagepoolID)
+    def attach(self, storagedomainID, storagepoolID):
+        return self._irs.attachStorageDomain(storagedomainID, storagepoolID)
 
-    def attach(self, storagepoolID):
-        return self._irs.attachStorageDomain(self._UUID, storagepoolID)
-
-    def create(self, domainType, typeArgs, name, domainClass,
+    def create(self, stroagedomainID, domainType, typeArgs, name, domainClass,
                version=sc.SUPPORTED_DOMAIN_VERSIONS[0],
                blockSize=sc.BLOCK_SIZE_512, maxHosts=sc.HOSTS_512_1M):
-        return self._irs.createStorageDomain(domainType, self._UUID, name,
+        return self._irs.createStorageDomain(domainType, stroagedomainID, name,
                                              typeArgs, domainClass, version,
                                              blockSize, maxHosts)
 
-    def deactivate(self, storagepoolID, masterSdUUID, masterVersion):
-        return self._irs.deactivateStorageDomain(self._UUID, storagepoolID,
-                                                 masterSdUUID, masterVersion)
+    def deactivate(
+            self,
+            storagedomainID,
+            storagepoolID,
+            masterSdUUID,
+            masterVersion):
+        return self._irs.deactivateStorageDomain(
+            storagedomainID, storagepoolID, masterSdUUID, masterVersion)
 
-    def detach(self, storagepoolID, masterSdUUID=None, masterVersion=0,
-               force=False):
+    def detach(
+            self,
+            storagedomainID,
+            storagepoolID,
+            masterSdUUID=None,
+            masterVersion=0,
+            force=False):
         if force:
-            return self._irs.forcedDetachStorageDomain(self._UUID,
+            return self._irs.forcedDetachStorageDomain(storagedomainID,
                                                        storagepoolID)
         else:
-            return self._irs.detachStorageDomain(self._UUID, storagepoolID,
-                                                 masterSdUUID, masterVersion)
+            return self._irs.detachStorageDomain(
+                storagedomainID, storagepoolID, masterSdUUID, masterVersion)
 
-    def extend(self, storagepoolID, devlist, force=False):
-        return self._irs.extendStorageDomain(self._UUID, storagepoolID,
+    def extend(self, storagedomainID, storagepoolID, devlist, force=False):
+        return self._irs.extendStorageDomain(storagedomainID, storagepoolID,
                                              devlist, force)
 
-    def resizePV(self, storagepoolID, guid):
-        return self._irs.resizePV(self._UUID, storagepoolID, guid)
+    def resizePV(self, storagedomainID, storagepoolID, guid):
+        return self._irs.resizePV(storagedomainID, storagepoolID, guid)
 
-    def format(self, autoDetach):
-        return self._irs.formatStorageDomain(self._UUID, autoDetach)
+    def format(self, storagedomainID, autoDetach):
+        return self._irs.formatStorageDomain(storagedomainID, autoDetach)
 
-    def getFileStats(self, pattern, caseSensitive):
-        return self._irs.getFileStats(self._UUID, pattern, caseSensitive)
+    def getFileStats(self, storagedomainID, pattern, caseSensitive):
+        return self._irs.getFileStats(storagedomainID, pattern, caseSensitive)
 
-    def getImages(self):
-        return self._irs.getImagesList(self._UUID)
+    def getImages(self, storagedomainID):
+        return self._irs.getImagesList(storagedomainID)
 
-    def getInfo(self):
-        return self._irs.getStorageDomainInfo(self._UUID)
+    def getInfo(self, storagedomainID):
+        return self._irs.getStorageDomainInfo(storagedomainID)
 
-    def getStats(self):
-        return self._irs.getStorageDomainStats(self._UUID)
+    def getStats(self, storagedomainID):
+        return self._irs.getStorageDomainStats(storagedomainID)
 
-    def getVolumes(self, storagepoolID, imageID=Image.BLANK_UUID):
-        return self._irs.getVolumesList(self._UUID, storagepoolID, imageID)
+    def getVolumes(
+            self,
+            storagedomainID,
+            storagepoolID,
+            imageID=Image.BLANK_UUID):
+        return self._irs.getVolumesList(
+            storagedomainID, storagepoolID, imageID)
 
-    def setDescription(self, description):
-        return self._irs.setStorageDomainDescription(self._UUID, description)
+    def setDescription(self, storagedomainID, description):
+        return self._irs.setStorageDomainDescription(
+            storagedomainID, description)
 
-    def validate(self):
-        return self._irs.validateStorageDomain(self._UUID)
+    def validate(self, storagedomainID):
+        return self._irs.validateStorageDomain(storagedomainID)
+
+    def dump(self, sd_id, full=False):
+        return self._irs.dumpStorageDomain(sd_id, full=full)
 
 
 class StoragePool(APIBase):
@@ -1053,12 +1134,9 @@ class StoragePool(APIBase):
     def create(self, name, masterSdUUID, masterVersion, domainList,
                lockRenewalIntervalSec, leaseTimeSec, ioOpTimeoutSec,
                leaseRetries):
-        poolType = None   # Not used
-        lockPolicy = None   # Not used
         return self._irs.createStoragePool(
-            poolType, self._UUID, name, masterSdUUID, domainList,
-            masterVersion, lockPolicy, lockRenewalIntervalSec, leaseTimeSec,
-            ioOpTimeoutSec, leaseRetries)
+            self._UUID, name, masterSdUUID, domainList, masterVersion,
+            lockRenewalIntervalSec, leaseTimeSec, ioOpTimeoutSec, leaseRetries)
 
     # scsiKey not used
     def destroy(self, hostID, scsiKey):
@@ -1090,10 +1168,9 @@ class StoragePool(APIBase):
     def reconstructMaster(self, hostId, name, masterSdUUID, masterVersion,
                           domainDict, lockRenewalIntervalSec, leaseTimeSec,
                           ioOpTimeoutSec, leaseRetries):
-        lockPolicy = None   # Not used
         return self._irs.reconstructMaster(
             self._UUID, name, masterSdUUID, domainDict, masterVersion,
-            lockPolicy, lockRenewalIntervalSec, leaseTimeSec, ioOpTimeoutSec,
+            lockRenewalIntervalSec, leaseTimeSec, ioOpTimeoutSec,
             leaseRetries, hostId)
 
     def setDescription(self, description):
@@ -1130,6 +1207,10 @@ class StoragePool(APIBase):
             self._UUID, storagedomainID, imageID, volumeID,
             allowActive=allowActive)
 
+    def switchMaster(self, oldMasterUUID, newMasterUUID, masterVersion):
+        return self._irs.switchMaster(
+            self._UUID, oldMasterUUID, newMasterUUID, masterVersion)
+
 
 class Global(APIBase):
     ctorArgs = []
@@ -1146,7 +1227,13 @@ class Global(APIBase):
            action can be one of (status, on, off, reboot)."""
 
         def fence(script, inp):
-            rc, out, err = commands.execCmd([script], data=inp)
+            cmd = commands.start([script], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+            data = inp.encode('utf-8')
+            with terminating(cmd):
+                out, err = cmd.communicate(data)
+                rc = cmd.returncode
             self.log.debug('rc %s inp %s out %s err %s', rc,
                            hidePasswd(inp), out, err)
             return rc, out, err
@@ -1232,6 +1319,9 @@ class Global(APIBase):
 
             return True
 
+        def getMessage(out, err):
+            return out.decode('utf-8') + err.decode('utf-8')
+
         self.log.debug('fenceNode(addr=%s,port=%s,agent=%s,user=%s,passwd=%s,'
                        'action=%s,secure=%s,options=%s,policy=%s)',
                        addr, port, agent, username, password, action, secure,
@@ -1264,7 +1354,7 @@ class Global(APIBase):
                        hidePasswd(inp), out, err)
         if not 0 <= rc <= 2:
             return {'status': {'code': 1,
-                               'message': out + err}}
+                               'message': getMessage(out, err)}}
         message = doneCode['message']
         ret = 0
         if action == 'status':
@@ -1274,12 +1364,12 @@ class Global(APIBase):
                 power = 'off'
             else:
                 power = 'unknown'
-                message = out + err
+                message = getMessage(out, err)
                 ret = rc
             return {'status': {'code': ret, 'message': message},
                     'power': power}
         if rc != 0:
-            message = out + err
+            message = getMessage(out, err)
         return {'status': {'code': rc, 'message': message},
                 'power': 'unknown', 'operationStatus': 'initiated'}
 
@@ -1499,6 +1589,10 @@ class Global(APIBase):
         try:
             self._cif._netConfigDirty = True
             supervdsm.getProxy().setupNetworks(networks, bondings, options)
+            if options.get('commitOnSuccess'):
+                # This option ensures that persist is called after
+                # setupNetworks
+                self._cif._netConfigDirty = False
             return {'status': doneCode}
         except ConfigNetworkError as e:
             self.log.error('%s', e.msg, exc_info=True)
@@ -1567,8 +1661,10 @@ class Global(APIBase):
     def getLVMVolumeGroups(self, storageType=None):
         return self._irs.getVGList(storageType)
 
-    def getDeviceList(self, storageType=None, guids=(), checkStatus=True):
-        return self._irs.getDeviceList(storageType, guids, checkStatus)
+    def getDeviceList(self, storageType=None, guids=(), checkStatus=True,
+                      refresh=True):
+        return self._irs.getDeviceList(storageType, guids, checkStatus,
+                                       refresh)
 
     def getDevicesVisibility(self, guidList):
         return self._irs.getDevicesVisibility(guidList)
@@ -1644,8 +1740,9 @@ class Global(APIBase):
 class SDM(APIBase):
     ctorArgs = []
 
-    def copy_data(self, job_id, source, destination):
-        return self._irs.sdm_copy_data(job_id, source, destination)
+    def copy_data(self, job_id, source, destination, copy_bitmaps=False):
+        return self._irs.sdm_copy_data(
+            job_id, source, destination, copy_bitmaps=copy_bitmaps)
 
     def sparsify_volume(self, job_id, vol_info):
         return self._irs.sdm_sparsify_volume(job_id, vol_info)
@@ -1653,8 +1750,9 @@ class SDM(APIBase):
     def amend_volume(self, job_id, vol_info, qcow2_attr):
         return self._irs.sdm_amend_volume(job_id, vol_info, qcow2_attr)
 
-    def merge(self, job_id, subchain_info):
-        return self._irs.sdm_merge(job_id, subchain_info)
+    def merge(self, job_id, subchain_info, merge_bitmaps=False):
+        return self._irs.sdm_merge(
+            job_id, subchain_info, merge_bitmaps=merge_bitmaps)
 
     def move_domain_device(self, job_id, move_params):
         return self._irs.sdm_move_domain_device(job_id, move_params)
@@ -1665,12 +1763,21 @@ class SDM(APIBase):
     def update_volume(self, job_id, vol_info, vol_attr):
         return self._irs.sdm_update_volume(job_id, vol_info, vol_attr)
 
+    def add_bitmap(self, job_id, vol_info, bitmap):
+        return self._irs.sdm_add_bitmap(job_id, vol_info, bitmap)
+
+    def remove_bitmap(self, job_id, vol_info, bitmap):
+        return self._irs.sdm_remove_bitmap(job_id, vol_info, bitmap)
+
+    def clear_bitmaps(self, job_id, vol_info):
+        return self._irs.sdm_clear_bitmaps(job_id, vol_info)
+
 
 class Lease(APIBase):
     ctorArgs = []
 
-    def create(self, lease):
-        return self._irs.create_lease(lease)
+    def create(self, lease, metadata=None):
+        return self._irs.create_lease(lease, metadata=metadata)
 
     def delete(self, lease):
         return self._irs.delete_lease(lease)
@@ -1683,6 +1790,9 @@ class Lease(APIBase):
 
     def rebuild_leases(self, sd_id):
         return self._irs.rebuild_leases(sd_id)
+
+    def fence(self, lease, metadata):
+        return self._irs.fence_lease(lease, metadata)
 
 
 class NBD(APIBase):

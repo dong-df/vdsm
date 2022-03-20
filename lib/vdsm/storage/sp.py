@@ -33,12 +33,14 @@ from weakref import proxy
 import six
 
 from vdsm.common import concurrent
+from vdsm.common.config import config
 from vdsm.common.panic import panic
 from vdsm.storage import blockSD
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fileSD
 from vdsm.storage import fileUtils
+from vdsm.storage import guarded
 from vdsm.storage import image
 from vdsm.storage import mailbox
 from vdsm.storage import merge
@@ -46,12 +48,11 @@ from vdsm.storage import misc
 from vdsm.storage import mount
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import sd
+from vdsm.storage import spwd
 from vdsm.storage import xlease
 from vdsm.storage.formatconverter import DefaultFormatConverter
 from vdsm.storage.sdc import sdCache
 from vdsm.storage.securable import secured, unsecured, SecureError
-
-POOL_MASTER_DOMAIN = 'mastersd'
 
 SPM_ACQUIRED = 'SPM'
 SPM_CONTEND = 'Contend'
@@ -92,14 +93,14 @@ class StoragePool(object):
     any heavy lifting activities until the time it is really needed.
     '''
 
-    log = logging.getLogger('storage.StoragePool')
+    log = logging.getLogger('storage.storagepool')
 
     def __init__(self, spUUID, domainMonitor, taskManager):
         self._secured = threading.Event()
         self._formatConverter = DefaultFormatConverter()
         self._domainsToUpgrade = []
         self.lock = threading.RLock()
-        self._setUnsecure()
+        self._set_insecure()
         self.spUUID = str(spUUID)
         self.poolPath = os.path.join(sc.REPO_DATA_CENTER, self.spUUID)
         self.id = SPM_ID_FREE
@@ -115,19 +116,28 @@ class StoragePool(object):
             StoragePool._domainStateChange, proxy(self))
         self._backend = None
 
+        # The watchdog monitors the SPM lease on the master domain.
+        self._watchdog = None
+
     def __is_secure__(self):
-        return self.isSecure()
+        return self.is_secure()
 
     @unsecured
-    def isSecure(self):
+    def is_secure(self):
         return self._secured.isSet()
 
     @unsecured
-    def _setSecure(self):
+    def _set_secure(self):
+        if not self.is_secure():
+            self.log.info("Switching storage pool %s to SECURE mode",
+                          self.spUUID)
         self._secured.set()
 
     @unsecured
-    def _setUnsecure(self):
+    def _set_insecure(self):
+        if self.is_secure():
+            self.log.info("Switching storage pool %s to INSECURE mode",
+                          self.spUUID)
         self._secured.clear()
 
     @unsecured
@@ -300,8 +310,8 @@ class StoragePool(object):
 
             try:
                 oldlver, oldid = self._backend.getSpmStatus()
-            except se.InquireNotSupportedError:
-                self.log.info("cluster lock inquire isn't supported. "
+            except se.InspectNotSupportedError:
+                self.log.info("cluster lock inspect isn't supported. "
                               "proceeding with startSpm()")
                 oldlver = LVER_INVALID
             else:
@@ -335,8 +345,11 @@ class StoragePool(object):
 
                 self.masterDomain.mountMaster()
                 self.masterDomain.createMasterTree()
-                self.tasksDir = os.path.join(self.poolPath, POOL_MASTER_DOMAIN,
-                                             sd.MASTER_FS_DIR, sd.TASKS_DIR)
+                self.tasksDir = os.path.join(
+                    self.poolPath,
+                    sc.POOL_MASTER_DOMAIN,
+                    sd.MASTER_FS_DIR,
+                    sd.TASKS_DIR)
 
                 try:
                     # Make sure backup domain is active
@@ -351,12 +364,14 @@ class StoragePool(object):
 
                 self.spmRole = SPM_ACQUIRED
 
-                # Once setSecure completes we are running as SPM
-                self._setSecure()
+                # Once this completes we are running as SPM.
+                self._set_secure()
+
+                self._start_watching_spm_lease(self.masterDomain)
 
                 # Mailbox issues SPM commands, therefore we start it AFTER spm
                 # commands are allowed to run to prevent a race between the
-                # mailbox and the "self._setSecure() call"
+                # mailbox and the "self._set_secure() call"
 
                 if self.masterDomain.supportsMailbox:
                     self.masterDomain.prepareMailbox()
@@ -389,8 +404,15 @@ class StoragePool(object):
                 raise
 
     @unsecured
-    def _shutDownUpgrade(self):
-        self.log.debug("Shutting down upgrade process")
+    def _cancel_upgrade(self):
+        """
+        If upgrade threads already took a shared lock, this will block until
+        all upgrade threads release the lock. If upgrade did not start yet,
+        this will cancel the pending upgrade.
+        """
+        self.log.info("Canceling upgrade for domains %s",
+                      self._domainsToUpgrade)
+
         with rm.acquireResource(sc.STORAGE, "upgrade_" + self.spUUID,
                                 rm.EXCLUSIVE):
             try:
@@ -411,52 +433,49 @@ class StoragePool(object):
                                sd.BLOCKSD_DIR, "*", sd.MASTER_FS_DIR)
         for master in glob(masters):
             if mount.isMounted(master):
-                cls.log.debug("unmounting %s", master)
+                cls.log.info("Unmounting master %s", master)
                 try:
                     blockSD.BlockStorageDomain.doUnmountMaster(master)
                 except se.StorageDomainMasterUnmountError as e:
-                    panic("unmount %s failed - %s" % (master, e))
+                    panic("Unmount master {} failed: {}".format(master, e))
             else:
-                cls.log.debug("master `%s` is not mounted, skipping", master)
+                cls.log.debug("Master %s is not mounted, skipping", master)
 
     def stopSpm(self, force=False):
         with self.lock:
             if not force and self.spmRole == SPM_FREE:
                 return True
 
-            self._shutDownUpgrade()
-            self._setUnsecure()
+            self._cancel_upgrade()
 
-            stopFailed = False
+            self._stop_watching_spm_lease()
+
+            self._set_insecure()
 
             try:
                 self.cleanupMasterMount()
             except:
-                # If unmounting fails the vdsm panics.
-                stopFailed = True
+                panic("Error cleaning up master mount")
+
+            if self.spmMailer:
+                try:
+                    self.spmMailer.stop()
+                    if not self.spmMailer.wait(timeout=60):
+                        raise RuntimeError("Timeout stopping SPM mail monitor")
+                except:
+                    panic("Error stopping SPM mail monitor")
 
             try:
-                if self.spmMailer:
-                    self.spmMailer.stop()
+                self._backend.setSpmStatus(spmId=SPM_ID_FREE,
+                                           __securityOverride=True)
             except:
-                # Here we are just begin polite.
-                # SPM will also clean this on start up.
-                pass
-
-            if not stopFailed:
-                try:
-                    self._backend.setSpmStatus(spmId=SPM_ID_FREE,
-                                               __securityOverride=True)
-                except:
-                    pass  # The system can handle this inconsistency
+                # The system can handle this inconsistency.
+                self.log.exception("Error updating SPM status")
 
             try:
                 self.masterDomain.releaseClusterLock()
             except:
-                stopFailed = True
-
-            if stopFailed:
-                panic("Unrecoverable errors during SPM stop process.")
+                panic("Error releasing cluster lock")
 
             self.spmRole = SPM_FREE
 
@@ -535,22 +554,27 @@ class StoragePool(object):
         # Cleanup links to domains under /rhev/datacenter/poolName
         self.refresh(msdUUID, masterVersion)
 
-    # TODO: Remove or rename this function.
-    def validatePoolSD(self, sdUUID):
+    def _assert_sd_in_pool(self, sdUUID):
         if sdUUID not in self.getDomains():
             raise se.StorageDomainNotMemberOfPool(self.spUUID, sdUUID)
         return True
 
-    def validateAttachedDomain(self, dom):
+    def _assert_sd_owned_by_pool(self, dom):
         """
         Avoid handling domains if not owned by pool.
         """
-        self.validatePoolSD(dom.sdUUID)
+        self._assert_sd_in_pool(dom.sdUUID)
         if self.spUUID not in dom.getPools():
             dom.invalidateMetadata()
             if self.spUUID not in dom.getPools():
                 raise se.StorageDomainNotInPool(self.spUUID, dom.sdUUID)
         return True
+
+    def _assert_sd_in_attached_state(self, sdUUID):
+        domains = self.getDomains()
+        if domains[sdUUID] != sd.DOM_ATTACHED_STATUS:
+            raise se.StorageDomainIllegalStateError(
+                sdUUID, sd.DOM_ATTACHED_STATUS, domains[sdUUID])
 
     @unsecured
     def _acquireTemporaryClusterLock(self, msdUUID, leaseParams):
@@ -636,7 +660,7 @@ class StoragePool(object):
         fileUtils.createdir(self.poolPath)
         self._acquireTemporaryClusterLock(msdUUID, leaseParams)
         try:
-            self._setSecure()
+            self._set_secure()
             try:
                 # Mark 'master' domain.  We should do it before actually
                 # attaching this domain to the pool During 'master' marking we
@@ -669,7 +693,7 @@ class StoragePool(object):
                                    exc_info=True)
                 raise
             finally:
-                self._setUnsecure()
+                self._set_insecure()
         finally:
             self._releaseTemporaryClusterLock(msdUUID)
             self.stopMonitoringDomains()
@@ -790,7 +814,7 @@ class StoragePool(object):
             # secure in order to change the domains map.
             # TODO: it is clear that reconstructMaster and create (StoragePool)
             # are extremely similar and they should be unified.
-            self._setSecure()
+            self._set_secure()
             try:
                 self.createMaster(poolName, futureMaster, masterVersion,
                                   leaseParams)
@@ -805,7 +829,7 @@ class StoragePool(object):
 
                 self.refresh(msdUUID=msdUUID, masterVersion=masterVersion)
             finally:
-                self._setUnsecure()
+                self._set_insecure()
         finally:
             futureMaster.releaseClusterLock()
 
@@ -816,8 +840,10 @@ class StoragePool(object):
         dstDomain.changeLeaseParams(leaseParams)
 
     def masterMigrate(self, sdUUID, msdUUID, masterVersion):
-        self.log.info("sdUUID=%s spUUID=%s msdUUID=%s", sdUUID, self.spUUID,
-                      msdUUID)
+        self.log.info(
+            "Storage pool %s migrating master from %s to %s with "
+            "version %s",
+            self.spUUID, sdUUID, msdUUID, masterVersion)
 
         # TODO: is this check still relevant?
         # Make sure the masterVersion higher than that of the pool
@@ -866,7 +892,7 @@ class StoragePool(object):
         newmsd.acquireClusterLock(self.id)
 
         try:
-            self.log.debug('migration to the new master %s begins',
+            self.log.debug("Migration to new master %s starting",
                            newmsd.sdUUID)
 
             # Preparing the mailbox since the new master domain may be an
@@ -896,11 +922,12 @@ class StoragePool(object):
             newmsd.changeRole(sd.MASTER_DOMAIN)
             self._backend.switchMasterDomain(curmsd, newmsd, masterVersion)
         except Exception:
-            self.log.exception('migration to new master failed')
+            self.log.exception("Migration to new master %s failed",
+                               newmsd.sdUUID)
             try:
                 self._backend.setDomainRegularRole(newmsd)
             except Exception:
-                self.log.exception('unable to mark domain %s as regular',
+                self.log.exception("Unable to mark domain %s as regular",
                                    newmsd.sdUUID)
 
             # Do not release the cluster lock if unmount fails. The lock
@@ -910,10 +937,18 @@ class StoragePool(object):
             newmsd.releaseClusterLock()
             raise
 
+        # At this point both the old and new master acquired the SPM lease.
+        # Before we release the SPM lease on the old master, we need to stop
+        # watching the old master SPM lease, and start watching the new master
+        # SPM lease.
+        self._stop_watching_spm_lease()
+        self._start_watching_spm_lease(newmsd)
+
         # From this point on we have a new master and should not fail
         try:
-            self.log.debug('master has migrated to %s, cleaning up %s',
-                           newmsd.sdUUID, curmsd.sdUUID)
+            self.log.debug(
+                "Migration to new master %s succeeded, refreshing pool",
+                newmsd.sdUUID)
             self.refresh(msdUUID, masterVersion)
 
             # From this point on there is a new master domain in the pool
@@ -926,7 +961,8 @@ class StoragePool(object):
                 self.log.info("Removing directory %r", directory)
                 fileUtils.cleanupdir(directory)
         except Exception:
-            self.log.exception('ignoring old master cleanup failure')
+            self.log.exception(
+                "Ignoring old master %s cleanup failure", curmsd.sdUUID)
         finally:
             try:
                 # Unmounting the old master filesystem and releasing the
@@ -937,7 +973,20 @@ class StoragePool(object):
                 curmsd.releaseClusterLock()
             except Exception:
                 self.log.exception(
-                    'ignoring old master unmount and release failures')
+                    "Ignoring old master %s unmount and release failures",
+                    curmsd.sdUUID)
+
+    def switchMaster(self, oldMasterUUID, newMasterUUID, masterVersion):
+        """
+        Switches the master domain from oldMasterUUID to newMasterUUID.
+        """
+        locks = [
+            rm.Lock(sc.STORAGE, oldMasterUUID, rm.EXCLUSIVE),
+            rm.Lock(sc.STORAGE, newMasterUUID, rm.EXCLUSIVE)
+        ]
+        self.log.info("Taking domains locks for switching master")
+        with guarded.context(locks):
+            self.masterMigrate(oldMasterUUID, newMasterUUID, masterVersion)
 
     def attachSD(self, sdUUID):
         """
@@ -963,7 +1012,7 @@ class StoragePool(object):
             dom = sdCache.produce(sdUUID)
 
         try:
-            self.validateAttachedDomain(dom)
+            self._assert_sd_owned_by_pool(dom)
         except (se.StorageDomainNotMemberOfPool, se.StorageDomainNotInPool):
             pass  # domain is not attached to this pool yet
         else:
@@ -1050,31 +1099,43 @@ class StoragePool(object):
 
         dom = sdCache.produce(sdUUID)
 
-        # Avoid detach domains if not owned by pool
-        self.validateAttachedDomain(dom)
+        # To detach SD, it has to be put into maintenance, which stops
+        # monitoring thread. Producing SD will call its constructor, which
+        # in case of block SD, will activate special LVs, but these won't be
+        # deactivate by monitoring thread as it was already stopped. Tear the
+        # domain down once detach is finished.
+        # TODO: remove once SD constructor is refactored so it doesn't do any
+        # actions on the storage, like activating LVs.
 
-        if sdUUID == self.masterDomain.sdUUID:
-            raise se.CannotDetachMasterStorageDomain(sdUUID)
+        with dom.tearing_down():
+            # Avoid detach domains which were not put into maintenance first.
+            self._assert_sd_in_attached_state(sdUUID)
 
-        # TODO: clusterLock protection should be moved to
-        #       StorageDomain.[at,de]tach()
-        detachingISO = dom.isISO()
+            # Avoid detach domains if not owned by pool
+            self._assert_sd_owned_by_pool(dom)
 
-        if detachingISO:
-            # An ISO domain can be shared by multiple pools
-            dom.acquireHostId(self.id)
-            dom.acquireClusterLock(self.id)
+            if sdUUID == self.masterDomain.sdUUID:
+                raise se.CannotDetachMasterStorageDomain(sdUUID)
 
-        try:
-            # Remove pool info from domain metadata
-            dom.detach(self.spUUID)
-        finally:
+            # TODO: clusterLock protection should be moved to
+            #       StorageDomain.[at,de]tach()
+            detachingISO = dom.isISO()
+
             if detachingISO:
-                dom.releaseClusterLock()
-                dom.releaseHostId(self.id)
+                # An ISO domain can be shared by multiple pools
+                dom.acquireHostId(self.id)
+                dom.acquireClusterLock(self.id)
 
-        # Remove domain from pool metadata
-        self.forcedDetachSD(sdUUID)
+            try:
+                # Remove pool info from domain metadata
+                dom.detach(self.spUUID)
+            finally:
+                if detachingISO:
+                    dom.releaseClusterLock()
+                    dom.releaseHostId(self.id)
+
+            # Remove domain from pool metadata
+            self.forcedDetachSD(sdUUID)
 
     def detachAllDomains(self):
         """
@@ -1127,7 +1188,7 @@ class StoragePool(object):
 
         dom = sdCache.produce(sdUUID)
         # Avoid domain activation if not owned by pool
-        self.validateAttachedDomain(dom)
+        self._assert_sd_owned_by_pool(dom)
 
         # Do nothing if already active
         domainStatuses = self.getDomains()
@@ -1160,7 +1221,7 @@ class StoragePool(object):
         :param masterVersion: new master storage domain version
         """
 
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         self.log.info("sdUUID=%s spUUID=%s newMsdUUID=%s", sdUUID, self.spUUID,
                       newMsdUUID)
         domList = self.getDomains()
@@ -1263,7 +1324,7 @@ class StoragePool(object):
         linkName = os.path.join(self.poolPath, domain.sdUUID)
         self._linkStorageDomain(domain.domaindir, linkName)
         if self.masterDomain.sdUUID == domain.sdUUID:
-            masterName = os.path.join(self.poolPath, POOL_MASTER_DOMAIN)
+            masterName = os.path.join(self.poolPath, sc.POOL_MASTER_DOMAIN)
             self._linkStorageDomain(domain.domaindir, masterName)
 
     @unsecured
@@ -1339,8 +1400,8 @@ class StoragePool(object):
                     self.log.warn("Could not clean all trash from the pool dom"
                                   " `%s` (%s)", oldie, e)
             except Exception as e:
-                    self.log.warn("Could not clean all trash from the pool dom"
-                                  " `%s` (%s)", oldie, e)
+                self.log.warn("Could not clean all trash from the pool dom"
+                              " `%s` (%s)", oldie, e)
 
     @unsecured
     def refresh(self, msdUUID, masterVersion):
@@ -1361,7 +1422,7 @@ class StoragePool(object):
                     If sdUUID is None, the update is on the pool, and therefore
                     the master domain will be updated.
         """
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         self.log.info("spUUID=%s sdUUID=%s", self.spUUID, sdUUID)
         vms = self._getVMsPath(sdUUID)
         # We should exclude 'masterd' link from IMG_METAPATTERN globing
@@ -1401,7 +1462,7 @@ class StoragePool(object):
         Remove VM.
          'vmUUID' - Virtual machine UUID
         """
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         self.log.info("spUUID=%s vmUUID=%s sdUUID=%s", self.spUUID, vmUUID,
                       sdUUID)
         vms = self._getVMsPath(sdUUID)
@@ -1410,17 +1471,28 @@ class StoragePool(object):
             self.log.info("Removing VM directory %r", vmDirPath)
             fileUtils.cleanupdir(vmDirPath)
 
-    def extendVolume(self, sdUUID, volumeUUID, size, isShuttingDown=None):
+    def extendVolume(self, sdUUID, volumeUUID, size):
         # This method is not exposed through the remote API but it's called
         # directly from the mailbox to implement the thin provisioning on
         # block devices. The scope of this method is to extend only the
         # volume apparent size; the virtual disk size seen by the guest is
         # unchanged.
-        self.validatePoolSD(sdUUID)
-        sdCache.produce(sdUUID).extendVolume(volumeUUID, size, isShuttingDown)
+        self._assert_sd_in_pool(sdUUID)
+
+        # Extend the volume without refreshing its size. If the SPM host
+        # see the new size immediately after extension, this can cause
+        # data corruption during VM migration when the source host is
+        # SPM.
+        #
+        # The logical volume will be refreshed by the host requesting
+        # the extension when we send a reply, after refreshing the disk
+        # on the migration destination host.
+        #
+        # For more details see https://bugzilla.redhat.com/1983882
+        sdCache.produce(sdUUID).extendVolume(volumeUUID, size, refresh=False)
 
     def reduceVolume(self, sdUUID, imgUUID, volUUID, allowActive=False):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         dom = sdCache.produce(sdUUID)
         dom.reduceVolume(imgUUID, volUUID, allowActive=allowActive)
 
@@ -1749,7 +1821,14 @@ class StoragePool(object):
             startEvent.wait()
 
         img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, sdUUID)
-        with rm.acquireResource(img_ns, imgUUID, rm.SHARED):
+
+        # NOTE: We must take exclusive lock here since we can have concurrent
+        # readers, and each reader is activating the volume before the copy and
+        # deactivating the volume after the copy. Without an exclusive lock,
+        # one reader can deactivate the volume just after the other reader
+        # activated the volume.
+        # See https://bugzilla.redhat.com/1694972
+        with rm.acquireResource(img_ns, imgUUID, rm.EXCLUSIVE):
             try:
                 img = image.Image(self.poolPath)
                 return img.copyFromImage(methodArgs, sdUUID, imgUUID, volUUID)
@@ -1811,7 +1890,11 @@ class StoragePool(object):
                      diskType, volUUID=None, desc="",
                      srcImgUUID=sc.BLANK_UUID,
                      srcVolUUID=sc.BLANK_UUID,
-                     initialSize=None):
+                     initialSize=None,
+                     addBitmaps=False,
+                     legal=True,
+                     sequence=0,
+                     bitmap=None):
         """
         Creates a new volume.
 
@@ -1846,6 +1929,14 @@ class StoragePool(object):
         :param initialSize: The initial size of the volume in case of thin
                             provisioning.
         :type initialSize: int
+        :param addBitmaps: If true, add source volume bitmaps to the
+                           created volume.
+        :type addBitmaps: boolean
+        :param legal: If true, create the volume as legal.
+        :type legal: boolean
+
+        :type sequence: int
+        :param sequence: The sequence number of the volume.
 
         :returns: a dict with the UUID of the new volume.
         :rtype: dict
@@ -1871,7 +1962,9 @@ class StoragePool(object):
                 imgUUID=imgUUID, capacity=size, volFormat=volFormat,
                 preallocate=preallocate, diskType=diskType, volUUID=volUUID,
                 desc=desc, srcImgUUID=srcImgUUID, srcVolUUID=srcVolUUID,
-                initial_size=initialSize)
+                initial_size=initialSize, add_bitmaps=addBitmaps, legal=legal,
+                sequence=sequence, bitmap=bitmap)
+
         return dict(uuid=newVolUUID)
 
     def deleteVolume(self, sdUUID, imgUUID, volumes, postZero, force, discard):
@@ -1937,40 +2030,40 @@ class StoragePool(object):
         domain.deleteImage(domain.sdUUID, imgUUID, volsByImg)
 
     def setVolumeDescription(self, sdUUID, imgUUID, volUUID, description):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, sdUUID)
         with rm.acquireResource(img_ns, imgUUID, rm.EXCLUSIVE):
             vol = sdCache.produce(sdUUID).produceVolume(imgUUID, volUUID)
             vol.setDescription(description)
 
     def setVolumeLegality(self, sdUUID, imgUUID, volUUID, legality):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, sdUUID)
         with rm.acquireResource(img_ns, imgUUID, rm.EXCLUSIVE):
             vol = sdCache.produce(sdUUID).produceVolume(imgUUID, volUUID)
             vol.setLegality(legality)
 
     def getVmsList(self, sdUUID):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         return sdCache.produce(sdUUID).getVMsList()
 
     def getVmsInfo(self, sdUUID, vmList=None):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         return sdCache.produce(sdUUID).getVMsInfo(vmList=vmList)
 
     def validateVolumeChain(self, sdUUID, imgUUID):
         image.Image(self.poolPath).validateVolumeChain(sdUUID, imgUUID)
 
     def extendSD(self, sdUUID, devlist, force):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         sdCache.produce(sdUUID).extend(devlist, force)
 
     def resizePV(self, sdUUID, guid):
-        self.validatePoolSD(sdUUID)
+        self._assert_sd_in_pool(sdUUID)
         sdCache.produce(sdUUID).resizePV(guid)
 
     def setSDDescription(self, sd, description):
-        self.validatePoolSD(sd.sdUUID)
+        self._assert_sd_in_pool(sd.sdUUID)
         sd.setDescription(description)
 
     def getAllTasksStatuses(self):
@@ -1981,7 +2074,7 @@ class StoragePool(object):
 
     # Lease operations
 
-    def create_lease(self, lease):
+    def create_lease(self, lease, metadata=None):
         """
         SPM task function for creating external lease.
 
@@ -1989,7 +2082,8 @@ class StoragePool(object):
         """
         dom = sdCache.produce(lease.sd_id)
         try:
-            dom.create_lease(lease.lease_id)
+            dom.create_lease(
+                lease.lease_id, metadata=metadata, host_id=self.id)
         except xlease.LeaseExists:
             # We cannot fail the task as engine is not checking tasks errors.
             self.log.info("Reusing existing lease: %s:%s",
@@ -2019,5 +2113,46 @@ class StoragePool(object):
     @unsecured
     def _master_volume_path(self, vol):
         return os.path.join(
-            sc.REPO_DATA_CENTER, self.spUUID,
-            POOL_MASTER_DOMAIN, sd.DOMAIN_META_DATA, vol)
+            sc.REPO_DATA_CENTER,
+            self.spUUID,
+            sc.POOL_MASTER_DOMAIN,
+            sd.DOMAIN_META_DATA, vol)
+
+    # Watching SPM lease
+
+    def _start_watching_spm_lease(self, master_sd):
+        """
+        If the master storage domain supports inquire, start watching the SPM
+        lease.
+
+        Panics on failures.
+        """
+        if not config.getboolean("spm", "watchdog_enable"):
+            return
+
+        if not master_sd.supports_inquire:
+            return
+
+        if self._watchdog is not None:
+            raise RuntimeError("Watchdog already started")
+
+        try:
+            self._watchdog = spwd.Watchdog(
+                master_sd,
+                check_interval=config.getfloat("spm", "watchdog_interval"))
+            self._watchdog.start()
+        except:
+            panic("Error starting SPM lease watchdog")
+
+    def _stop_watching_spm_lease(self):
+        """
+        If we are watching the SPM lease, stop the watchdog.
+
+        Panics on failures.
+        """
+        if self._watchdog:
+            try:
+                self._watchdog.stop()
+            except:
+                panic("Error stopping SPM lease watchdog")
+            self._watchdog = None

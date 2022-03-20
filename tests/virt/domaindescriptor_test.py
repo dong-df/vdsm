@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2017 Red Hat, Inc.
+# Copyright 2014-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -113,28 +113,55 @@ NO_REBOOT = """
 </domain>
 """
 
+VCPU = """
+<domain>
+    <vcpu>10</vcpu>
+</domain>
+"""
+
+VCPU_CURRENT = """
+<domain>
+    <vcpu current="5">10</vcpu>
+</domain>
+"""
+
+PINNED_CPUS = """
+<domain>
+    <cputune>
+        <vcpupin vcpu="0" cpuset="1,2,5-7" />
+        <vcpupin vcpu="1" cpuset="1,6,10" />
+    </cputune>
+</domain>
+"""
+
+NO_PINNED_CPUS = """
+<domain>
+    <uuid>xyz</uuid>
+</domain>
+"""
+
 
 class DevicesHashTests(VdsmTestCase):
 
     def test_no_devices(self):
         desc1 = DomainDescriptor(NO_DEVICES)
         desc2 = DomainDescriptor(EMPTY_DEVICES)
-        self.assertNotEqual(desc1.devices_hash, desc2.devices_hash)
+        assert desc1.devices_hash != desc2.devices_hash
 
     def test_different_devices(self):
         desc1 = DomainDescriptor(EMPTY_DEVICES)
         desc2 = DomainDescriptor(SOME_DEVICES)
-        self.assertNotEqual(desc1.devices_hash, desc2.devices_hash)
+        assert desc1.devices_hash != desc2.devices_hash
 
     def test_different_order(self):
         desc1 = DomainDescriptor(SOME_DEVICES)
         desc2 = DomainDescriptor(REORDERED_DEVICES)
-        self.assertNotEqual(desc1.devices_hash, desc2.devices_hash)
+        assert desc1.devices_hash != desc2.devices_hash
 
     def test_stable_hash(self):
         desc1 = DomainDescriptor(SOME_DEVICES)
         desc2 = DomainDescriptor(SOME_DEVICES)
-        self.assertEqual(desc1.devices_hash, desc2.devices_hash)
+        assert desc1.devices_hash == desc2.devices_hash
 
 
 @expandPermutations
@@ -145,7 +172,7 @@ class DomainDescriptorTests(XMLTestCase):
                    [MEMORY_SIZE, 1024]])
     def test_memory_size(self, domain_xml, result):
         desc = DomainDescriptor(domain_xml)
-        self.assertEqual(desc.get_memory_size(), result)
+        assert desc.get_memory_size() == result
 
     @permutations([[DomainDescriptor], [MutableDomainDescriptor]])
     def test_xml(self, descriptor):
@@ -158,7 +185,7 @@ class DomainDescriptorTests(XMLTestCase):
                    [MutableDomainDescriptor, 'nonexistent', 0]])
     def test_device_elements(self, descriptor, tag, result):
         desc = descriptor(SOME_DEVICES)
-        self.assertEqual(len(list(desc.get_device_elements(tag))), result)
+        assert len(list(desc.get_device_elements(tag))) == result
 
     @permutations([
         [DomainDescriptor, 'device', {}, 2],
@@ -173,10 +200,9 @@ class DomainDescriptorTests(XMLTestCase):
     def test_device_elements_with_attrs(self, descriptor, tag, attrs,
                                         expected):
         desc = descriptor(SOME_DEVICES)
-        self.assertEqual(
-            len(list(desc.get_device_elements_with_attrs(tag, **attrs))),
-            expected
-        )
+        assert len(list(
+            desc.get_device_elements_with_attrs(tag, **attrs)
+        )) == expected
 
     @permutations([
         # attrs, expected_devs
@@ -187,10 +213,9 @@ class DomainDescriptorTests(XMLTestCase):
     ])
     def test_device_element_with_attrs_selection(self, attrs, expected_devs):
         desc = DomainDescriptor(SOME_DISK_DEVICES)
-        self.assertEqual(
-            len(list(desc.get_device_elements_with_attrs('disk', **attrs))),
-            expected_devs
-        )
+        assert len(list(
+            desc.get_device_elements_with_attrs('disk', **attrs)
+        )) == expected_devs
 
     @permutations([
         # xml_data, expected
@@ -200,7 +225,7 @@ class DomainDescriptorTests(XMLTestCase):
     def test_metadata(self, xml_data, expected):
         desc = DomainDescriptor(xml_data)
         found = desc.metadata is not None
-        self.assertEqual(found, expected)
+        assert found == expected
 
     @permutations([
         # values, expected_metadata
@@ -240,4 +265,25 @@ class DomainDescriptorTests(XMLTestCase):
     def test_on_reboot_config(self, xml_data, expected):
         desc = DomainDescriptor(xml_data)
         reboot_config = desc.on_reboot_config()
-        self.assertEqual(reboot_config, expected)
+        assert reboot_config == expected
+
+    @permutations([
+        [VCPU, 10],
+        [VCPU_CURRENT, 5],
+    ])
+    def test_get_number_of_cpus(self, xml_data, expected):
+        desc = DomainDescriptor(xml_data)
+        cpus = desc.get_number_of_cpus()
+        assert cpus == expected
+
+    def test_pinned_cpus(self):
+        desc = DomainDescriptor(PINNED_CPUS)
+        pinning = desc.pinned_cpus
+        assert len(pinning) == 2
+        assert pinning[0] == frozenset([1, 2, 5, 6, 7])
+        assert pinning[1] == frozenset([1, 6, 10])
+
+    def test_no_pinned_cpus(self):
+        desc = DomainDescriptor(NO_PINNED_CPUS)
+        pinning = desc.pinned_cpus
+        assert pinning == {}

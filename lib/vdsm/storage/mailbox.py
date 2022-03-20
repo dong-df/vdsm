@@ -94,7 +94,7 @@ def _mboxExecCmd(*args, **kwargs):
 
 class SPM_Extend_Message:
 
-    log = logging.getLogger('storage.SPM.Messages.Extend')
+    log = logging.getLogger('storage.spm.messages.extend')
 
     def __init__(self, volumeData, newSize, callbackFunction=None):
         if ('poolID' not in volumeData or
@@ -119,8 +119,8 @@ class SPM_Extend_Message:
         # Version (1 byte), OpCode (4 bytes), Domain UUID (16 bytes), Volume
         # UUID (16 bytes), Requested size (16 bytes), Padding to 64 bytes (14
         # bytes)
-        domain = misc.packUuid(volumeData['domainID'])
-        volume = misc.packUuid(volumeData['volumeID'])
+        domain = pack_uuid(volumeData['domainID'])
+        volume = pack_uuid(volumeData['volumeID'])
         size = b'%0*x' % (SIZE_CHARS, newSize)
         payload = MESSAGE_VERSION + EXTEND_CODE + domain + volume + size
         # Pad payload with zeros
@@ -157,9 +157,9 @@ class SPM_Extend_Message:
 
         volume = {}
         volume['poolID'] = pool.spUUID
-        volume['domainID'] = misc.unpackUuid(
+        volume['domainID'] = unpack_uuid(
             payload[sdOffset:sdOffset + PACKED_UUID_SIZE])
-        volume['volumeID'] = misc.unpackUuid(
+        volume['volumeID'] = unpack_uuid(
             payload[volumeOffset:volumeOffset + PACKED_UUID_SIZE])
         size = int(payload[sizeOffset:sizeOffset + SIZE_CHARS], 16)
 
@@ -185,7 +185,7 @@ class SPM_Extend_Message:
 
 class HSM_Mailbox:
 
-    log = logging.getLogger('storage.Mailbox.HSM')
+    log = logging.getLogger('storage.mailbox.hsm')
 
     def __init__(self, hostID, poolID, inbox, outbox, monitorInterval=2):
         self._hostID = str(hostID)
@@ -227,7 +227,7 @@ class HSM_Mailbox:
 
 
 class HSM_MailMonitor(object):
-    log = logging.getLogger('storage.MailBox.HsmMailMonitor')
+    log = logging.getLogger('storage.mailbox.hsmmailmonitor')
 
     def __init__(self, inbox, outbox, hostID, queue, monitorInterval):
         # Save arguments
@@ -773,3 +773,13 @@ def wait_timeout(monitor_interval):
     years, while allowing shorter times for testing.
     """
     return monitor_interval * 1.5
+
+
+def pack_uuid(s):
+    value = uuid.UUID(s).int
+    return value.to_bytes(16, "little")
+
+
+def unpack_uuid(s):
+    value = int.from_bytes(s, "little")
+    return str(uuid.UUID(int=value))

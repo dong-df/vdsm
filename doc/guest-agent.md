@@ -38,19 +38,59 @@ are:
 
  -  We cannot (or don't have to) talk to the socket directly. Libvirt holds
     the connection to the socket because it needs to talk to QGA. All the
-    communication has to go through libvirt. Right now, there is only the
-    low-level function `virDomainQemuAgentCommand()`. It is unsupported and
-    not meant to be used in production. This contradicts the libvirt
-    philosophy that the management application should not care about details
-    of anything from hypervisor down and libvirt should be the only point of
-    contact. But at the moment it is the only way to access QGA. In the future
-    we may be able to fetch the information by some more supported way, e.g.
-    by `virConnectGetAllDomainStats()`
+    communication has to go through libvirt.
 
  -  QGA does not support events and there is no intention to implement that.
     This means there is no way how to request periodic information from QGA.
     Somebody has to regularly poll QGA for the information. Right now, this
     has to be VDSM for the above reason.
+
+
+Libvirt interface to QEMU Guest Agent
+=======================================
+
+Libvirt holds the connection to the guest agent socket. That means all the
+calls we need to do have to go through libvirt. Since libvirt 5.7.0 there is
+generic interface to the agent information provided by
+`virDomainGetGuestInfo()`. This function is not universal though. When new
+commands are added to the agent libvirt has to be extended to call the new
+command and provide the results. Some calls are handled by separate functions
+and such information is not duplicated in `virDomainGetGuestInfo()`. Notably
+`virDomainInterfaceAddresses()` that we use to retrieve information about NICs.
+
+There is also the low-level function `virDomainQemuAgentCommand()`. It is
+unsupported and not meant to be used in production. Using the function also
+taints the domain. We need this function too though for several reasons.
+Namely to receive general information about the agent (guest-info command)
+with version and list of supported commands. But we also need to be able to
+make calls not (yet) supported by libvirt interface.
+
+
+Channel state tracking
+========================
+
+Because unlike the oVirt agent the QEMU guest agent is passive and does not
+periodically report information from guest we have a hard time knowing if the
+agent is in a good shape (i.e. is not stuck). That means if we want some
+information or action from the agent we have to try and hope for the best.
+Luckily we have at least some clue if the agent is there at all, listening for
+commands or not (not running or not installed). Libvirt watches messages from
+QEMU monitor about the state of the socket in the guest and tracks this
+information internally. This information is then provided to the management
+applications (in our case VDSM) in two ways -- in domain XML and via events.
+
+Similarly we too keep the state of the agent stored internally in the poller.
+We listen to libvirt `VIR_DOMAIN_EVENT_ID_AGENT_LIFECYCLE` event and remember
+the state of the channel. In most of the cases this should be good enough for
+tracking the actual state. Even during VM migration libvirt first notifies
+VDSM on destination host that the agent is disconnected. Later, when the VM is
+migrated, libvirt updates the state to connected if the agent is running
+inside the guest. For the edge cases, when the events are not enough (e.g.
+during VM recovery after VDSM restart) we can "bootstrap" the channel state by
+reading it from domain XML.
+
+Historically VDSM was blindly trying to reach the agent. This is still obvious
+on some code paths, but should be eliminated over time.
 
 
 Class Relationships

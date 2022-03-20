@@ -44,7 +44,9 @@ from vdsm.storage import fileUtils
 from vdsm.storage import fileVolume
 from vdsm.storage import mount
 from vdsm.storage import outOfProcess as oop
+from vdsm.storage import sanlock_direct
 from vdsm.storage import sd
+from vdsm.storage import volumemetadata
 from vdsm.storage import xlease
 from vdsm.storage.persistent import PersistentDict, DictValidator
 
@@ -335,8 +337,8 @@ class FileStorageDomainManifest(sd.StorageDomainManifest):
         Fetch the set of the Image UUIDs in the SD.
         """
         # Get Volumes of an image
-        pattern = os.path.join(self.mountpoint, self.sdUUID, sd.DOMAIN_IMAGES,
-                               UUID_GLOB_PATTERN)
+        pattern = os.path.join(glob_escape(self.mountpoint), self.sdUUID,
+                               sd.DOMAIN_IMAGES, UUID_GLOB_PATTERN)
         files = self.oop.glob.glob(pattern)
         images = set()
         for i in files:
@@ -567,7 +569,7 @@ class FileStorageDomain(sd.StorageDomain):
         to the parent. When creating the qcow layer, we pass a relative path
         which allows us to build a directory with links to all volumes in the
         chain anywhere we want. This method creates a directory with the image
-        uuid under /var/run/vdsm and creates sym links to all the volumes in
+        uuid under /run/vdsm and creates sym links to all the volumes in
         the chain.
 
         srcImgPath: Dir where the image volumes are.
@@ -807,7 +809,7 @@ class FileStorageDomain(sd.StorageDomain):
             self.log.debug("Converting volume %s metadata", vol.volUUID)
             try:
                 vol_md = vol.getMetadata()
-            except se.MetaDataKeyNotFoundError as e:
+            except se.InvalidMetadata as e:
                 self.log.warning(
                     "Skipping volume %s with invalid metadata: %s",
                     vol.volUUID, e)
@@ -830,10 +832,91 @@ class FileStorageDomain(sd.StorageDomain):
             self.log.debug("Finalizing volume %s metadata", vol.volUUID)
             try:
                 vol_md = vol.getMetadata()
-            except se.MetaDataKeyNotFoundError:
+            except se.InvalidMetadata:
                 # We already logged about this in convert_volume_metadata().
                 continue
             vol.setMetadata(vol_md)
+
+    # Dump metadata
+
+    def dump(self, full=False):
+        result = {
+            "metadata": self.getInfo(),
+            "volumes": self._dump_volumes()
+        }
+
+        if full:
+            if self.hasVolumeLeases():
+                result["leases"] = self._dump_leases()
+                result["lockspace"] = self.dump_lockspace()
+
+            if self.supports_external_leases(self.getVersion()):
+                result["xleases"] = self.dump_external_leases()
+
+        return result
+
+    def _dump_volumes(self):
+        result = {}
+        # Glob *.meta files directly without an iterator which
+        # may break if a metadata file fails on path validation.
+        meta_files_pattern = os.path.join(
+            glob_escape(self.mountpoint),
+            self.sdUUID,
+            sd.DOMAIN_IMAGES,
+            UUID_GLOB_PATTERN,
+            "*" + fileVolume.META_FILEEXT)
+
+        self.log.debug("Looking up files %s", meta_files_pattern)
+        for path in self.oop.glob.glob(meta_files_pattern):
+            vol_uuid, md = self._parse_metadata_file(path)
+            result[vol_uuid] = md
+
+        return result
+
+    def _parse_metadata_file(self, filepath):
+        img_dir, filename = os.path.split(filepath)
+        vol_uuid = os.path.splitext(filename)[0]
+        img_uuid = os.path.basename(img_dir)
+
+        try:
+            # Read metadata from a file.
+            data = self.oop.readFile(filepath, direct=True)
+        except Exception as e:
+            self.log.warning("Failed to read meta file for volume %s/%s: %s",
+                             self.sdUUID, vol_uuid, e)
+            md = {"status": sc.VOL_STATUS_INVALID}
+        else:
+            # Parse the meta file's key=value pairs and get the metadata dict.
+            md_lines = data.rstrip(b"\0").splitlines()
+            md = volumemetadata.dump(md_lines)
+
+        if 'image' not in md:
+            md['image'] = img_uuid
+
+        # Get volume size.
+        try:
+            vol_size = self.getVolumeSize(img_uuid, vol_uuid)
+            md["truesize"] = vol_size.truesize
+            md["apparentsize"] = vol_size.apparentsize
+        except Exception as e:
+            self.log.warning(
+                "Failed to get size for volume %s/%s: %s",
+                self.sdUUID, vol_uuid, e)
+            md["status"] = sc.VOL_STATUS_INVALID
+
+        # Check if volume was marked as removed and override its status.
+        if img_uuid.startswith(sc.REMOVED_IMAGE_PREFIX):
+            md["status"] = sc.VOL_STATUS_REMOVED
+
+        return vol_uuid, md
+
+    def _dump_leases(self):
+        return list(sanlock_direct.dump_leases(
+            self.getLeasesFilePath(),
+            # Dump all reserved leases.
+            size=sd.RESERVED_LEASES * self.alignment,
+            block_size=self.block_size,
+            alignment=self.alignment))
 
     # Validating file system features
 
@@ -854,7 +937,7 @@ class FileStorageDomain(sd.StorageDomain):
         Returns:
             the detected block size (1, 512, 4096)
         """
-        log = logging.getLogger("storage.fileSD")
+        log = logging.getLogger("storage.filesd")
         iop = oop.getProcessPool(sd_id)
         try:
             block_size = iop.probe_block_size(mountpoint)
@@ -886,7 +969,7 @@ def _getMountsList(pattern="*"):
 
 
 def scanDomains(pattern="*"):
-    log = logging.getLogger("storage.scanDomains")
+    log = logging.getLogger("storage.scandomains")
 
     mntList = _getMountsList(pattern)
 

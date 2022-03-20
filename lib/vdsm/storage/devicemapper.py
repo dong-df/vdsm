@@ -28,10 +28,10 @@ import re
 from collections import namedtuple
 from glob import glob
 
-from vdsm.common import cmdutils
 from vdsm.common import supervdsm
 from vdsm.common import commands
 from vdsm.constants import EXT_DMSETUP
+from vdsm.storage import dmsetup
 
 
 DMPATH_PREFIX = "/dev/mapper/"
@@ -134,11 +134,9 @@ def removeMapping(deviceName):
     if os.geteuid() != 0:
         return supervdsm.getProxy().devicemapper_removeMapping(deviceName)
 
+    log.info("Removing device mapping %s", deviceName)
     cmd = [EXT_DMSETUP, "remove", deviceName]
-    try:
-        commands.run(cmd)
-    except cmdutils.Error as e:
-        raise Error("Could not remove mapping {!r}: {}".format(deviceName, e))
+    commands.run(cmd)
 
 
 def getAllMappedDevices():
@@ -162,32 +160,13 @@ def removeMappingsHoldingDevice(slaveName):
     for holder in holders:
         removeMapping(getDevName(holder))
 
+
 PATH_STATUS_RE = re.compile(r"(?P<devnum>\d+:\d+)\s+(?P<status>[AF])")
 
 
 def getPathsStatus():
-    if os.geteuid() != 0:
-        return supervdsm.getProxy().devicemapper_getPathsStatus()
-
-    cmd = [EXT_DMSETUP, "status", "--target", "multipath"]
-    try:
-        out = commands.run(cmd)
-    except cmdutils.Error as e:
-        raise Error("Could not get device statuses: {}".format(e))
-
-    lines = out.decode("utf-8").splitlines()
-
     res = {}
-    for statusLine in lines:
-        try:
-            devName, statusLine = statusLine.split(":", 1)
-        except ValueError:
-            if len(out) == 1:
-                # return an empty dict when status output is: No devices found
-                return res
-            else:
-                raise
-
+    for devName, statusLine in dmsetup.status(target="multipath"):
         for m in PATH_STATUS_RE.finditer(statusLine):
             devNum, status = m.groups()
             physdevName = device_name(devNum)
@@ -197,32 +176,12 @@ def getPathsStatus():
 
 
 def multipath_status():
-    if os.geteuid() != 0:
-        return supervdsm.getProxy().devicemapper_multipath_status()
-
-    cmd = [EXT_DMSETUP, "status", "--target", "multipath"]
-    try:
-        out = commands.run(cmd)
-    except cmdutils.Error as e:
-        raise Error("Cannot get multipath status: {}".format(e))
-
     res = {}
-    lines = out.decode("utf-8").splitlines()
-    for line in lines:
-        try:
-            guid, paths = line.split(":", 1)
-        except ValueError:
-            # TODO check if this output is relevant
-            if len(lines) != 1:
-                raise
-            # return an empty dict when status output is: No devices found
-            return res
-
+    for guid, paths in dmsetup.status(target="multipath"):
         statuses = []
         for m in PATH_STATUS_RE.finditer(paths):
             major_minor, status = m.groups()
-            name = device_name(major_minor)
-            statuses.append(PathStatus(name, status))
+            statuses.append(PathStatus(major_minor, status))
 
         res[guid] = statuses
 

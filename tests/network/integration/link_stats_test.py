@@ -1,4 +1,4 @@
-# Copyright 2019 Red Hat, Inc.
+# Copyright 2019-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,30 +23,38 @@ from contextlib import contextmanager
 
 import pytest
 
-from .netintegtestlib import bridge_device
-from network import nettestlib
+from network.nettestlib import bond_device
+from network.nettestlib import bridge_device
+from network.nettestlib import dummy_device
+from network.nettestlib import vlan_device
 
 from vdsm.network.link import stats as link_stats
 
 
 @contextmanager
+def _bond_device_master(slaves):
+    with bond_device(slaves) as bond:
+        yield bond
+
+
+@contextmanager
 def _vlan_device():
-    with nettestlib.dummy_device() as nic:
-        with nettestlib.vlan_device(nic, 101) as vlan:
-            yield vlan.devName
+    with dummy_device() as nic:
+        with vlan_device(nic, 101) as vlan:
+            yield vlan
 
 
 @contextmanager
 def _bridge_device():
     with bridge_device() as bridge:
-        yield bridge.devName
+        yield bridge
 
 
 @pytest.mark.parametrize(
     'device_ctx, device_ctx_args',
     [
-        (nettestlib.dummy_device, {}),
-        (nettestlib.bond_device, {'slaves': []}),
+        (dummy_device, {}),
+        (_bond_device_master, {'slaves': ()}),
         (_vlan_device, {}),
         (_bridge_device, {}),
     ],

@@ -1,4 +1,4 @@
-# Copyright 2014-2019 Red Hat, Inc.
+# Copyright 2014-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 from __future__ import absolute_import
 from __future__ import division
 import os
+import os.path
 import uuid
 import sys
 
@@ -30,6 +31,8 @@ from vdsm.config import config
 from . import NO, MAYBE
 
 from vdsm import cpuinfo
+from vdsm.common import cache
+from vdsm.common import commands
 from vdsm.common import cpuarch
 from vdsm.common import pki
 from vdsm.common import systemctl
@@ -39,8 +42,14 @@ from vdsm.tool.configfile import ParserWrapper
 from vdsm import constants
 
 
+_LIBIVRT_DAEMON_CONFIG = os.path.join(
+    constants.SYSCONF_PATH, 'sysconfig/libvirtd'
+)
+_LIBVIRT_SERVICE_UNIT = "libvirtd.service"
 _LIBVIRT_TCP_SOCKET_UNIT = "libvirtd-tcp.socket"
 _LIBVIRT_TLS_SOCKET_UNIT = "libvirtd-tls.socket"
+_SYSTEMD_REQUIREMENT_PATH_TEMPLATE = "/etc/systemd/system/{}.requires"
+_SYSTEMD_UNITS_PATH = "/usr/lib/systemd/system"
 
 
 requires = frozenset(('certificates',))
@@ -50,16 +59,14 @@ services = ("vdsmd", "supervdsmd", "libvirtd")
 
 _LibvirtConnectionConfig = namedtuple(
     "_LibvirtConnectionConfig",
-    "auth_tcp, listen_tcp, listen_tls, spice_tls")
+    "auth_tcp, spice_tls")
 
 
 def configure():
-    # Remove a previous configuration (if present)
-    confutils.remove_conf(FILES, CONF_VERSION)
+    removeConf()
 
     vdsmConfiguration = {
-        'socket_activation': _libvirt_uses_socket_activation(),
-        'ssl_enabled': config.getboolean('vars', 'ssl'),
+        'ssl_enabled': _ssl(),
         'sanlock_enabled': constants.SANLOCK_ENABLED,
         'libvirt_selinux': constants.LIBVIRT_SELINUX
     }
@@ -77,27 +84,27 @@ def configure():
             if status == 0:
                 raise
 
-    if _libvirt_uses_socket_activation():
-        cfg = _read_libvirt_connection_config()
-
-        if cfg.listen_tcp != 0:
-            systemctl.enable(_LIBVIRT_TCP_SOCKET_UNIT)
-
-        if cfg.listen_tls != 0:
-            systemctl.enable(_LIBVIRT_TLS_SOCKET_UNIT)
+    _inject_unit_requirement(_LIBVIRT_SERVICE_UNIT, _socket_unit())
 
 
 def validate():
-    """
-    Validate conflict in configured files
-    """
-    return _isSslConflict()
+    socket_unit = _socket_unit()
+
+    if socket_unit not in _unit_requirements(_LIBVIRT_SERVICE_UNIT):
+        sys.stdout.write("{} doesn't have requirement on {} unit\n".format(
+            _LIBVIRT_SERVICE_UNIT, socket_unit))
+        return False
+
+    return _validate_config()
 
 
 def isconfigured():
     """
     Check if libvirt is already configured for vdsm
     """
+    # Creates libvirt conf file if not exists
+    open(_LIBIVRT_DAEMON_CONFIG, 'a').close()
+
     ret = MAYBE
     for path in (confutils.get_persisted_files(FILES)):
         if not confutils.open_config(path, CONF_VERSION).hasConf():
@@ -106,18 +113,8 @@ def isconfigured():
     if not _is_hugetlbfs_1g_mounted():
         ret = NO
 
-    if _libvirt_uses_socket_activation():
-        cfg = _read_libvirt_connection_config()
-
-        if cfg.listen_tcp != 0 and not _unit_enabled(_LIBVIRT_TCP_SOCKET_UNIT):
-            sys.stdout.write("{} unit is disabled\n".format(
-                _LIBVIRT_TCP_SOCKET_UNIT))
-            ret = NO
-
-        if cfg.listen_tls != 0 and not _unit_enabled(_LIBVIRT_TLS_SOCKET_UNIT):
-            sys.stdout.write("{} unit is disabled\n".format(
-                _LIBVIRT_TLS_SOCKET_UNIT))
-            ret = NO
+    if not _socket_unit() in _unit_requirements(_LIBVIRT_SERVICE_UNIT):
+        ret = NO
 
     if ret == MAYBE:
         sys.stdout.write("libvirt is already configured for vdsm\n")
@@ -128,42 +125,73 @@ def isconfigured():
 
 def removeConf():
     confutils.remove_conf(FILES, CONF_VERSION)
+    _remove_unit_requirements(_LIBVIRT_SERVICE_UNIT, [
+        _LIBVIRT_TLS_SOCKET_UNIT, _LIBVIRT_TCP_SOCKET_UNIT
+    ])
 
 
-def _unit_enabled(unit_name):
-    props = systemctl.show(unit_name, ("UnitFileState",))
-    return props[0]["UnitFileState"] == "enabled"
+@cache.memoized
+def _ssl():
+    return config.getboolean('vars', 'ssl')
+
+
+@cache.memoized
+def _socket_unit():
+    return _LIBVIRT_TLS_SOCKET_UNIT if _ssl() else _LIBVIRT_TCP_SOCKET_UNIT
+
+
+def _inject_unit_requirement(unit, required_unit):
+    requirements_dir_name = _SYSTEMD_REQUIREMENT_PATH_TEMPLATE.format(unit)
+    os.makedirs(requirements_dir_name, mode=0o755, exist_ok=True)
+    try:
+        os.symlink(
+            os.path.join(_SYSTEMD_UNITS_PATH, required_unit),
+            os.path.join(requirements_dir_name, required_unit)
+        )
+    except FileExistsError:
+        pass
+    commands.run([systemctl.SYSTEMCTL, "daemon-reload"])
+
+
+def _remove_unit_requirements(unit, required_units):
+    requirements_dir_name = _SYSTEMD_REQUIREMENT_PATH_TEMPLATE.format(unit)
+
+    for required_unit in required_units:
+        try:
+            os.remove(os.path.join(requirements_dir_name, required_unit))
+        except FileNotFoundError:
+            pass
+
+    commands.run([systemctl.SYSTEMCTL, "daemon-reload"])
+
+
+def _unit_requirements(unit_name):
+    return systemctl.show(unit_name, ("Requires",))[0]["Requires"]
 
 
 def _read_libvirt_connection_config():
     lconf_p = ParserWrapper({
-        'listen_tcp': '0',
         'auth_tcp': 'sasl',
-        'listen_tls': '1',
     })
     lconf_p.read(confutils.get_file_path('LCONF', FILES))
-    listen_tcp = lconf_p.getint('listen_tcp')
     auth_tcp = lconf_p.get('auth_tcp')
-    listen_tls = lconf_p.getint('listen_tls')
     qconf_p = ParserWrapper({'spice_tls': '0'})
     qconf_p.read(confutils.get_file_path('QCONF', FILES))
     spice_tls = qconf_p.getboolean('spice_tls')
     return _LibvirtConnectionConfig(
-        auth_tcp, listen_tcp, listen_tls, spice_tls)
+        auth_tcp, spice_tls)
 
 
-def _isSslConflict():
+def _validate_config():
     """
     return True if libvirt configuration files match ssl configuration of
     vdsm.conf.
     """
-    ssl = config.getboolean('vars', 'ssl')
-
     cfg = _read_libvirt_connection_config()
     ret = True
-    if ssl:
-        if (cfg.listen_tls != 0 and cfg.listen_tcp != 1
-                and cfg.auth_tcp != '"none"' and cfg.spice_tls != 0):
+
+    if _ssl():
+        if (cfg.auth_tcp != '"none"' and cfg.spice_tls != 0):
             sys.stdout.write(
                 "SUCCESS: ssl configured to true. No conflicts\n")
         else:
@@ -172,13 +200,12 @@ def _isSslConflict():
                 "conflicting vdsm and libvirt-qemu tls configuration.\n"
                 "vdsm.conf with ssl=True "
                 "requires the following changes:\n"
-                "libvirtd.conf: listen_tcp=0, auth_tcp=\"sasl\", "
-                "listen_tls=1\nqemu.conf: spice_tls=1.\n"
+                "libvirtd.conf: auth_tcp=\"sasl\"\n"
+                "qemu.conf: spice_tls=1.\n"
             )
             ret = False
     else:
-        if (cfg.listen_tls == 0 and cfg.listen_tcp == 1
-                and cfg.auth_tcp == '"none"' and cfg.spice_tls == 0):
+        if (cfg.auth_tcp == '"none"' and cfg.spice_tls == 0):
             sys.stdout.write(
                 "SUCCESS: ssl configured to false. No conflicts.\n")
         else:
@@ -187,8 +214,8 @@ def _isSslConflict():
                 "conflicting vdsm and libvirt-qemu tls configuration.\n"
                 "vdsm.conf with ssl=False "
                 "requires the following changes:\n"
-                "libvirtd.conf: listen_tcp=1, auth_tcp=\"none\", "
-                "listen_tls=0\n qemu.conf: spice_tls=0.\n"
+                "libvirtd.conf: auth_tcp=\"none\"\n"
+                "qemu.conf: spice_tls=0.\n"
             )
             ret = False
     return ret
@@ -204,32 +231,6 @@ def _is_hugetlbfs_1g_mounted(mtab_path='/etc/mtab'):
                 return True
 
     return False
-
-
-def _find_libvirt_socket_units():
-    return systemctl.show("libvirtd*.socket", ("Names", "LoadState",))
-
-
-# https://bugzilla.redhat.com/1750340
-# Used in tests
-def _libvirt_uses_socket_activation():
-    socket_units = _find_libvirt_socket_units()
-
-    if len(socket_units) == 0:
-        sys.stdout.write("libvirtd doesn't use systemd socket activation\n")
-        return False
-
-    sys.stdout.write("libvirtd socket units status: {}\n".format(socket_units))
-
-    for su in socket_units:
-        if su["LoadState"] == "masked":
-            sys.stdout.write(("libvirtd doesn't use systemd socket activation"
-                              " - one or more of its socket units have been "
-                              "masked\n"))
-            return False
-
-    sys.stdout.write("libvirtd uses socket activation\n")
-    return True
 
 
 # version != PACKAGE_VERSION since we do not want to update configuration
@@ -255,9 +256,6 @@ FILES = {
             {
                 'conditions': {},
                 'content': {
-                    'unix_sock_group': (
-                        '"' + constants.QEMU_PROCESS_GROUP + '"'),
-                    'unix_sock_rw_perms': '"0770"',
                     'auth_unix_rw': '"sasl"',
                     'host_uuid': '"' + str(uuid.uuid4()) + '"',
                     'keepalive_interval': -1,
@@ -269,8 +267,6 @@ FILES = {
                 },
                 'content': {
                     'auth_tcp': '"none"',
-                    'listen_tcp': 1,
-                    'listen_tls': 0,
                 },
 
             },
@@ -301,7 +297,11 @@ FILES = {
                 'conditions': {},
                 'content': {
                     'dynamic_ownership': 1,
-                    'save_image_format': '"gzip"',
+                    # When using block storage, the saved data will result
+                    # in an error when trying to decompress it using gzip.
+                    # For now, we will default to `raw` to make the restore
+                    # memory state work.
+                    'save_image_format': '"raw"',
                     'user': '"qemu"',
                     'group': '"qemu"',
                     'remote_display_port_min': 5900,
@@ -361,10 +361,7 @@ FILES = {
     },
 
     'LDCONF': {
-        'path': os.path.join(
-            constants.SYSCONF_PATH,
-            'sysconfig/libvirtd',
-        ),
+        'path': _LIBIVRT_DAEMON_CONFIG,
         'configure': confutils.add_section,
         'removeConf': confutils.remove_section,
         'persisted': True,
@@ -372,19 +369,11 @@ FILES = {
             {
                 'conditions': {},
                 'content': {
-                    'DAEMON_COREFILE_LIMIT': 'unlimited'
+                    'DAEMON_COREFILE_LIMIT': 'unlimited',
+                    'LIBVIRTD_ARGS': ''
                 }
 
             },
-            {
-                'conditions': {
-                    'socket_activation': False
-                },
-                'content': {
-                    'LIBVIRTD_ARGS': '--listen'
-                }
-
-            }
         ]
     },
 

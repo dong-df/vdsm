@@ -29,19 +29,21 @@ import os.path
 import threading
 import xml.etree.ElementTree as etree
 
+from unittest import mock
+
 from vdsm import clientIF
 from vdsm.common import libvirtconnection, response
 from vdsm.virt import recovery
 from vdsm.virt.vm import VolumeError
 
 from testlib import VdsmTestCase as TestCaseBase
-from testlib import mock
 from testlib import temporaryPath
 from monkeypatch import MonkeyPatch, MonkeyPatchScope
 
-import vmfakelib as fake
 import vmfakecon
 import fakelib
+
+from virt import vmfakelib as fake
 
 
 INEXISTENT_PATH = '/no/such/path'

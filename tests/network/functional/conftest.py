@@ -1,5 +1,5 @@
 #
-# Copyright 2018-2019 Red Hat, Inc.
+# Copyright 2018-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,17 +18,17 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
-
 from contextlib import contextmanager
+from unittest import mock
 
 import pytest
 
 from . import netfunctestlib as nftestlib
+from .netfunctestlib import NetFuncTestAdapter
 from .netfunctestlib import Target
-from network.compat import mock
 
 from vdsm.network import initializer
+from vdsm.network.dhcp_monitor import MonitoredItemPool
 
 
 def pytest_addoption(parser):
@@ -39,6 +39,11 @@ def pytest_addoption(parser):
     parser.addoption(
         '--skip-stable-link-monitor', action='store_const', const=True
     )
+
+
+@pytest.fixture(scope='session', autouse=True)
+def adapter(target):
+    yield NetFuncTestAdapter(target)
 
 
 @pytest.fixture(scope='session', autouse=True)
@@ -82,9 +87,15 @@ def patch_stable_link_monitor(skip_stable_link_monitor):
     yield
 
 
-@pytest.fixture(scope='session', autouse=True)
-def _bond_option_mapping(bond_option_mapping):
-    return
+@pytest.fixture(scope='function', autouse=True)
+def clear_monitor_pool():
+    yield
+    pool = MonitoredItemPool.instance()
+    if not pool.is_pool_empty():
+        # Some tests are not able to clear the pool
+        # (without running dhcp server).
+        # The same applies if the waiting for dhcp monitor times out.
+        pool.clear_pool()
 
 
 @contextmanager

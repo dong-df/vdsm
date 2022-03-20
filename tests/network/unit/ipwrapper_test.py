@@ -1,4 +1,4 @@
-# Copyright 2013-2019 Red Hat, Inc.
+# Copyright 2013-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,7 +22,6 @@ from __future__ import absolute_import
 from __future__ import division
 
 import pytest
-import six
 
 from vdsm.network.ipwrapper import Route
 from vdsm.network.ipwrapper import Rule
@@ -44,8 +43,8 @@ class TestIpwrapper(object):
                 'eth0',
                 'foo',
             ),
-            '200.100.50.0/16 via 11.11.11.11 dev eth2 table foo': (
-                '200.100.50.0/16',
+            '200.100.0.0/16 via 11.11.11.11 dev eth2 table foo': (
+                '200.100.0.0/16',
                 '11.11.11.11',
                 'eth2',
                 'foo',
@@ -69,7 +68,7 @@ class TestIpwrapper(object):
                 'veth_23',
                 'local',
             ),
-            'ff02::2 dev veth_23  metric 0 \    cache': (
+            'ff02::2 dev veth_23  metric 0 \\    cache': (
                 'ff02::2',
                 None,
                 'veth_23',
@@ -77,7 +76,7 @@ class TestIpwrapper(object):
             ),
         }
 
-        for text, attributes in six.viewitems(good_routes):
+        for text, attributes in good_routes.items():
             route = Route.fromText(text)
             assert _getRouteAttrs(route) == attributes
 
@@ -135,7 +134,7 @@ class TestIpwrapper(object):
                 5,
             ),
         }
-        for text, attributes in six.viewitems(good_rules):
+        for text, attributes in good_rules.items():
             rule = Rule.fromText(text)
             assert _getRuleAttrs(rule) == attributes
 

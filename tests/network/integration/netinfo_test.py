@@ -1,5 +1,5 @@
 #
-# Copyright 2012-2019 Red Hat, Inc.
+# Copyright 2012-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,10 +19,8 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
-from __future__ import division
-
-import os
+import ipaddress
+from unittest import mock
 
 import pytest
 
@@ -32,32 +30,59 @@ from vdsm.network.link import nic
 from vdsm.network.link.bond import Bond
 from vdsm.network.link.bond.sysfs_driver import BONDING_MASTERS
 from vdsm.network.link.iface import random_iface_name
-from vdsm.network.netinfo import addresses, bonding, nics
+from vdsm.network.netinfo import addresses, bonding, nics, routes
 from vdsm.network.netlink import waitfor
 
-from network.compat import mock
+from network.nettestlib import Interface
+from network.nettestlib import IpFamily
+from network.nettestlib import running_on_ovirt_ci
 
 from ..nettestlib import dnsmasq_run, dummy_device, veth_pair, wait_for_ipv6
 
+IPV4_ADDR1 = '192.168.99.2'
+IPV4_GATEWAY1 = '192.168.99.1'
+IPV4_ADDR2 = '192.168.199.2'
+IPV4_GATEWAY2 = '192.168.199.1'
+IPV4_ADDR3 = '192.168.200.2'
+IPV4_NETMASK = '255.255.255.0'
+IPV4_PREFIX_LENGTH = 24
+IPV6_ADDR = '2607:f0d0:1002:51::4'
+IPV6_ADDR_BASE = '2001:1:1:1'
+IPV6_ADDR1 = f'{IPV6_ADDR_BASE}::1'
+IPV6_NET_ADDR = f'{IPV6_ADDR_BASE}::'
+IPV6_PREFIX_LENGTH = 64
+
+IPV4_ADDR1_CIDR = f'{IPV4_ADDR1}/{IPV4_PREFIX_LENGTH}'
+IPV4_ADDR2_CIDR = f'{IPV4_ADDR2}/{IPV4_PREFIX_LENGTH}'
+IPV4_ADDR3_CIDR = f'{IPV4_ADDR3}/{32}'
+IPV6_ADDR_CIDR = f'{IPV6_ADDR}/{IPV6_PREFIX_LENGTH}'
 
 # speeds defined in ethtool
 ETHTOOL_SPEEDS = set([10, 100, 1000, 2500, 10000])
 
 
-running_on_ovirt_ci = 'OVIRT_CI' in os.environ
-running_on_travis_ci = 'TRAVIS_CI' in os.environ
-ipv6_broken_on_travis_ci = pytest.mark.skipif(
-    running_on_travis_ci, reason='IPv6 not supported on travis'
-)
-
-# FIXME: Remove when the tests will use a pytest format (and not a nose one).
-is_bonding_available = False
+@pytest.fixture
+def nic0():
+    with dummy_device() as nic:
+        yield nic
 
 
-@pytest.fixture(scope='module', autouse=True)
-def bonding_available(bond_module):
-    global is_bonding_available
-    is_bonding_available = bond_module
+@pytest.fixture
+def dynamic_ipv6_iface():
+    if running_on_ovirt_ci():
+        pytest.skip('Using dnsmasq for ipv6 RA is unstable on CI')
+
+    with veth_pair() as (server, client):
+        with wait_for_ipv6(server, IPV6_ADDR1, IPV6_PREFIX_LENGTH):
+            Interface.from_existing_dev_name(server).add_ip(
+                IPV6_ADDR1, IPV6_PREFIX_LENGTH, IpFamily.IPv6
+            )
+        client_interface = Interface.from_existing_dev_name(client)
+        client_interface.down()
+        with dnsmasq_run(server, ipv6_slaac_prefix=IPV6_NET_ADDR):
+            with wait_for_ipv6(client):
+                client_interface.up()
+            yield client
 
 
 class TestNetinfo(object):
@@ -89,40 +114,40 @@ class TestNetinfo(object):
             )
 
     @pytest.mark.xfail(
-        condition=running_on_ovirt_ci,
+        condition=running_on_ovirt_ci(),
         raises=AssertionError,
         reason='Bond options scanning is fragile on CI',
         strict=False,
     )
-    def test_get_bonding_options(self):
+    def test_get_bonding_options(self, bond_module):
         INTERVAL = '12345'
-        bondName = random_iface_name()
+        bond_name = random_iface_name()
 
-        if not is_bonding_available:
+        if not bond_module:
             pytest.skip('Bonding is not available')
 
         with open(BONDING_MASTERS, 'w') as bonds:
-            bonds.write('+' + bondName)
+            bonds.write('+' + bond_name)
             bonds.flush()
 
             try:  # no error is anticipated but let's make sure we can clean up
-                assert self._bond_opts_without_mode(bondName) == {}, (
+                assert self._bond_opts_without_mode(bond_name) == {}, (
                     'This test fails when a new bonding option is added to '
                     'the kernel. Please run vdsm-tool dump-bonding-options` '
                     'and retest.'
                 )
 
                 with open(
-                    bonding.BONDING_OPT % (bondName, 'miimon'), 'w'
+                    bonding.BONDING_OPT % (bond_name, 'miimon'), 'w'
                 ) as opt:
                     opt.write(INTERVAL)
 
-                assert self._bond_opts_without_mode(bondName) == {
+                assert self._bond_opts_without_mode(bond_name) == {
                     'miimon': INTERVAL
                 }
 
             finally:
-                bonds.write('-' + bondName)
+                bonds.write('-' + bond_name)
 
     @staticmethod
     def _bond_opts_without_mode(bond_name):
@@ -130,109 +155,92 @@ class TestNetinfo(object):
         opts.pop('mode')
         return opts
 
-    @ipv6_broken_on_travis_ci
-    def test_ip_info(self):
-        IPV4_ADDR1 = '192.168.99.2'
-        IPV4_GATEWAY1 = '192.168.99.1'
-        IPV4_ADDR2 = '192.168.199.2'
-        IPV4_GATEWAY2 = '192.168.199.1'
-        IPV4_ADDR3 = '192.168.200.2'
-        IPV4_NETMASK = '255.255.255.0'
-        IPV4_PREFIX_LENGTH = 24
-        IPV6_ADDR = '2607:f0d0:1002:51::4'
-        IPV6_PREFIX_LENGTH = 64
-
-        IPV4_ADDR1_CIDR = self._cidr_form(IPV4_ADDR1, IPV4_PREFIX_LENGTH)
-        IPV4_ADDR2_CIDR = self._cidr_form(IPV4_ADDR2, IPV4_PREFIX_LENGTH)
-        IPV4_ADDR3_CIDR = self._cidr_form(IPV4_ADDR3, 32)
-        IPV6_ADDR_CIDR = self._cidr_form(IPV6_ADDR, IPV6_PREFIX_LENGTH)
-
-        with dummy_device() as device:
-            with waitfor.waitfor_ipv4_addr(device, address=IPV4_ADDR1_CIDR):
-                ipwrapper.addrAdd(device, IPV4_ADDR1, IPV4_PREFIX_LENGTH)
-            with waitfor.waitfor_ipv4_addr(device, address=IPV4_ADDR2_CIDR):
-                ipwrapper.addrAdd(device, IPV4_ADDR2, IPV4_PREFIX_LENGTH)
-            with waitfor.waitfor_ipv6_addr(device, address=IPV6_ADDR_CIDR):
-                ipwrapper.addrAdd(
-                    device, IPV6_ADDR, IPV6_PREFIX_LENGTH, family=6
-                )
-
-            # 32 bit addresses are reported slashless by netlink
-            with waitfor.waitfor_ipv4_addr(device, address=IPV4_ADDR3):
-                ipwrapper.addrAdd(device, IPV4_ADDR3, 32)
-
-            assert addresses.getIpInfo(device) == (
-                IPV4_ADDR1,
-                IPV4_NETMASK,
-                [IPV4_ADDR1_CIDR, IPV4_ADDR2_CIDR, IPV4_ADDR3_CIDR],
-                [IPV6_ADDR_CIDR],
+    def test_ip_info(self, nic0):
+        nic0_interface = Interface.from_existing_dev_name(nic0)
+        with waitfor.waitfor_ipv4_addr(nic0, address=IPV4_ADDR1_CIDR):
+            nic0_interface.add_ip(
+                IPV4_ADDR1, IPV4_PREFIX_LENGTH, IpFamily.IPv4
             )
-            assert addresses.getIpInfo(device, ipv4_gateway=IPV4_GATEWAY1) == (
-                IPV4_ADDR1,
-                IPV4_NETMASK,
-                [IPV4_ADDR1_CIDR, IPV4_ADDR2_CIDR, IPV4_ADDR3_CIDR],
-                [IPV6_ADDR_CIDR],
+        with waitfor.waitfor_ipv4_addr(nic0, address=IPV4_ADDR2_CIDR):
+            nic0_interface.add_ip(
+                IPV4_ADDR2, IPV4_PREFIX_LENGTH, IpFamily.IPv4
             )
-            assert addresses.getIpInfo(device, ipv4_gateway=IPV4_GATEWAY2) == (
-                IPV4_ADDR2,
-                IPV4_NETMASK,
-                [IPV4_ADDR1_CIDR, IPV4_ADDR2_CIDR, IPV4_ADDR3_CIDR],
-                [IPV6_ADDR_CIDR],
-            )
+        with waitfor.waitfor_ipv6_addr(nic0, address=IPV6_ADDR_CIDR):
+            nic0_interface.add_ip(IPV6_ADDR, IPV6_PREFIX_LENGTH, IpFamily.IPv6)
 
-    def _cidr_form(self, ip_addr, prefix_length):
-        return '{}/{}'.format(ip_addr, prefix_length)
+        # 32 bit addresses are reported slashless by netlink
+        with waitfor.waitfor_ipv4_addr(nic0, address=IPV4_ADDR3):
+            nic0_interface.add_ip(IPV4_ADDR3, 32, IpFamily.IPv4)
+
+        assert addresses.getIpInfo(nic0) == (
+            IPV4_ADDR1,
+            IPV4_NETMASK,
+            [IPV4_ADDR1_CIDR, IPV4_ADDR2_CIDR, IPV4_ADDR3_CIDR],
+            [IPV6_ADDR_CIDR],
+        )
+        assert addresses.getIpInfo(nic0, ipv4_gateway=IPV4_GATEWAY1) == (
+            IPV4_ADDR1,
+            IPV4_NETMASK,
+            [IPV4_ADDR1_CIDR, IPV4_ADDR2_CIDR, IPV4_ADDR3_CIDR],
+            [IPV6_ADDR_CIDR],
+        )
+        assert addresses.getIpInfo(nic0, ipv4_gateway=IPV4_GATEWAY2) == (
+            IPV4_ADDR2,
+            IPV4_NETMASK,
+            [IPV4_ADDR1_CIDR, IPV4_ADDR2_CIDR, IPV4_ADDR3_CIDR],
+            [IPV6_ADDR_CIDR],
+        )
+
+    @pytest.mark.parametrize(
+        "ip_addr, ip_netmask",
+        [
+            pytest.param(IPV4_ADDR1, IPV4_NETMASK, id="IPV4"),
+            pytest.param(
+                IPV6_ADDR,
+                IPV6_PREFIX_LENGTH,
+                id="IPV6",
+            ),
+        ],
+    )
+    def test_routes_device_to(self, ip_addr, ip_netmask, nic0):
+        addr_in_net = ipaddress.ip_address(ip_addr) + 1
+        ip_version = addr_in_net.version
+
+        Interface.from_existing_dev_name(nic0).add_ip(
+            ip_addr, ip_netmask, family=ip_version
+        )
+        assert routes.getRouteDeviceTo(str(addr_in_net)) == nic0
 
 
 class TestIPv6Addresses(object):
-    def test_local_auto_when_ipv6_is_disabled(self):
-        with dummy_device() as dev:
-            sysctl.disable_ipv6(dev)
-            assert not addresses.is_ipv6_local_auto(dev)
+    def test_local_auto_when_ipv6_is_disabled(self, nic0):
+        sysctl.disable_ipv6(nic0)
+        assert not addresses.is_ipv6_local_auto(nic0)
 
-    @ipv6_broken_on_travis_ci
-    def test_local_auto_without_router_advertisement_server(self):
-        with dummy_device() as dev:
-            assert addresses.is_ipv6_local_auto(dev)
+    def test_local_auto_without_router_advertisement_server(self, nic0):
+        assert addresses.is_ipv6_local_auto(nic0)
 
-    @ipv6_broken_on_travis_ci
-    def test_local_auto_with_static_address_without_ra_server(self):
-        with dummy_device() as dev:
-            ipwrapper.addrAdd(dev, '2001::88', '64', family=6)
-            ip_addrs = addresses.getIpAddrs()[dev]
-            assert addresses.is_ipv6_local_auto(dev)
-            assert 2 == len(ip_addrs), ip_addrs
-            assert addresses.is_ipv6(ip_addrs[0])
-            assert not addresses.is_dynamic(ip_addrs[0])
+    def test_local_auto_with_static_address_without_ra_server(self, nic0):
+        Interface.from_existing_dev_name(nic0).add_ip(
+            '2001::88', IPV6_PREFIX_LENGTH, IpFamily.IPv6
+        )
+        ip_addrs = addresses.getIpAddrs()[nic0]
+        assert addresses.is_ipv6_local_auto(nic0)
+        assert 2 == len(ip_addrs), ip_addrs
+        assert addresses.is_ipv6(ip_addrs[0])
+        assert not addresses.is_dynamic(ip_addrs[0])
 
-    @pytest.mark.skipif(
-        running_on_ovirt_ci,
-        reason='Using dnsmasq for ipv6 RA is unstable on CI',
-    )
-    @ipv6_broken_on_travis_ci
-    def test_local_auto_with_dynamic_address_from_ra(self):
-        IPV6_NETADDRESS = '2001:1:1:1'
-        IPV6_NETPREFIX_LEN = '64'
-        with veth_pair() as (server, client):
-            ipwrapper.addrAdd(
-                server, IPV6_NETADDRESS + '::1', IPV6_NETPREFIX_LEN, family=6
-            )
-            ipwrapper.linkSet(server, ['up'])
-            with dnsmasq_run(server, ipv6_slaac_prefix=IPV6_NETADDRESS + '::'):
-                with wait_for_ipv6(client):
-                    ipwrapper.linkSet(client, ['up'])
+    def test_local_auto_with_dynamic_address_from_ra(self, dynamic_ipv6_iface):
+        # Expecting link and global addresses on client iface
+        # The addresses are given randomly, so we sort them
+        ip_addrs = sorted(
+            addresses.getIpAddrs()[dynamic_ipv6_iface],
+            key=lambda ip: ip['address'],
+        )
+        assert len(ip_addrs) == 2
 
-                # Expecting link and global addresses on client iface
-                # The addresses are given randomly, so we sort them
-                ip_addrs = sorted(
-                    addresses.getIpAddrs()[client],
-                    key=lambda ip: ip['address'],
-                )
-                assert 2, len(ip_addrs) == ip_addrs
+        assert addresses.is_dynamic(ip_addrs[0])
+        assert ip_addrs[0]['scope'] == 'global'
+        assert ip_addrs[0]['address'].startswith(IPV6_ADDR_BASE)
 
-                assert addresses.is_dynamic(ip_addrs[0])
-                assert 'global' == ip_addrs[0]['scope']
-                ip_address = ip_addrs[0]['address'][: len(IPV6_NETADDRESS)]
-                assert IPV6_NETADDRESS == ip_address
-
-                assert 'link' == ip_addrs[1]['scope']
+        assert ip_addrs[1]['scope'] == 'link'

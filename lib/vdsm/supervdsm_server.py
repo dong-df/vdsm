@@ -20,6 +20,7 @@
 from __future__ import absolute_import
 
 import argparse
+import atexit
 import errno
 import importlib
 import logging
@@ -39,12 +40,11 @@ from multiprocessing import Process
 
 import six
 
+from vdsm.common import commands
 from vdsm.common import concurrent
 from vdsm.common import constants
 from vdsm.common import lockfile
 from vdsm.common import sigutils
-from vdsm.common import time
-from vdsm.common import zombiereaper
 
 try:
     from vdsm.gluster import listPublicFunctions
@@ -57,6 +57,7 @@ from vdsm.storage import constants as sc
 from vdsm.storage import fuser
 from vdsm.storage import hba
 from vdsm.storage import mount
+from vdsm.storage import transientdisk
 from vdsm.storage.fileUtils import chown, resolveGid, resolveUid
 from vdsm.storage.fileUtils import validateAccess as _validateAccess
 from vdsm.storage.iscsi import getDevIscsiInfo as _getdeviSCSIinfo
@@ -102,24 +103,25 @@ def logDecorator(func):
     return wrapper
 
 
-def safe_poll(mp_connection, timeout):
+class PopenAdapter:
     """
-    This is a workaround until we get the PEP-475 fix for EINTR.  It
-    ensures that a multiprocessing.connection.poll() will not return
-    before the timeout due to an interruption.
-
-    Returns True if there is any data to read from the pipe or if the
-    pipe was closed.  Returns False if the timeout expired.
+    Adapt multiprocessing.Process() to subprocess.Popen() interface so it can
+    be used with commands.wait_async().
     """
-    deadline = time.monotonic_time() + timeout
-    remaining = timeout
+    def __init__(self, proc):
+        self._proc = proc
 
-    while not mp_connection.poll(remaining):
-        remaining = deadline - time.monotonic_time()
-        if remaining <= 0:
-            return False
+    def communicate(self):
+        self._proc.join()
+        return None, None
 
-    return True
+    @property
+    def pid(self):
+        return self._proc.pid
+
+    @property
+    def returncode(self):
+        return self._proc.exitcode
 
 
 class _SuperVdsm(object):
@@ -145,57 +147,49 @@ class _SuperVdsm(object):
         return _readSessionInfo(sessionID)
 
     def _runAs(self, user, groups, func, args=(), kwargs={}):
-        def child(pipe):
-            res = ex = None
+        def child(writer):
             try:
                 uid = resolveUid(user)
+
                 if groups:
                     gids = [resolveGid(g) for g in groups]
-
                     os.setgid(gids[0])
                     os.setgroups(gids)
+
                 os.setuid(uid)
 
                 res = func(*args, **kwargs)
+
+                writer.send((res, None))
             except BaseException as e:
-                ex = e
+                writer.send((None, e))
 
-            pipe.send((res, ex))
-            pipe.recv()
+            writer.close()
 
-        pipe, hisPipe = Pipe()
-        with closing(pipe), closing(hisPipe):
-            proc = Process(target=child, args=(hisPipe,))
+        reader, writer = Pipe(duplex=False)
+        with closing(reader), closing(writer):
+            proc = Process(target=child, args=(writer,))
             proc.start()
-
-            needReaping = True
             try:
-                if not safe_poll(pipe, RUN_AS_TIMEOUT):
-                    try:
-
-                        os.kill(proc.pid, signal.SIGKILL)
-                    except OSError as e:
-                        # Don't add to zombiereaper of PID no longer exists
-                        if e.errno == errno.ESRCH:
-                            needReaping = False
-                        else:
-                            raise
-
+                if not reader.poll(RUN_AS_TIMEOUT):
                     raise Timeout()
 
-                res, err = pipe.recv()
-                pipe.send("Bye")
-                proc.terminate()
-
+                res, err = reader.recv()
                 if err is not None:
                     raise err
 
                 return res
-
             finally:
-                # Add to zombiereaper if process has not been waited upon
-                if proc.exitcode is None and needReaping:
-                    zombiereaper.autoReapPID(proc.pid)
+                proc.terminate()
+                proc.join(1)
+
+                if proc.exitcode is None:
+                    try:
+                        os.kill(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        commands.wait_async(PopenAdapter(proc))
 
     @logDecorator
     def validateAccess(self, user, groups, *args, **kwargs):
@@ -233,9 +227,10 @@ def main(args):
         constants.VDSM_USER = args.user
         constants.VDSM_GROUP = args.group
 
-        # Override storage-repository, used to verify file access.
+        # Override storage locations, used to verify file access.
         sc.REPO_DATA_CENTER = args.data_center
         sc.REPO_MOUNT_DIR = os.path.join(args.data_center, sc.DOMAIN_MNT_POINT)
+        transientdisk.P_TRANSIENT_DISKS = args.transient_disks
 
         try:
             logging.config.fileConfig(args.logger_conf,
@@ -249,7 +244,6 @@ def main(args):
         if not config.getboolean('vars', 'core_dump_enable'):
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         sigutils.register()
-        zombiereaper.registerSignalHandler()
 
         def bind(func):
             def wrapper(_SuperVdsm, *args, **kwargs):
@@ -311,18 +305,21 @@ def main(args):
             while _running:
                 sigutils.wait_for_signal()
 
+            if config.getboolean('devel', 'coverage_enable'):
+                atexit._run_exitfuncs()
+
             log.debug("Terminated normally")
         finally:
             try:
                 with connection.Client(address, authkey=_AUTHKEY) as conn:
                     server.shutdown(conn)
                 server_thread.join()
-            except:
+            except Exception:
                 # We ignore any errors here to avoid a situation where systemd
                 # restarts supervdsmd just at the end of shutdown stage. We're
                 # prepared to handle any mess (like existing outdated socket
                 # file) in the startup stage.
-                pass
+                log.exception("Error while shutting down supervdsm")
 
     except Exception as e:
         syslog.syslog("Supervdsm failed to start: %s" % e)
@@ -370,4 +367,9 @@ def option_parser():
         default=sc.REPO_DATA_CENTER,
         help=("override storage repository directory (default %s)"
               % sc.REPO_DATA_CENTER))
+    parser.add_argument(
+        '--transient-disks',
+        default=transientdisk.P_TRANSIENT_DISKS,
+        help=("override storage transient disks directory (default %s)"
+              % transientdisk.P_TRANSIENT_DISKS))
     return parser

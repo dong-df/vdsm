@@ -30,6 +30,8 @@ import sys
 import threading
 import time
 
+from unittest import mock
+
 import pytest
 
 from vdsm import utils
@@ -38,10 +40,9 @@ from vdsm.common import constants
 from vdsm.common import commands
 from vdsm.common.compat import subprocess
 from vdsm.common.password import ProtectedPassword
+from vdsm.storage import constants as sc
 
 import fakelib
-
-from testlib import mock
 
 
 class TestStart:
@@ -260,7 +261,7 @@ class TestRun:
         monkeypatch.setattr(cmdutils, "retcode_log_line", mock.MagicMock())
         cmdutils.command_log_line.return_value = "log line"
         cmdutils.retcode_log_line.return_value = "error line"
-        args = ["exit 1"]
+        args = ["false"]
         try:
             commands.run(args)
         except cmdutils.Error:
@@ -318,7 +319,7 @@ class TestExecCmdStress:
     CONCURRENCY = 50
     FUNC_DELAY = 0.01
     FUNC_CALLS = 40
-    BLOCK_SIZE = 4096
+    BLOCK_SIZE = sc.BLOCK_SIZE_4K
     BLOCK_COUNT = 256
 
     def setup_method(self, test_method):
@@ -415,3 +416,45 @@ class Worker(object):
                 time.sleep(self._func_delay)
         except Exception:
             self.exc_info = sys.exc_info()
+
+
+class TestWaitAsync:
+
+    def test_normal_termination(self):
+        event = threading.Event()
+        p = commands.start(["sleep", "0.1"])
+
+        # Start async waiter waiting for normal terminatin.
+        commands.wait_async(p, event=event)
+
+        if not event.wait(1):
+            raise RuntimeError("Error waiting for termination")
+
+        assert p.returncode == 0
+
+    def test_terminate_async(self):
+        event = threading.Event()
+        p = commands.start(["sleep", "10"])
+
+        # Terminate the command without waiting for it, and start async waiter.
+        p.terminate()
+        commands.wait_async(p, event=event)
+
+        if not event.wait(1):
+            raise RuntimeError("Error waiting for termination")
+
+        assert p.returncode == -15
+
+    def test_out_err(self):
+        event = threading.Event()
+        p = commands.start(
+            ["sh", "-c", "echo out>&1; echo err>&2; sleep 0.1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+
+        commands.wait_async(p, event=event)
+
+        if not event.wait(1):
+            raise RuntimeError("Error waiting for termination")
+
+        assert p.returncode == 0

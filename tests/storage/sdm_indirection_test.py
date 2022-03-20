@@ -24,12 +24,15 @@ from contextlib import contextmanager
 
 from vdsm.storage import blockSD
 from vdsm.storage import blockVolume
+from vdsm.storage import constants as sc
 from vdsm.storage import fileSD
 from vdsm.storage import fileVolume
 
 from testlib import VdsmTestCase
 from testlib import permutations, expandPermutations
 from testlib import recorded
+
+import uuid
 
 
 class FakeDomainManifest(object):
@@ -161,7 +164,7 @@ class FakeDomainManifest(object):
         pass
 
     @recorded
-    def inquireDomainLock(self):
+    def inspectDomainLock(self):
         pass
 
     @recorded
@@ -180,10 +183,10 @@ class FakeDomainManifest(object):
     def refresh(self):
         pass
 
-    @classmethod
     @recorded
-    def validateCreateVolumeParams(cls, volFormat, srcVolUUID, diskType=None,
-                                   preallocate=None):
+    def validateCreateVolumeParams(
+            self, volFormat, srcVolUUID, diskType=None, preallocate=None,
+            add_bitmaps=False, bitmap=None):
         pass
 
     @recorded
@@ -194,8 +197,8 @@ class FakeDomainManifest(object):
 class FakeBlockDomainManifest(FakeDomainManifest):
     def __init__(self):
         FakeDomainManifest.__init__(self)
-        self.logBlkSize = 512
-        self.phyBlkSize = 512
+        self.logBlkSize = sc.BLOCK_SIZE_512
+        self.phyBlkSize = sc.BLOCK_SIZE_512
 
     @recorded
     def getMonitoringPath(self):
@@ -336,7 +339,7 @@ class FakeVolumeManifest(object):
     @classmethod
     @recorded
     def newMetadata(cls, metaId, sdUUID, imgUUID, puuid, size, format, type,
-                    voltype, disktype, desc="", legality=None):
+                    voltype, disktype, desc="", legality=None, sequence=0):
         pass
 
     @recorded
@@ -674,8 +677,20 @@ class DomainTestMixin(object):
                                   [('getRepoPath', (), {})])
 
     def test_validate_create_volume_params(self):
-        self.checker.check_classmethod_call_args_kwargs(
-            "validateCreateVolumeParams", 1, 2, diskType=3, preallocate=4)
+        result = [
+            (
+                'validateCreateVolumeParams',
+                ("1", "2"),
+                {
+                    "diskType": "3",
+                    "preallocate": None,
+                    "add_bitmaps": False,
+                    "bitmap": None,
+                }
+            )
+        ]
+        self.checker.check_method(
+            "validateCreateVolumeParams", ("1", "2", "3"), result)
 
     def test_nonexisting_function(self):
         self.assertRaises(AttributeError,
@@ -686,7 +701,7 @@ class DomainTestMixin(object):
         ['getClusterLease', 'getDomainLease', 0],
         ['acquireClusterLock', 'acquireDomainLock', 1],
         ['releaseClusterLock', 'releaseDomainLock', 0],
-        ['inquireClusterLock', 'inquireDomainLock', 0],
+        ['inspectClusterLock', 'inspectDomainLock', 0],
         ['_makeClusterLock', '_makeDomainLock', 1],
     ])
     def test_clusterlock(self, dom_method, manifest_method, nr_args):
@@ -835,10 +850,29 @@ class VolumeTestMixin(object):
     def test_functions(self, fn, nargs):
         self.checker.check_method_call(fn, nargs)
 
+    def test_newmetadata(self):
+        args = (
+            1,             # metaId
+            uuid.uuid4(),  # sdUUID
+            uuid.uuid4(),  # imgUUID
+            uuid.uuid4(),  # puuid
+            1000,          # capacity
+            1,             # format
+            2,             # type
+            sc.LEAF_VOL,   # voltype
+            'file',        # disktype
+            '',            # description
+            sc.LEGAL_VOL,
+        )
+        kwargs = {"sequence": 0}
+        self.checker.check_classmethod_call_args_kwargs(
+            "newMetadata",
+            *args,
+            **kwargs)
+
     @permutations([
         ['_putMetadata', 2],
         ['createMetadata', 2],
-        ['newMetadata', 11],
         ['newVolumeLease', 3],
         ['getImageVolumes', 2],
         ['teardown', 3],

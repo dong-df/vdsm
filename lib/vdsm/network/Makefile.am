@@ -1,4 +1,4 @@
-# Copyright 2015-2017 Red Hat, Inc.
+# Copyright 2015-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,7 +17,7 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-SUBDIRS = configurators ip link lldp lldpad netinfo netlink ovs tc nm netswitch
+SUBDIRS = common configurators ip link lldp lldpad netinfo netlink nmstate tc netswitch
 
 include $(top_srcdir)/build-aux/Makefile.subs
 

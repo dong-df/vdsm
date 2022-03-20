@@ -34,6 +34,7 @@ from vdsm.common.threadlocal import vars
 from vdsm.common.units import MiB
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
+from vdsm.storage import glance
 from vdsm.storage import imageSharing
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
@@ -44,7 +45,7 @@ from vdsm.storage.sdc import sdCache
 
 from vdsm.common.exception import ActionStopped
 
-log = logging.getLogger('storage.Image')
+log = logging.getLogger('storage.image')
 
 # What volumes to synchronize
 SYNC_VOLUMES_ALL = 'ALL'
@@ -80,7 +81,7 @@ class Image:
     """ Actually represents a whole virtual disk.
         Consist from chain of volumes.
     """
-    log = logging.getLogger('storage.Image')
+    log = logging.getLogger('storage.image')
     _fakeTemplateLock = threading.Lock()
 
     def __init__(self, repoPath):
@@ -113,7 +114,8 @@ class Image:
         qemu_measure = qemuimg.measure(
             image=src_vol_params['path'],
             format=sc.fmt2str(src_vol_params['volFormat']),
-            output_format=qemuimg.FORMAT.QCOW2)
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=src_vol_params["block"])
 
         # Adds extra room so we don't have to extend this disk immediately
         # when a vm is started.
@@ -445,12 +447,6 @@ class Image:
                         backing = None
                         backingFormat = None
 
-                    if (destDom.supportsSparseness and
-                            dstVol.getType() == sc.PREALLOCATED_VOL):
-                        preallocation = qemuimg.PREALLOCATION.FALLOC
-                    else:
-                        preallocation = None
-
                     operation = qemuimg.convert(
                         srcVol.getVolumePath(),
                         dstVol.getVolumePath(),
@@ -459,11 +455,15 @@ class Image:
                         dstQcow2Compat=destDom.qcow2_compat(),
                         backing=backing,
                         backingFormat=backingFormat,
-                        preallocation=preallocation,
                         unordered_writes=destDom.recommends_unordered_writes(
-                            dstVol.getFormat()))
-                    with utils.stopwatch("Copy volume %s"
-                                         % srcVol.volUUID):
+                            dstVol.getFormat()),
+                        create=dstVol.requires_create(),
+                        target_is_zero=dstVol.zero_initialized(),
+                    )
+                    with utils.stopwatch(
+                            "Copy volume {}".format(srcVol.volUUID),
+                            level=logging.INFO,
+                            log=self.log):
                         self._run_qemuimg_operation(operation)
                 except ActionStopped:
                     raise
@@ -735,12 +735,6 @@ class Image:
                 # Start the actual copy image procedure
                 dstVol.prepare(rw=True, setrw=True)
 
-                if (destDom.supportsSparseness and
-                        dstVol.getType() == sc.PREALLOCATED_VOL):
-                    preallocation = qemuimg.PREALLOCATION.FALLOC
-                else:
-                    preallocation = None
-
                 try:
                     operation = qemuimg.convert(
                         volParams['path'],
@@ -748,11 +742,15 @@ class Image:
                         srcFormat=sc.fmt2str(volParams['volFormat']),
                         dstFormat=sc.fmt2str(dstVolFormat),
                         dstQcow2Compat=destDom.qcow2_compat(),
-                        preallocation=preallocation,
                         unordered_writes=destDom.recommends_unordered_writes(
-                            dstVolFormat))
-                    with utils.stopwatch("Copy volume %s"
-                                         % srcVol.volUUID):
+                            dstVolFormat),
+                        create=dstVol.requires_create(),
+                        target_is_zero=dstVol.zero_initialized(),
+                    )
+                    with utils.stopwatch(
+                            "Copy volume {}".format(srcVol.volUUID),
+                            level=logging.INFO,
+                            log=self.log):
                         self._run_qemuimg_operation(operation)
                 except ActionStopped:
                     raise
@@ -858,12 +856,48 @@ class Image:
 
     def syncVolumeChain(self, sdUUID, imgUUID, volUUID, actualChain):
         """
-        Fix volume metadata to reflect the given actual chain.  This function
-        is used to correct the volume chain linkage after a live merge.
+        Fix volume metadata to reflect the given actual chain. This function
+        is used to correct the volume chain linkage after a live merge or for
+        recovery after live merge failure.
+
+        There are multiple cases for the usage of this function:
+
+        1. Marking leaf volume ILLEGAL before we complete a live merge of the
+           leaf volume. In this case actual_chain will not contain the leaf
+           volume id.
+
+           actual_chain: ["base-vol", "internal-vol"]
+           current_chain: ["base-vol", "internal-vol", "leaf-vol"]
+           action: mark "leaf-vol" as illegal.
+
+        2. Removal of internal volume after internal live merge was completed
+           successfully. In this case actual_chain will not contain one of the
+           internal volumes ids.
+
+           actual_chain: ["base-vol", "leaf-vol"]
+           current_chain: ["base-vol", "internal-vol", "leaf-vol"]
+           action: set "leaf-vol" parent to "base-vol"
+
+        3. Fixing the chain after completing live merge of leaf volume has
+           failed. In this case actual_chain will contain all volumes ids. This
+           reverts the change done in case 1.
+
+           actual_chain: ["base-vol", "internal-vol", "leaf-vol"]
+           current_chain: ["base-vol", "internal-vol", "leaf-vol"]
+           action: if "leaf-vol" is ILLEGAL, mark it to LEGAL
+
+        4. Do nothing if actual and current chain matches (no subChain) and
+           leaf volume is marked legal. I this case no change needs to be done
+           in the current_chain.
+
+           actual_chain: ["base-vol", "internal-vol", "leaf-vol"]
+           current_chain: ["base-vol", "internal-vol", "leaf-vol"]
+           action: if "leaf-vol" is LEGAL, do nothing
         """
         curChain = self.getChain(sdUUID, imgUUID, volUUID)
         log_str = logutils.volume_chain_to_str(vol.volUUID for vol in curChain)
         self.log.info("Current chain=%s ", log_str)
+        sdDom = sdCache.produce(sdUUID)
 
         subChain = []
         for vol in curChain:
@@ -871,22 +905,35 @@ class Image:
                 subChain.insert(0, vol.volUUID)
             elif len(subChain) > 0:
                 break
-        if len(subChain) == 0:
-            return
-        self.log.info("Unlinking subchain: %s", subChain)
 
-        sdDom = sdCache.produce(sdUUID=sdUUID)
+        if len(subChain) == 0:
+            tailVol = sdDom.produceVolume(imgUUID, volUUID)
+            if not tailVol.isLegal():
+                # Case 3 - fixing the chain.
+                self.log.info(
+                    "Leaf volume %s is ILLEGAL but is part of the actual chain"
+                    " - marking it LEGAL so it can be used again.",
+                    tailVol.volUUID)
+                tailVol.setLegality(sc.LEGAL_VOL)
+            # Case 4 - do nothing.
+            return
+
         dstParent = sdDom.produceVolume(imgUUID, subChain[0]).getParent()
         subChainTailVol = sdDom.produceVolume(imgUUID, subChain[-1])
         if subChainTailVol.isLeaf():
-            self.log.info("Leaf volume %s is being removed from the chain. "
-                          "Marking it ILLEGAL to prevent data corruption",
-                          subChainTailVol.volUUID)
+            # Case 1 - mark leaf ILLEGAL.
+            self.log.info(
+                "Leaf volume %s is being removed from the actual chain. "
+                "Marking it ILLEGAL to prevent data corruption",
+                subChainTailVol.volUUID)
             subChainTailVol.setLegality(sc.ILLEGAL_VOL)
         else:
+            # Case 2 - remove internal volume.
             for childID in subChainTailVol.getChildren():
-                self.log.info("Setting parent of volume %s to %s",
-                              childID, dstParent)
+                self.log.info(
+                    "Internal volume %s removed from actual chain, linking "
+                    "child volume %s to parent volume %s",
+                    subChainTailVol, childID, dstParent)
                 sdDom.produceVolume(imgUUID, childID). \
                     setParentMeta(dstParent)
 
@@ -909,7 +956,7 @@ class Image:
             vol = dom.produceVolume(imgUUID, volUUID)
             qemuImgFormat = sc.fmt2str(vol.getFormat())
             imgInfo = qemuimg.info(vol.volumePath, qemuImgFormat)
-            backingFile = imgInfo.get('backingfile')
+            backingFile = imgInfo.get('backing-filename')
             if backingFile is not None:
                 volUUID = os.path.basename(backingFile)
             else:
@@ -951,7 +998,11 @@ class Image:
 
         vol = self._activateVolumeForImportExport(domain, imgUUID, volUUID)
         try:
-            imageSharing.upload(vol.getVolumePath(), methodArgs)
+            self._check_sharing_method(methodArgs)
+            glance.upload_image(
+                vol.getVolumePath(),
+                methodArgs["url"],
+                headers=methodArgs.get("headers"))
         finally:
             domain.deactivateImage(imgUUID)
 
@@ -960,9 +1011,16 @@ class Image:
 
         vol = self._activateVolumeForImportExport(domain, imgUUID, volUUID)
         try:
+            self._check_sharing_method(methodArgs)
             # Extend the volume (if relevant) to the image size
-            vol.extend(imageSharing.getSize(methodArgs))
-            imageSharing.download(vol.getVolumePath(), methodArgs)
+            image_info = glance.image_info(
+                methodArgs.get('url'),
+                headers=methodArgs.get("headers"))
+            vol.extend(image_info["size"])
+            glance.download_image(
+                vol.getVolumePath(),
+                methodArgs["url"],
+                headers=methodArgs.get("headers"))
         finally:
             domain.deactivateImage(imgUUID)
 
@@ -985,3 +1043,12 @@ class Image:
             imageSharing.copyToImage(vol.getVolumePath(), methodArgs)
         finally:
             domain.deactivateImage(imgUUID)
+
+    def _check_sharing_method(self, method_args):
+        try:
+            method = method_args["method"]
+        except KeyError:
+            raise RuntimeError("Sharing method not specified")
+
+        if method != "http":
+            raise RuntimeError("Sharing method %s not found" % method)

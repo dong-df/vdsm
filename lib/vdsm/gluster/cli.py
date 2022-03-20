@@ -196,11 +196,11 @@ def _parseVolumeStatus(tree):
     for el in tree.findall('volStatus/volumes/volume/node'):
         value = {}
 
-        for ch in el.getchildren():
+        for ch in el:
             value[ch.tag] = ch.text or ''
 
         ports = {}
-        for ch in el.find('ports').getchildren():
+        for ch in el.find('ports'):
             ports[ch.tag] = ch.text or ''
 
         if value['path'] == 'localhost':
@@ -240,7 +240,7 @@ def _parseVolumeStatusDetail(tree):
     for el in tree.findall('volStatus/volumes/volume/node'):
         value = {}
 
-        for ch in el.getchildren():
+        for ch in el:
             value[ch.tag] = ch.text or ''
 
         sizeTotal = int(value.get('sizeTotal', '0'))
@@ -270,7 +270,7 @@ def _parseVolumeStatusClients(tree):
         clientsStatus = []
         for c in el.findall('clientsStatus/client'):
             clientValue = {}
-            for ch in c.getchildren():
+            for ch in c:
                 clientValue[ch.tag] = ch.text or ''
             clientsStatus.append({'hostname': clientValue['hostname'],
                                   'bytesRead': clientValue['bytesRead'],
@@ -292,12 +292,12 @@ def _parseVolumeStatusMem(tree):
                  'mallinfo': {},
                  'mempool': []}
 
-        for ch in el.find('memStatus/mallinfo').getchildren():
+        for ch in el.find('memStatus/mallinfo'):
             brick['mallinfo'][ch.tag] = ch.text or ''
 
         for c in el.findall('memStatus/mempool/pool'):
             mempool = {}
-            for ch in c.getchildren():
+            for ch in c:
                 mempool[ch.tag] = ch.text or ''
             brick['mempool'].append(mempool)
 
@@ -532,6 +532,8 @@ def volumeInfo(volumeName=None, remoteServer=None):
     command = _getGlusterVolCmd() + ["info"]
     if remoteServer:
         command += ['--remote-host=%s' % remoteServer]
+        if not is_ipv4_fqdn(remoteServer):
+            command += ['--inet6']
     if volumeName:
         command.append(volumeName)
     try:
@@ -542,6 +544,14 @@ def volumeInfo(volumeName=None, remoteServer=None):
         return _parseVolumeInfo(xmltree)
     except _etreeExceptions:  # pylint: disable=catching-non-exception
         raise ge.GlusterXmlErrorException(err=[etree.tostring(xmltree)])
+
+
+def is_ipv4_fqdn(address):
+    try:
+        socket.getaddrinfo(address, None, family=socket.AF_INET)
+    except OSError:  # cannot resolve to IPV4
+        return False
+    return True
 
 
 @gluster_mgmt_api
@@ -576,11 +586,11 @@ def volumeStart(volumeName, force=False):
     command = _getGlusterVolCmd() + ["start", volumeName]
     if force:
         command.append('force')
-    rc, out, err = _execGluster(command)
-    if rc:
-        raise ge.GlusterVolumeStartFailedException(rc, out, err)
-    else:
-        return True
+    try:
+        _execGluster(command)
+    except ge.GlusterCmdFailedException as e:
+        raise ge.GlusterVolumeStartFailedException(rc=e.rc, err=e.err)
+    return True
 
 
 @gluster_mgmt_api
@@ -610,11 +620,11 @@ def volumeSet(volumeName, option, value):
     heal_is_set = option in ('cluster.granular-entry-heal',
                              'granular-entry-heal')
     volume_created = _checkIfVolumeCreated(volumeName)
-    if heal_is_set and volume_created:
-        command = _getGlusterVolCmd() + ['heal', volumeName,
-                                         'granular-entry-heal', value]
+    command = _getGlusterVolCmd()
+    if heal_is_set and not volume_created:
+        command += ['heal', volumeName, 'granular-entry-heal', value]
     else:
-        command = _getGlusterVolCmd() + ["set", volumeName, option, value]
+        command += ['set', volumeName, option, value]
     try:
         _execGlusterXml(command)
         return True
@@ -634,10 +644,10 @@ def _checkIfVolumeCreated(volumeName):
 
 def _parseVolumeSetHelpXml(out):
     optionList = []
-    tree = etree.fromstring('\n'.join(out))
+    tree = etree.fromstring(out)
     for el in tree.findall('option'):
         option = {}
-        for ch in el.getchildren():
+        for ch in el:
             option[ch.tag] = ch.text or ''
         optionList.append(option)
     return optionList
@@ -645,11 +655,12 @@ def _parseVolumeSetHelpXml(out):
 
 @gluster_mgmt_api
 def volumeSetHelpXml():
-    rc, out, err = _execGluster(_getGlusterVolCmd() + ["set", 'help-xml'])
-    if rc:
-        raise ge.GlusterVolumeSetHelpXmlFailedException(rc, out, err)
-    else:
-        return _parseVolumeSetHelpXml(out)
+    command = _getGlusterVolCmd() + ["set", 'help-xml']
+    try:
+        out = _execGluster(command)
+    except ge.GlusterCmdFailedException as e:
+        raise ge.GlusterVolumeSetHelpXmlFailedException(rc=e.rc, err=e.err)
+    return _parseVolumeSetHelpXml(out)
 
 
 @gluster_mgmt_api
@@ -1273,7 +1284,7 @@ def _parseVolumeGeoRepConfig(tree):
     """
     conf = tree.find('geoRep/config')
     config = {}
-    for child in conf.getchildren():
+    for child in conf:
         config[child.tag] = child.text
     return {'geoRepConfig': config}
 
@@ -1337,11 +1348,11 @@ def snapshotDelete(volumeName=None, snapName=None):
         command += ["volume", volumeName]
 
     # xml output not used because of BZ:1161416 in gluster cli
-    rc, out, err = _execGluster(command)
-    if rc:
-        raise ge.GlusterSnapshotDeleteFailedException(rc, out, err)
-    else:
-        return True
+    try:
+        _execGluster(command)
+    except ge.GlusterCmdFailedException as e:
+        raise ge.GlusterSnapshotDeleteFailedException(rc=e.rc, err=e.err)
+    return True
 
 
 @gluster_mgmt_api
@@ -1574,10 +1585,11 @@ def snapshotInfo(volumeName=None):
 @gluster_mgmt_api
 def executeGsecCreate():
     command = _getGlusterSystemCmd() + ["execute", "gsec_create"]
-    rc, out, err = _execGluster(command)
-    if rc:
-        raise ge.GlusterGeoRepPublicKeyFileCreateFailedException(rc,
-                                                                 out, err)
+    try:
+        _execGluster(command)
+    except ge.GlusterCmdFailedException as e:
+        raise ge.GlusterGeoRepPublicKeyFileCreateFailedException(
+            rc=e.rc, err=e.err)
     return True
 
 
@@ -1586,11 +1598,11 @@ def executeMountBrokerUserAdd(remoteUserName, remoteVolumeName):
     command = _getGlusterSystemCmd() + ["execute", "mountbroker",
                                         "user", remoteUserName,
                                         remoteVolumeName]
-    rc, out, err = _execGluster(command)
-    if rc:
-        raise ge.GlusterGeoRepExecuteMountBrokerUserAddFailedException(rc,
-                                                                       out,
-                                                                       err)
+    try:
+        _execGluster(command)
+    except ge.GlusterCmdFailedException as e:
+        raise ge.GlusterGeoRepExecuteMountBrokerUserAddFailedException(
+            rc=e.rc, err=e.err)
     return True
 
 
@@ -1599,10 +1611,11 @@ def executeMountBrokerOpt(optionName, optionValue):
     command = _getGlusterSystemCmd() + ["execute", "mountbroker",
                                         "opt", optionName,
                                         optionValue]
-    rc, out, err = _execGluster(command)
-    if rc:
-        raise ge.GlusterGeoRepExecuteMountBrokerOptFailedException(rc,
-                                                                   out, err)
+    try:
+        _execGluster(command)
+    except ge.GlusterCmdFailedException as e:
+        raise ge.GlusterGeoRepExecuteMountBrokerOptFailedException(
+            rc=e.rc, err=e.err)
     return True
 
 
@@ -1621,9 +1634,9 @@ def volumeGeoRepSessionCreate(volumeName, remoteHost,
         command.append('force')
     try:
         _execGlusterXml(command)
-        return True
     except ge.GlusterCmdFailedException as e:
         raise ge.GlusterGeoRepSessionCreateFailedException(rc=e.rc, err=e.err)
+    return True
 
 
 @gluster_mgmt_api
@@ -1638,9 +1651,9 @@ def volumeGeoRepSessionDelete(volumeName, remoteHost, remoteVolumeName,
                                      "delete"]
     try:
         _execGlusterXml(command)
-        return True
     except ge.GlusterCmdFailedException as e:
         raise ge.GlusterGeoRepSessionDeleteFailedException(rc=e.rc, err=e.err)
+    return True
 
 
 @gluster_mgmt_api
@@ -1682,10 +1695,10 @@ def volumeResetBrickStart(volumeName, existingBrick):
                                      existingBrick, "start"]
     try:
         _execGlusterXml(command)
-        return True
     except ge.GlusterCmdFailedException as e:
         raise ge.GlusterVolumeResetBrickStartFailedException(rc=e.rc,
                                                              err=e.err)
+    return True
 
 
 @gluster_mgmt_api
@@ -1695,10 +1708,10 @@ def volumeResetBrickCommitForce(volumeName, existingBrick):
                                      "force"]
     try:
         _execGlusterXml(command)
-        return True
     except ge.GlusterCmdFailedException as e:
         raise ge.GlusterVolumeResetBrickCommitForceFailedException(rc=e.rc,
                                                                    err=e.err)
+    return True
 
 
 @gluster_mgmt_api
@@ -1710,7 +1723,6 @@ def globalVolumeOptions():
     except ge.GlusterCmdFailedException as e:
         raise ge.GlusterVolumeGetGlobalOptionsFailedException(rc=e.rc,
                                                               err=e.err)
-
     return _parseGlobalVolumeOptions(xmltree)
 
 

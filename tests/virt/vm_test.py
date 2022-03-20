@@ -1,6 +1,6 @@
 #
 # Copyright IBM Corp. 2012
-# Copyright 2013-2019 Red Hat, Inc.
+# Copyright 2013-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -46,10 +46,11 @@ from vdsm.common import xmlutils
 
 import vdsm.common.time
 
+from vdsm.virt import cpumanagement
 from vdsm.virt import periodic
+from vdsm.virt import utils
 from vdsm.virt import virdomain
 from vdsm.virt import vm
-from vdsm.virt import vmchannels
 from vdsm.virt import vmdevices
 from vdsm.virt import vmexitreason
 from vdsm.virt import vmstats
@@ -64,7 +65,7 @@ from vdsm.virt.vmtune import (
 )
 
 from monkeypatch import MonkeyPatch, MonkeyPatchScope
-from testValidation import brokentest, slowtest
+from testValidation import brokentest
 from testlib import VdsmTestCase as TestCaseBase
 from testlib import XMLTestCase
 from testlib import make_config
@@ -73,7 +74,9 @@ from testlib import permutations, expandPermutations
 from testlib import recorded
 
 from fakelib import FakeLogger
-import vmfakelib as fake
+
+from . import vmfakelib as fake
+import pytest
 
 
 _VM_PARAMS = {
@@ -128,10 +131,10 @@ class TestVm(XMLTestCase):
             drive = vmdevices.storage.Drive(self.log, diskType=DISK_TYPE.FILE,
                                             **devConf)
 
-            with self.assertRaises(Exception) as cm:
+            with pytest.raises(Exception) as cm:
                 drive.iotune = tuneConf
 
-            self.assertEqual(cm.exception.args[0], exceptionMsg)
+            assert cm.value.args[0] == exceptionMsg
 
     def testVmPolicyOnStartup(self):
         LIMIT = '50'
@@ -150,7 +153,7 @@ class TestVm(XMLTestCase):
             # need to test this code.
             testvm._updateVcpuLimit()
             stats = testvm.getStats()
-            self.assertEqual(stats['vcpuUserLimit'], LIMIT)
+            assert stats['vcpuUserLimit'] == LIMIT
 
     def testGetVmPolicySucceded(self):
         with fake.VM() as testvm:
@@ -168,7 +171,7 @@ class TestVm(XMLTestCase):
     def testGetVmPolicyFailOnNoDomain(self):
         with fake.VM() as testvm:
             testvm._dom = fake.Domain(virtError=libvirt.VIR_ERR_NO_DOMAIN)
-            self.assertEqual(testvm._getVmPolicy(), None)
+            assert testvm._getVmPolicy() is None
 
     def testUpdateVmPolicy(self):
         with fake.VM() as machine:
@@ -263,7 +266,7 @@ class TestVm(XMLTestCase):
             machine.updateVmPolicy(policy)
 
             stats = machine.getStats()
-            self.assertEqual(stats['vcpuUserLimit'], LIMIT)
+            assert stats['vcpuUserLimit'] == LIMIT
 
     def testIoTuneParser(self):
         with fake.VM() as machine:
@@ -288,7 +291,7 @@ class TestVm(XMLTestCase):
             dom = io_tune_to_dom(ioTuneValues)
             parsed = io_tune_dom_to_values(dom)
 
-            self.assertEqual(ioTuneValues, parsed)
+            assert ioTuneValues == parsed
 
     def testIoTuneMerge(self):
         with fake.VM() as machine:
@@ -340,7 +343,7 @@ class TestVm(XMLTestCase):
 
             ioTuneMerged = io_tune_merge(ioTuneValues1, ioTuneValues2)
 
-            self.assertEqual(ioTuneMerged, ioTuneExpectedValues)
+            assert ioTuneMerged == ioTuneExpectedValues
 
     def testUpdateExistingVmPolicy(self):
         with fake.VM() as machine:
@@ -484,7 +487,7 @@ class TestVm(XMLTestCase):
                      u'total_bytes_sec': 9999
                  }}
             ]
-            self.assertEqual(tunables, expected)
+            assert tunables == expected
 
     @permutations([['<empty/>'], [None]])
     def testNoIoTunePolicy(self, metadata):
@@ -494,7 +497,7 @@ class TestVm(XMLTestCase):
             machine._dom = dom
 
             tunables = machine.io_tune_policy()
-            self.assertEqual(tunables, [])
+            assert tunables == []
 
     @brokentest("the test expects overwrite, the code incrementally updates")
     @permutations([
@@ -558,18 +561,17 @@ class TestVm(XMLTestCase):
 
             machine.setIoTune(tunables)
 
-            self.assertEqual(expected_io_tune, dom._io_tune)
+            assert expected_io_tune == dom._io_tune
 
             # Test that caches were properly updated
-            self.assertEqual(drives[0].iotune,
-                             expected_io_tune[drives[0].name])
+            assert drives[0].iotune == expected_io_tune[drives[0].name]
             self.assertXMLEqual(drives[0]._deviceXML, expected_xml)
 
     def testGetPolicyDisconnected(self):
         with fake.VM() as machine:
             machine._dom = virdomain.Disconnected(machine.id)
             policy = machine._getVmPolicy()
-            self.assertEqual(policy, None)
+            assert policy is None
 
     def testSdIds(self):
         """
@@ -606,13 +608,30 @@ class TestVm(XMLTestCase):
             for drive in drives:
                 machine._devices[drive.type].append(drive)
 
-            self.assertEqual(machine.sdIds, set([domainID]))
+            assert machine.sdIds == set([domainID])
 
     def testVmGuestSocketFile(self):
+        # No channel
         with fake.VM(self.conf) as testvm:
-            self.assertEqual(
-                testvm._guestSocketFile,
-                testvm._makeChannelPath(vmchannels.LEGACY_DEVICE_NAME))
+            assert testvm._guestSocketFile is None
+        # New name
+        channel = '''
+<channel type="unix">
+  <source mode="bind" path="/path/to/channel"/>
+  <target type="virtio" name="ovirt-guest-agent.0"/>
+</channel>
+        '''
+        with fake.VM(self.conf, xmldevices=channel) as testvm:
+            assert testvm._guestSocketFile == '/path/to/channel'
+        # Old name
+        channel = '''
+<channel type="unix">
+  <source mode="bind" path="/path/to/channel"/>
+  <target type="virtio" name="com.redhat.rhevm.vdsm"/>
+</channel>
+        '''
+        with fake.VM(self.conf, xmldevices=channel) as testvm:
+            assert testvm._guestSocketFile == '/path/to/channel'
 
     def test_spice_restore_set_passwd(self):
         devices = '''
@@ -653,10 +672,10 @@ class TestVm(XMLTestCase):
             testvm._dom = dom
 
             testvm.releaseVm()
-            self.assertEqual(status, {
+            assert status == {
                 'graceful': 1,
                 'forceful': 0,
-            })
+            }
 
     @MonkeyPatch(os, 'unlink', lambda _: None)
     @permutations([[1], [2], [3], [9]])
@@ -684,18 +703,18 @@ class TestVm(XMLTestCase):
             testvm._dom = dom
 
             testvm.releaseVm(gracefulAttempts=attempts)
-            self.assertEqual(status, {
+            assert status == {
                 'graceful': attempts,
                 'forceful': 1,
-            })
+            }
 
     def test_acpi_enabled(self):
         with fake.VM(arch=cpuarch.X86_64, features='<acpi/>') as testvm:
-            self.assertTrue(testvm.acpi_enabled())
+            assert testvm.acpi_enabled()
 
     def test_acpi_disabled(self):
         with fake.VM(arch=cpuarch.X86_64) as testvm:
-            self.assertFalse(testvm.acpi_enabled())
+            assert not testvm.acpi_enabled()
 
     def test_hotplug_lease(self):
         params = {
@@ -734,9 +753,46 @@ class TestVm(XMLTestCase):
             testvm.cif = FakeLeaseClientIF(expected_conf)
             res = testvm.hotplugLease(params)
 
-            self.assertIsNotNone(res.pop('vmList'))
-            self.assertEqual(res, response.success())
+            assert res.pop('vmList') is not None
+            assert res == response.success()
             # Up until here we verified the hotplugLease proper.
+
+    def testMemSize(self):
+        with fake.VM() as testvm:
+            assert testvm.mem_size_mb() == 4096
+
+    def testNvdimms(self):
+        # Add NVDIMM to the devices, update memory and make sure
+        # mem_size_mb() returns proper size
+        vm_xml = '''
+        <domain type='kvm' xmlns:ovirt-vm="http://ovirt.org/vm/1.0">
+            <name>nTESTING</name>
+            <uuid>TESTING</uuid>
+            <memory unit='KiB'>12582912</memory>
+            <os>
+                <type arch='x86_64' machine='pc-i440fx-2.3'>hvm</type>
+            </os>
+            <devices>
+                <memory model='nvdimm' access='shared'>
+                    <source>
+                        <path>/dev/pmem0</path>
+                        <alignsize unit='KiB'>131072</alignsize>
+                    </source>
+                    <target>
+                        <size unit='KiB'>8388608</size>
+                        <node>0</node>
+                        <label>
+                            <size unit='KiB'>128</size>
+                        </label>
+                    </target>
+                    <address type='dimm' slot='0'/>
+                </memory>
+            </devices>
+        </domain>
+        '''
+        with fake.VM(params={'xml': vm_xml}) as testvm:
+            # Verify the memory is 4 GB and not 12 GB (4 + 8)
+            assert testvm.mem_size_mb() == 4096
 
 
 class ExpectedError(Exception):
@@ -801,9 +857,9 @@ class TestVmDeviceHandling(TestCaseBase):
         with fake.VM(self.conf, create_device_objects=True) as testvm:
             testvm._devices['general'] = devices
             self.assertNotRaises(testvm._setup_devices)
-            self.assertEqual(devices[0].state, fake.SETUP)
-            self.assertEqual(devices[1].state, fake.SETUP)
-            self.assertEqual(devices[2].state, fake.SETUP)
+            assert devices[0].state == fake.SETUP
+            assert devices[1].state == fake.SETUP
+            assert devices[2].state == fake.SETUP
 
     def test_device_setup_fail_first(self):
         devices = ([fake.Device('device_0', fail_setup=ExpectedError)] +
@@ -811,10 +867,11 @@ class TestVmDeviceHandling(TestCaseBase):
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
             testvm._devices['general'] = devices
-            self.assertRaises(ExpectedError, testvm._setup_devices)
-            self.assertEqual(devices[0].state, fake.SETUP)
-            self.assertEqual(devices[1].state, fake.CREATED)
-            self.assertEqual(devices[2].state, fake.CREATED)
+            with pytest.raises(ExpectedError):
+                testvm._setup_devices()
+            assert devices[0].state == fake.SETUP
+            assert devices[1].state == fake.CREATED
+            assert devices[2].state == fake.CREATED
 
     def test_device_setup_fail_second(self):
         devices = [fake.Device('device_0'),
@@ -823,10 +880,11 @@ class TestVmDeviceHandling(TestCaseBase):
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
             testvm._devices['general'] = devices
-            self.assertRaises(ExpectedError, testvm._setup_devices)
-            self.assertEqual(devices[0].state, fake.TEARDOWN)
-            self.assertEqual(devices[1].state, fake.SETUP)
-            self.assertEqual(devices[2].state, fake.CREATED)
+            with pytest.raises(ExpectedError):
+                testvm._setup_devices()
+            assert devices[0].state == fake.TEARDOWN
+            assert devices[1].state == fake.SETUP
+            assert devices[2].state == fake.CREATED
 
     def test_device_setup_fail_third(self):
         devices = [fake.Device('device_0'), fake.Device('device_1'),
@@ -834,10 +892,11 @@ class TestVmDeviceHandling(TestCaseBase):
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
             testvm._devices['general'] = devices
-            self.assertRaises(ExpectedError, testvm._setup_devices)
-            self.assertEqual(devices[0].state, fake.TEARDOWN)
-            self.assertEqual(devices[1].state, fake.TEARDOWN)
-            self.assertEqual(devices[2].state, fake.SETUP)
+            with pytest.raises(ExpectedError):
+                testvm._setup_devices()
+            assert devices[0].state == fake.TEARDOWN
+            assert devices[1].state == fake.TEARDOWN
+            assert devices[2].state == fake.SETUP
 
     def test_device_setup_correct_exception(self):
         devices = [fake.Device('device_0', fail_teardown=UnexpectedError),
@@ -848,10 +907,11 @@ class TestVmDeviceHandling(TestCaseBase):
 
         with fake.VM(self.conf, create_device_objects=True) as testvm:
             testvm._devices['general'] = devices
-            self.assertRaises(ExpectedError, testvm._setup_devices)
-            self.assertEqual(devices[0].state, fake.TEARDOWN)
-            self.assertEqual(devices[1].state, fake.SETUP)
-            self.assertEqual(devices[2].state, fake.CREATED)
+            with pytest.raises(ExpectedError):
+                testvm._setup_devices()
+            assert devices[0].state == fake.TEARDOWN
+            assert devices[1].state == fake.SETUP
+            assert devices[2].state == fake.CREATED
 
     def test_device_teardown_success(self):
         devices = [fake.Device('device_{}'.format(i)) for i in range(3)]
@@ -860,9 +920,9 @@ class TestVmDeviceHandling(TestCaseBase):
             testvm._devices['general'] = devices
             self.assertNotRaises(testvm._setup_devices)
             self.assertNotRaises(testvm._teardown_devices)
-            self.assertEqual(devices[0].state, fake.TEARDOWN)
-            self.assertEqual(devices[1].state, fake.TEARDOWN)
-            self.assertEqual(devices[2].state, fake.TEARDOWN)
+            assert devices[0].state == fake.TEARDOWN
+            assert devices[1].state == fake.TEARDOWN
+            assert devices[2].state == fake.TEARDOWN
 
     def test_device_teardown_fail_all(self):
         devices = [fake.Device('device_{}'.format(i),
@@ -873,9 +933,9 @@ class TestVmDeviceHandling(TestCaseBase):
             testvm._devices['general'] = devices
             self.assertNotRaises(testvm._setup_devices)
             self.assertNotRaises(testvm._teardown_devices)
-            self.assertEqual(devices[0].state, fake.TEARDOWN)
-            self.assertEqual(devices[1].state, fake.TEARDOWN)
-            self.assertEqual(devices[2].state, fake.TEARDOWN)
+            assert devices[0].state == fake.TEARDOWN
+            assert devices[1].state == fake.TEARDOWN
+            assert devices[2].state == fake.TEARDOWN
 
     @permutations([
         [[], '0'],
@@ -887,7 +947,7 @@ class TestVmDeviceHandling(TestCaseBase):
     def test_getNextIndex(self, used, expected):
         with fake.VM(self.conf) as testvm:
             # TODO: get rid of mangling
-            self.assertEqual(testvm._Vm__getNextIndex(used), expected)
+            assert testvm._Vm__getNextIndex(used) == expected
 
     @permutations([
         ['', ''],
@@ -898,7 +958,7 @@ class TestVmDeviceHandling(TestCaseBase):
     ])
     def test_indiceForIface(self, iface, expected):
         with fake.VM(self.conf) as testvm:
-            self.assertEqual(testvm._indiceForIface(iface), expected)
+            assert testvm._indiceForIface(iface) == expected
 
     @permutations([
         # We have to make sure that 'sd' key exists otherwise even defaultdict
@@ -915,7 +975,7 @@ class TestVmDeviceHandling(TestCaseBase):
         with fake.VM(self.conf) as testvm:
             testvm._usedIndices = used
             testvm.updateDriveIndex(drv)
-            self.assertEqual(testvm._usedIndices, expected)
+            assert testvm._usedIndices == expected
 
     @permutations([
         [[{'iface': 'scsi', 'index': '1'}, {'iface': 'sata'}],
@@ -928,12 +988,12 @@ class TestVmDeviceHandling(TestCaseBase):
     ])
     def test_normalizeDrivesIndices(self, drives, expected):
         with fake.VM(self.conf) as testvm:
-            self.assertEqual(testvm.normalizeDrivesIndices(drives), expected)
+            assert testvm.normalizeDrivesIndices(drives) == expected
 
     def test_xml_device_processing(self):
         with fake.VM({'xml': self.xml_conf}) as vm:
             devices = vm._make_devices()
-            self.assertEqual(sum([len(v) for v in devices.values()]), 2)
+            assert sum([len(v) for v in devices.values()]) == 2
 
 
 VM_EXITS = tuple(product((define.NORMAL, define.ERROR),
@@ -952,9 +1012,9 @@ class TestVmExit(TestCaseBase):
         with fake.VM() as testvm:
             testvm.setDownStatus(exitCode, exitReason)
             stats = testvm.getStats()
-            self.assertEqual(stats['exitReason'], exitReason)
-            self.assertEqual(stats['exitMessage'],
-                             vmexitreason.exitReasons.get(exitReason))
+            assert stats['exitReason'] == exitReason
+            assert stats['exitMessage'] == \
+                vmexitreason.exitReasons.get(exitReason)
 
     @permutations(VM_EXITS)
     def testExitReasonExplicitMessage(self, exitCode, exitReason):
@@ -967,8 +1027,8 @@ class TestVmExit(TestCaseBase):
             msg = "test custom error message"
             testvm.setDownStatus(exitCode, exitReason, msg)
             stats = testvm.getStats()
-            self.assertEqual(stats['exitReason'], exitReason)
-            self.assertEqual(stats['exitMessage'], msg)
+            assert stats['exitReason'] == exitReason
+            assert stats['exitMessage'] == msg
 
 
 _VM_PARAMS = {'displayPort': -1, 'displaySecurePort': -1,
@@ -1006,17 +1066,17 @@ class TestVmStats(TestCaseBase):
                             'net.0.tx.drop': 12},
                 end_index=0)
         posttime = vdsm.common.time.monotonic_time()
-        self.assertIn('sampleTime', res)
-        self.assertTrue(pretime <= res['sampleTime'] <= posttime,
-                        'sampleTime not in [%s..%s]' % (pretime, posttime))
+        assert 'sampleTime' in res
+        assert pretime <= res['sampleTime'] <= posttime, \
+            'sampleTime not in [%s..%s]' % (pretime, posttime)
         del res['sampleTime']
-        self.assertEqual(res, {
+        assert res == {
             'rxErrors': '8', 'rxDropped': '9',
             'txErrors': '11', 'txDropped': '12',
             'macAddr': MAC, 'name': 'vnettest',
             'speed': '1000', 'state': 'unknown',
             'rx': '0', 'tx': '625000000',
-        })
+        }
 
     def testMultipleGraphicDeviceStats(self):
         device_types = ['spice', 'vnc']
@@ -1026,46 +1086,45 @@ class TestVmStats(TestCaseBase):
 </graphics>'''.format(type_=t) for t in device_types])
         with fake.VM(xmldevices=devices, create_device_objects=True) as testvm:
             res = testvm.getStats()
-            self.assertTrue(res['displayInfo'])
+            assert res['displayInfo']
             for dev_stats, type_ in zip(res['displayInfo'], device_types):
-                self.assertIn(dev_stats['type'], type_)
-                self.assertIn('port', dev_stats)
+                assert dev_stats['type'] in type_
+                assert 'port' in dev_stats
 
     def testDiskMappingHashInStatsHash(self):
         with fake.VM(_VM_PARAMS) as testvm:
             res = testvm.getStats()
             testvm.guestAgent.diskMappingHash += 1
-            self.assertNotEqual(
-                res['hash'], testvm.getStats()['hash'])
+            assert res['hash'] != testvm.getStats()['hash']
 
     @MonkeyPatch(vm, 'config',
                  make_config([('vars', 'vm_command_timeout', '10')]))
     def testMonitorTimeoutResponsive(self):
         with fake.VM(_VM_PARAMS) as testvm:
-            self.assertFalse(testvm.isMigrating())
+            assert not testvm.isMigrating()
             stats = {'monitorResponse': '0'}
             testvm._setUnresponsiveIfTimeout(stats, 1)  # any value < timeout
-            self.assertEqual(stats['monitorResponse'], '0')
+            assert stats['monitorResponse'] == '0'
 
     @MonkeyPatch(vm, 'config',
                  make_config([('vars', 'vm_command_timeout', '1')]))
     def testMonitorTimeoutUnresponsive(self):
         with fake.VM(_VM_PARAMS) as testvm:
-            self.assertEqual(testvm._monitorResponse, 0)
-            self.assertFalse(testvm.isMigrating())
+            assert testvm._monitorResponse == 0
+            assert not testvm.isMigrating()
             stats = {'monitorResponse': '0'}
             testvm._setUnresponsiveIfTimeout(stats, 10)  # any value > timeout
-            self.assertEqual(stats['monitorResponse'], '-1')
+            assert stats['monitorResponse'] == '-1'
 
     @MonkeyPatch(vm, 'config',
                  make_config([('vars', 'vm_command_timeout', '10')]))
     def testMonitorTimeoutOnAlreadyUnresponsive(self):
         with fake.VM(_VM_PARAMS) as testvm:
             self._monitorResponse = -1
-            self.assertFalse(testvm.isMigrating())
+            assert not testvm.isMigrating()
             stats = {'monitorResponse': '-1'}
             testvm._setUnresponsiveIfTimeout(stats, 1)  # any value < timeout
-            self.assertEqual(stats['monitorResponse'], '-1')
+            assert stats['monitorResponse'] == '-1'
 
 
 @expandPermutations
@@ -1074,28 +1133,28 @@ class TestLibVirtCallbacks(TestCaseBase):
 
     def test_onIOErrorPause(self):
         with fake.VM(_VM_PARAMS, runCpu=True) as testvm:
-            self.assertTrue(testvm._guestCpuRunning)
+            assert testvm._guestCpuRunning
             testvm.onIOError('fakedev', self.FAKE_ERROR,
                              libvirt.VIR_DOMAIN_EVENT_IO_ERROR_PAUSE)
-            self.assertFalse(testvm._guestCpuRunning)
-            self.assertEqual(testvm._pause_code, self.FAKE_ERROR)
+            assert not testvm._guestCpuRunning
+            assert testvm._pause_code == self.FAKE_ERROR
 
     def test_onIOErrorReport(self):
         with fake.VM(_VM_PARAMS, runCpu=True) as testvm:
-            self.assertTrue(testvm._guestCpuRunning)
+            assert testvm._guestCpuRunning
             testvm.onIOError('fakedev', self.FAKE_ERROR,
                              libvirt.VIR_DOMAIN_EVENT_IO_ERROR_REPORT)
-            self.assertTrue(testvm._guestCpuRunning)
-            self.assertNotEqual(testvm._pause_code, self.FAKE_ERROR)
+            assert testvm._guestCpuRunning
+            assert testvm._pause_code != self.FAKE_ERROR
 
     def test_onIOErrorNotSupported(self):
         """action not explicitely handled, must be skipped"""
         with fake.VM(_VM_PARAMS, runCpu=True) as testvm:
-            self.assertTrue(testvm._guestCpuRunning)
+            assert testvm._guestCpuRunning
             testvm.onIOError('fakedev', self.FAKE_ERROR,
                              libvirt.VIR_DOMAIN_EVENT_IO_ERROR_NONE)
-            self.assertTrue(testvm._guestCpuRunning)
-            self.assertIsNone(testvm._pause_code)  # no error recorded
+            assert testvm._guestCpuRunning
+            assert testvm._pause_code is None  # no error recorded
 
     @permutations([
         ['net1', set()],
@@ -1118,14 +1177,12 @@ class TestLibVirtCallbacks(TestCaseBase):
                      create_device_objects=True) as testvm:
             testvm._updateDomainDescriptor = lambda *args: None
             testvm.onDeviceRemoved(alias)
-            self.assertEqual(
-                set([d.alias for group in testvm._devices.values()
-                     for d in group]),
-                kept_aliases)
+            assert set([d.alias for group in testvm._devices.values()
+                        for d in group]) == kept_aliases
 
 
 class TestVmStatusTransitions(TestCaseBase):
-    @slowtest
+    @pytest.mark.slow
     def testSavingState(self):
         with fake.VM(runCpu=True, status=vmstatus.UP) as testvm:
             testvm._dom = fake.Domain(domState=libvirt.VIR_DOMAIN_RUNNING)
@@ -1145,13 +1202,11 @@ class TestVmStatusTransitions(TestCaseBase):
 
             with MonkeyPatchScope([(testvm, '_underlyingPause',
                                     _fireAsyncEvent)]):
-                self.assertEqual(testvm.status()['status'], vmstatus.UP)
+                assert testvm.status()['status'] == vmstatus.UP
                 testvm.pause(vmstatus.SAVING_STATE)
-                self.assertEqual(testvm.status()['status'],
-                                 vmstatus.SAVING_STATE)
+                assert testvm.status()['status'] == vmstatus.SAVING_STATE
                 t.join()
-                self.assertEqual(testvm.status()['status'],
-                                 vmstatus.SAVING_STATE)
+                assert testvm.status()['status'] == vmstatus.SAVING_STATE
                 # state must not change even after we are sure the event was
                 # handled
 
@@ -1159,10 +1214,10 @@ class TestVmStatusTransitions(TestCaseBase):
 class TestVmBalloon(TestCaseBase):
     def assertAPIFailed(self, res, specificErr=None):
         if specificErr is None:
-            self.assertNotEqual(res['status']['code'], 0)
+            assert res['status']['code'] != 0
         else:
-            self.assertEqual(res['status']['code'],
-                             define.errCode[specificErr]['status']['code'])
+            assert res['status']['code'] == \
+                define.errCode[specificErr]['status']['code']
 
     def testSucceed(self):
         devices = '<memballoon model="virtio" alias="balloon"/>'
@@ -1174,8 +1229,7 @@ class TestVmBalloon(TestCaseBase):
             testvm._dom = fake.Domain()
             target = 256 * 1024
             testvm.setBalloonTarget(target)
-            self.assertEqual(testvm._dom.__calls__,
-                             [('setMemory', (target,), {})])
+            assert testvm._dom.__calls__ == [('setMemory', (target,), {})]
 
     def testVmWithoutDom(self):
         devices = '<memballoon model="virtio" alias="balloon"/>'
@@ -1183,11 +1237,8 @@ class TestVmBalloon(TestCaseBase):
             xmldevices=devices,
             create_device_objects=True
         ) as testvm:
-            self.assertRaises(
-                exception.BalloonError,
-                testvm.setBalloonTarget,
-                128
-            )
+            with pytest.raises(exception.BalloonError):
+                testvm.setBalloonTarget(128)
 
     def testTargetValueNotInteger(self):
         devices = '<memballoon model="virtio" alias="balloon"/>'
@@ -1195,11 +1246,8 @@ class TestVmBalloon(TestCaseBase):
             xmldevices=devices,
             create_device_objects=True
         ) as testvm:
-            self.assertRaises(
-                exception.BalloonError,
-                testvm.setBalloonTarget,
-                'foobar'
-            )
+            with pytest.raises(exception.BalloonError):
+                testvm.setBalloonTarget('foobar')
 
     def testLibvirtFailure(self):
         devices = '<memballoon model="virtio" alias="balloon"/>'
@@ -1209,15 +1257,12 @@ class TestVmBalloon(TestCaseBase):
         ) as testvm:
             testvm._dom = fake.Domain(virtError=libvirt.VIR_ERR_INTERNAL_ERROR)
             # we don't care about the error code as long as is != NO_DOMAIN
-            self.assertRaises(
-                exception.BalloonError,
-                testvm.setBalloonTarget,
-                256
-            )
+            with pytest.raises(exception.BalloonError):
+                testvm.setBalloonTarget(256)
 
     def testGetBalloonInfo(self):
         with fake.VM() as testvm:
-            self.assertEqual(testvm.get_balloon_info(), {})
+            assert testvm.get_balloon_info() == {}
 
     def testSkipBalloonModelNone(self):
         devices = '<memballoon model="none" alias="balloon"/>'
@@ -1229,56 +1274,43 @@ class TestVmBalloon(TestCaseBase):
             testvm._dom = fake.Domain()
             target = 256 * 1024
             testvm.setBalloonTarget(target)
-            self.assertFalse(hasattr(testvm._dom, '__calls__'))
+            assert not hasattr(testvm._dom, '__calls__')
+
+    def testBalloningDisabled(self):
+        devices = '<memballoon model="virtio" alias="balloon"/>'
+        with fake.VM(
+            params={'memSize': 128 * 1024},
+            xmldevices=devices,
+            create_device_objects=True
+        ) as testvm:
+            testvm._dom = fake.Domain()
+            target = 256 * 1024
+            assert testvm._ballooning_enabled  # Verify the default
+            testvm._ballooning_enabled = False
+            testvm.setBalloonTarget(target)
+            assert not hasattr(testvm._dom, '__calls__')
+            assert testvm._balloon_target is None
 
 
 class ChangeBlockDevTests(TestCaseBase):
-    def test_change_cd_eject(self):
-        with fake.VM() as fakevm:
-            fakevm._dom = fake.Domain()
-            cdromspec = {'path': '',
-                         'iface': 'ide',
-                         'index': '2'}
-            self.assertNotRaises(
-                fakevm.changeCD,
-                cdromspec)
-
-    def test_change_cd_failure(self):
-        with fake.VM() as fakevm:
-            # no specific meaning, actually any error != None is good
-            fakevm._dom = fake.Domain(
-                virtError=libvirt.VIR_ERR_GET_FAILED)
-
-            cdromspec = {'path': '/path/to/image',
-                         'iface': 'ide',
-                         'index': '2',
-                         }
-
-            self.assertRaises(
-                exception.ChangeDiskFailed,
-                fakevm.changeCD,
-                cdromspec)
-
     def test_update_drive_parameters_failure(self):
         with fake.VM() as testvm:
             testvm.log = FakeLogger()
 
             # to make the update fail, the simplest way is to have
             # no devices whatsoever
-            self.assertEqual(testvm._devices,
-                             vmdevices.common.empty_dev_map())
-            self.assertEqual(testvm.conf['devices'], [])
+            assert testvm._devices == vmdevices.common.empty_dev_map()
+            assert testvm.conf['devices'] == []
 
             # the method will swallow all the errors
             testvm.updateDriveParameters({'name': 'vda'})
 
             # nothing should be added...
-            self.assertEqual(testvm._devices,
-                             vmdevices.common.empty_dev_map())
-            self.assertEqual(testvm.conf['devices'], [])
+            assert testvm._devices == vmdevices.common.empty_dev_map()
+            assert testvm.conf['devices'] == []
 
             # ... and the reason for no update should be logged
-            self.assertTrue(testvm.log.messages)
+            assert testvm.log.messages
 
 
 class FakeVm(vm.Vm):
@@ -1291,6 +1323,7 @@ class FakeVm(vm.Vm):
 
     def __init__(self, dom):
         self._dom = dom
+        self._qga_lock = threading.Lock()
 
 
 class FreezingTests(TestCaseBase):
@@ -1301,13 +1334,13 @@ class FreezingTests(TestCaseBase):
 
     def test_freeze(self):
         res = self.vm.freeze()
-        self.assertEqual(res, response.success())
-        self.assertEqual(self.dom.__calls__, [("fsFreeze", (), {})])
+        assert res == response.success()
+        assert self.dom.__calls__ == [("fsFreeze", (), {})]
 
     def test_thaw(self):
         res = self.vm.thaw()
-        self.assertEqual(res, response.success())
-        self.assertEqual(self.dom.__calls__, [("fsThaw", (), {})])
+        assert res == response.success()
+        assert self.dom.__calls__ == [("fsThaw", (), {})]
 
 
 class FreezingGuestAgentUnresponsiveTests(TestCaseBase):
@@ -1322,11 +1355,11 @@ class FreezingGuestAgentUnresponsiveTests(TestCaseBase):
 
     def test_freeze(self):
         res = self.vm.freeze()
-        self.assertEqual(res, self.expected)
+        assert res == self.expected
 
     def test_thaw(self):
         res = self.vm.thaw()
-        self.assertEqual(res, self.expected)
+        assert res == self.expected
 
 
 class FreezingUnsupportedTests(TestCaseBase):
@@ -1341,11 +1374,11 @@ class FreezingUnsupportedTests(TestCaseBase):
 
     def test_freeze(self):
         res = self.vm.freeze()
-        self.assertEqual(res, self.expected)
+        assert res == self.expected
 
     def test_thaw(self):
         res = self.vm.thaw()
-        self.assertEqual(res, self.expected)
+        assert res == self.expected
 
 
 class FreezingUnexpectedErrorTests(TestCaseBase):
@@ -1358,13 +1391,11 @@ class FreezingUnexpectedErrorTests(TestCaseBase):
 
     def test_freeze(self):
         res = self.vm.freeze()
-        self.assertEqual(res, response.error("freezeErr",
-                                             message="fake error"))
+        assert res == response.error("freezeErr", message="fake error")
 
     def test_thaw(self):
         res = self.vm.thaw()
-        self.assertEqual(res, response.error("thawErr",
-                                             message="fake error"))
+        assert res == response.error("thawErr", message="fake error")
 
 
 def err_no_domain():
@@ -1452,11 +1483,11 @@ class TestVmPersistency(TestCaseBase):
         domains = [FakePersistentDomain(undefined, *s) for s in domain_specs]
         connection = FakePersistentConnection(domains)
         if result is None:
-            self.assertRaises(exception.VMExists, vm._undefine_stale_domain,
-                              FakePersistentVm(), connection)
+            with pytest.raises(exception.VMExists):
+                vm._undefine_stale_domain(FakePersistentVm(), connection)
         else:
             vm._undefine_stale_domain(FakePersistentVm(), connection)
-            self.assertEqual(undefined, result)
+            assert undefined == result
 
 
 class BlockIoTuneTests(TestCaseBase):
@@ -1499,22 +1530,18 @@ class BlockIoTuneTests(TestCaseBase):
             testvm._devices[hwclass.DISK] = (self.drive,)
 
             res = testvm.io_tune_values()
-            self.assertTrue(res)
-            self.assertEqual(
-                self.dom.__calls__,
+            assert res
+            assert self.dom.__calls__ == \
                 [('blockIoTune',
                     (self.drive.name, libvirt.VIR_DOMAIN_AFFECT_LIVE),
                     {})]
-            )
 
             res = testvm.io_tune_values()
-            self.assertTrue(res)
-            self.assertEqual(
-                self.dom.__calls__,
+            assert res
+            assert self.dom.__calls__ == \
                 [('blockIoTune',
                     (self.drive.name, libvirt.VIR_DOMAIN_AFFECT_LIVE),
                     {})]
-            )
 
     @MonkeyPatch(vm, 'isVdsmImage', lambda *args: True)
     def test_set_updates_cache(self):
@@ -1534,7 +1561,7 @@ class BlockIoTuneTests(TestCaseBase):
             res = testvm.io_tune_values()
             self.assert_iotune_in_response(res, self.iotune_high)
 
-            self.assertEqual(len(self.dom.__calls__), 2)
+            assert len(self.dom.__calls__) == 2
             self.assert_nth_call_to_dom_is(0, 'blockIoTune')
             self.assert_nth_call_to_dom_is(1, 'setBlockIoTune')
 
@@ -1553,7 +1580,7 @@ class BlockIoTuneTests(TestCaseBase):
             res = testvm.io_tune_values()
             self.assert_iotune_in_response(res, self.iotune_high)
 
-            self.assertEqual(len(self.dom.__calls__), 1)
+            assert len(self.dom.__calls__) == 1
             self.assert_nth_call_to_dom_is(0, 'setBlockIoTune')
 
     @MonkeyPatch(vm, 'isVdsmImage', lambda *args: True)
@@ -1575,10 +1602,8 @@ class BlockIoTuneTests(TestCaseBase):
                 self.iotune_low
             )
 
-            self.assertEqual(
-                self.dom.iotunes,
+            assert self.dom.iotunes == \
                 {self.drive.name: self.iotune_high}
-            )
 
     @MonkeyPatch(vm, 'isVdsmImage', lambda *args: True)
     def test_set_iotune_invalid(self):
@@ -1590,14 +1615,11 @@ class BlockIoTuneTests(TestCaseBase):
                 {"name": self.drive.name, "ioTune": self.iotune_wrong}
             ]
 
-            self.assertRaises(
-                exception.UpdateIOTuneError,
-                testvm.setIoTune,
-                tunables
-            )
+            with pytest.raises(exception.UpdateIOTuneError):
+                testvm.setIoTune(tunables)
 
-    @MonkeyPatch(vm, 'config',
-                 make_config([('vars', 'vm_kill_paused_time', '1')]))
+    @MonkeyPatch(utils, 'config',
+                 make_config([('sanlock', 'io_timeout', '1')]))
     def test_exit_with_error_on_resume(self):
         with fake.VM() as testvm:
             pretime = vdsm.common.time.monotonic_time() - 30.0
@@ -1606,9 +1628,8 @@ class BlockIoTuneTests(TestCaseBase):
 
             testvm._dom = fake.Domain()
 
-            self.assertRaises(
-                vm.DestroyedOnResumeError,
-                testvm.maybe_resume)
+            with pytest.raises(vm.DestroyedOnResumeError):
+                testvm.maybe_resume()
 
             testvm.onLibvirtLifecycleEvent(
                 libvirt.VIR_DOMAIN_EVENT_STOPPED,
@@ -1616,10 +1637,10 @@ class BlockIoTuneTests(TestCaseBase):
                 None)
 
             stats = testvm.getStats()
-            self.assertEqual(stats['status'], vmstatus.DOWN)
-            self.assertEqual(stats['exitCode'], define.ERROR)
-            self.assertEqual(stats['exitReason'],
-                             vmexitreason.DESTROYED_ON_PAUSE_TIMEOUT)
+            assert stats['status'] == vmstatus.DOWN
+            assert stats['exitCode'] == define.ERROR
+            assert stats['exitReason'] == \
+                vmexitreason.DESTROYED_ON_PAUSE_TIMEOUT
 
     _PAUSED_VMS = {'auto_resume':
                    {'pause_time_offset': 81.0,
@@ -1682,42 +1703,36 @@ class BlockIoTuneTests(TestCaseBase):
         periodic._kill_long_paused_vms(cif)
         for vm_ in cif.getVMs().values():
             expected_status = spec[vm_.id]['expected_status']
-            self.assertEqual(
-                vm_.lastStatus, expected_status,
-                msg=("Wrong status of `%s': actual=%s, expected=%s" %
-                     (vm_.id, vm_.lastStatus, expected_status,))
-            )
+            assert vm_.lastStatus == expected_status, \
+                ("Wrong status of `%s': actual=%s, expected=%s" %
+                 (vm_.id, vm_.lastStatus, expected_status,))
 
     @MonkeyPatch(vm, 'isVdsmImage', lambda *args: True)
     def test_io_tune_policy_values(self):
         with fake.VM() as testvm:
             testvm._dom = self.dom
             testvm._devices[hwclass.DISK] = (self.drive,)
-            self.assertEqual(
-                testvm.io_tune_policy_values(),
-                {
-                    'current_values': [{
-                        'ioTune': self.iotune_low,
-                        'name': self.drive.name,
-                        'path': self.drive.path,
-                    }],
-                    'policy': []
-                })
+            assert testvm.io_tune_policy_values() == {
+                'current_values': [{
+                    'ioTune': self.iotune_low,
+                    'name': self.drive.name,
+                    'path': self.drive.path,
+                }],
+                'policy': []
+            }
 
     @MonkeyPatch(vm, 'isVdsmImage', lambda *args: True)
     def test_io_tune_policy_values_handle_exceptions(self):
         with fake.VM() as testvm:
             testvm._dom = virdomain.Disconnected(testvm.id)
             testvm._devices[hwclass.DISK] = (self.drive,)
-            self.assertEqual(testvm.io_tune_policy_values(), {})
+            assert testvm.io_tune_policy_values() == {}
 
     def assert_nth_call_to_dom_is(self, nth, call):
-        self.assertEqual(self.dom.__calls__[nth][0], call)
+        assert self.dom.__calls__[nth][0] == call
 
     def assert_iotune_in_response(self, res, iotune):
-        self.assertEqual(
-            res[0]['ioTune'], iotune
-        )
+        assert res[0]['ioTune'] == iotune
 
 
 class FakeBlockIoTuneDrive(object):
@@ -1760,11 +1775,11 @@ class SyncGuestTimeTests(TestCaseBase):
     @MonkeyPatch(time, 'time', lambda: 1234567890.125)
     def test_success(self):
         vm = self._make_vm()
-        vm._syncGuestTime()
-        self.assertEqual(vm._dom.__calls__, [
+        vm.syncGuestTime()
+        assert vm._dom.__calls__ == [
             ('setTime', (), {'time': {'seconds': 1234567890,
                                       'nseconds': 125000000}})
-        ])
+        ]
 
     @permutations([[libvirt.VIR_ERR_AGENT_UNRESPONSIVE],
                    [libvirt.VIR_ERR_NO_SUPPORT],
@@ -1772,7 +1787,7 @@ class SyncGuestTimeTests(TestCaseBase):
     def test_swallow_expected_errors(self, virt_error):
         vm = self._make_vm(virt_error=virt_error)
         with self.assertNotRaises():
-            vm._syncGuestTime()
+            vm.syncGuestTime()
 
 
 @expandPermutations
@@ -1790,6 +1805,7 @@ class MetadataTests(TestCaseBase):
       </ovirt-vm:custom>
     </ovirt-vm:vm>
   </metadata>
+  <devices/>
 </domain>'''
 
     _TEST_XML_CLUSTER_VERSION = u'''<?xml version="1.0" encoding="utf-8"?>
@@ -1805,6 +1821,7 @@ class MetadataTests(TestCaseBase):
       </ovirt-vm:custom>
     </ovirt-vm:vm>
   </metadata>
+  <devices/>
 </domain>'''
 
     _TEST_XML_LAUNCH_PAUSED = u'''<?xml version="1.0" encoding="utf-8"?>
@@ -1815,6 +1832,27 @@ class MetadataTests(TestCaseBase):
       <ovirt-vm:launchPaused>true</ovirt-vm:launchPaused>
     </ovirt-vm:vm>
   </metadata>
+  <devices/>
+</domain>'''
+
+    _TEST_XML_IMPLIED_PIN = u'''<?xml version="1.0" encoding="utf-8"?>
+<domain type="kvm" xmlns:ovirt-vm="http://ovirt.org/vm/1.0">
+  <uuid>TESTING</uuid>
+  <devices/>
+  <cputune>
+    <vcpupin vcpu='0' cpuset='10'/>
+  </cputune>
+</domain>'''
+
+    _TEST_XML_DEDICATED = u'''<?xml version="1.0" encoding="utf-8"?>
+<domain type="kvm" xmlns:ovirt-vm="http://ovirt.org/vm/1.0">
+  <uuid>TESTING</uuid>
+  <metadata>
+    <ovirt-vm:vm>
+      <ovirt-vm:cpuPolicy>dedicated</ovirt-vm:cpuPolicy>
+    </ovirt-vm:vm>
+  </metadata>
+  <devices/>
 </domain>'''
 
     @contextmanager
@@ -1834,12 +1872,11 @@ class MetadataTests(TestCaseBase):
 
     def test_conf_devices_empty(self):
         with self.test_vm() as testvm:
-            self.assertEqual(testvm.conf['devices'], [])
+            assert testvm.conf['devices'] == []
 
     def test_custom_properties(self):
         with self.test_vm() as testvm:
-            self.assertEqual(
-                testvm._custom,
+            assert testvm._custom == \
                 {
                     'vmId': 'TESTING',
                     'custom':
@@ -1848,7 +1885,6 @@ class MetadataTests(TestCaseBase):
                         'fizz': 'buzz',
                     },
                 }
-            )
 
     @permutations([
         (3, 6, True,),
@@ -1859,7 +1895,7 @@ class MetadataTests(TestCaseBase):
     ])
     def test_min_cluster_version(self, major, minor, result):
         with self.test_vm(test_xml=self._TEST_XML_CLUSTER_VERSION) as testvm:
-            self.assertEqual(testvm.min_cluster_version(major, minor), result)
+            assert testvm.min_cluster_version(major, minor) == result
 
     @permutations([
         (3, 6, False,),
@@ -1870,15 +1906,88 @@ class MetadataTests(TestCaseBase):
     ])
     def test_void_cluster_version(self, major, minor, result):
         with self.test_vm(test_xml=self._TEST_XML) as testvm:
-            self.assertEqual(testvm.min_cluster_version(major, minor), result)
+            assert testvm.min_cluster_version(major, minor) == result
 
     def test_launch_paused_default_false(self):
         with self.test_vm(test_xml=self._TEST_XML) as testvm:
-            self.assertFalse(testvm._launch_paused)
+            assert not testvm._launch_paused
 
     def test_launch_paused(self):
         with self.test_vm(test_xml=self._TEST_XML_LAUNCH_PAUSED) as testvm:
-            self.assertTrue(testvm._launch_paused)
+            assert testvm._launch_paused
+
+    @permutations([
+        (_TEST_XML, cpumanagement.CPU_POLICY_NONE),
+        (_TEST_XML_IMPLIED_PIN, cpumanagement.CPU_POLICY_MANUAL),
+        (_TEST_XML_DEDICATED, cpumanagement.CPU_POLICY_DEDICATED),
+    ])
+    def test_cpu_policy(self, xml, expected):
+        with self.test_vm(test_xml=xml) as testvm:
+            assert testvm.cpu_policy() == expected
+
+    def test_manually_pinned_cpus(self):
+        with self.test_vm(test_xml=self._TEST_XML_IMPLIED_PIN) as testvm:
+            assert testvm.manually_pinned_cpus() == frozenset([0])
+
+
+class TestQgaContext(TestCaseBase):
+
+    def test_default_timeout(self):
+        with fake.VM() as testvm:
+            testvm._dom = fake.Domain()
+            assert testvm._dom._agent_timeout == \
+                libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK
+            with testvm.qga_context():
+                assert testvm._dom._agent_timeout == \
+                    libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK
+            assert testvm._dom._agent_timeout == \
+                libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK
+
+    def test_reset_default_timeout(self):
+        with fake.VM() as testvm:
+            testvm._dom = fake.Domain()
+            with testvm.qga_context(10):
+                assert testvm._dom._agent_timeout == 10
+            assert testvm._dom._agent_timeout == \
+                libvirt.VIR_DOMAIN_AGENT_RESPONSE_TIMEOUT_BLOCK
+
+    def test_libvirtError_not_handled(self):
+        with fake.VM() as testvm:
+            testvm._dom = fake.Domain()
+            with pytest.raises(libvirt.libvirtError):
+                with testvm.qga_context():
+                    # This exception should be propagated outside the context
+                    raise libvirt.libvirtError("Some error")
+
+    def test_unlock_clean(self):
+        with fake.VM() as testvm:
+            testvm._dom = fake.Domain()
+            with testvm.qga_context():
+                assert testvm._qga_lock.locked()
+            # Make sure the lock was released properly
+            assert not testvm._qga_lock.locked()
+
+    def test_unlock_dirty(self):
+        with fake.VM() as testvm:
+            testvm._dom = fake.Domain()
+            with pytest.raises(libvirt.libvirtError):
+                with testvm.qga_context():
+                    assert testvm._qga_lock.locked()
+                    # Simulate error condition
+                    raise libvirt.libvirtError("Some error")
+            # Make sure the lock was released properly
+            assert not testvm._qga_lock.locked()
+
+    def test_handle_lock_timeout(self):
+        with fake.VM() as testvm:
+            testvm._dom = fake.Domain()
+            # Lock it before entering the context
+            testvm._qga_lock.acquire()
+            with pytest.raises(exception.NonResponsiveGuestAgent):
+                with testvm.qga_context(1):
+                    # We should not get here because the attempt to lock should
+                    # time out and qga_context should raise an exception.
+                    pass
 
 
 class FakeLeaseDomain(object):
@@ -1888,6 +1997,9 @@ class FakeLeaseDomain(object):
 
     def XMLDesc(self, flags=0):
         return '<domain/>'
+
+    def all_channels(self):
+        return []
 
 
 class FakeLeaseIRS(object):

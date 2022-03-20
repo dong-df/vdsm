@@ -25,6 +25,7 @@ from __future__ import division
 import os
 import sys
 
+import selinux
 import six
 import pytest
 
@@ -34,7 +35,10 @@ from vdsm.common import compat
 
 from vdsm.storage.compat import sanlock
 
-from testing import on_travis_ci, on_ovirt_ci
+from testing import (
+    on_ovirt_ci,
+    on_travis_ci,
+)
 
 
 requires_root = pytest.mark.skipif(
@@ -46,6 +50,9 @@ requires_unprivileged_user = pytest.mark.skipif(
 requires_sanlock = pytest.mark.skipif(
     isinstance(sanlock, compat.MissingModule),
     reason="sanlock is not available")
+
+requires_selinux = pytest.mark.skipif(
+    not selinux.is_selinux_enabled(), reason="Selinux is not enabled")
 
 xfail_python3 = pytest.mark.xfail(
     six.PY3, reason="needs porting to python 3")

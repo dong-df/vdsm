@@ -1,4 +1,4 @@
-# Copyright 2019 Red Hat, Inc.
+# Copyright 2019-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,13 +22,13 @@ from __future__ import division
 import logging
 import os
 import tempfile
+from unittest import mock
 
 import pytest
 
 import network as network_tests
 from vdsm.network.link.bond import sysfs_options_mapper
 
-from .compat import mock
 from .nettestlib import KernelModule
 from .nettestlib import has_sysfs_bond_permission
 
@@ -46,7 +46,7 @@ def bond_module():
     return bonding_kmod
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope='session', autouse=True)
 def bond_option_mapping(bond_module):
     file1 = tempfile.NamedTemporaryFile()
     file2 = tempfile.NamedTemporaryFile()

@@ -23,12 +23,14 @@ from __future__ import absolute_import
 import os
 import logging
 import threading
+import time
 from collections import namedtuple
 import codecs
 from contextlib import contextmanager
 
 import six
 
+from vdsm import host
 from vdsm import utils
 from vdsm.common import exception
 from vdsm.common.marks import deprecated
@@ -39,14 +41,20 @@ from vdsm.storage import clusterlock
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fileUtils
+from vdsm.storage import guarded
 from vdsm.storage import misc
 from vdsm.storage import outOfProcess as oop
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceFactories
 from vdsm.storage import resourceManager as rm
 from vdsm.storage import rwlock
+from vdsm.storage import sanlock_direct
 from vdsm.storage import task
+from vdsm.storage import utils as su
+from vdsm.storage import validators
 from vdsm.storage import xlease
+from vdsm.storage.sdc import sdCache
+
 from vdsm.storage.persistent import unicodeEncoder, unicodeDecoder
 
 DOMAIN_META_DATA = 'dom_md'
@@ -173,6 +181,12 @@ UNICODE_MINIMAL_VERSION = 3
 # upgrade from V1 to V3.
 SDM_LEASE_NAME = 'SDM'
 SDM_LEASE_SLOT = 1
+
+# Reserved leases for special purposes:
+#  - 0       SPM (Backward comapatibility with V0 and V2)
+#  - 1       SDM (SANLock V3)
+#  - 2..100  (Unassigned)
+RESERVED_LEASES = 100
 
 VolumeSize = namedtuple("VolumeSize", [
     # The logical volume size in block storage and file size in file
@@ -320,7 +334,7 @@ SD_MD_FIELDS = {
 
 
 class StorageDomainManifest(object):
-    log = logging.getLogger("storage.StorageDomainManifest")
+    log = logging.getLogger("storage.storagedomainmanifest")
     mountpoint = None
 
     # version: clusterLockClass
@@ -370,6 +384,14 @@ class StorageDomainManifest(object):
         sparseness or not.
         """
         return False
+
+    @property
+    def supports_inquire(self):
+        """
+        This property advertises whether the storage domain supports
+        inquireCluserLock().
+        """
+        return self._domainLock.supports_inquire
 
     def recommends_unordered_writes(self, format):
         """
@@ -448,7 +470,7 @@ class StorageDomainManifest(object):
         try:
             version = self.getMetaParam(DMDK_VERSION)
         except KeyError:
-            raise se.MetaDataKeyNotFoundError("key={}".format(DMDK_VERSION))
+            raise se.InvalidMetadata("key={}".format(DMDK_VERSION))
         return version
 
     @property
@@ -537,9 +559,9 @@ class StorageDomainManifest(object):
         lease = self.getVolumeLease(imgUUID, volUUID)
         self._domainLock.release(lease)
 
-    def inquireVolumeLease(self, imgUUID, volUUID):
+    def inspectVolumeLease(self, imgUUID, volUUID):
         lease = self.getVolumeLease(imgUUID, volUUID)
-        return self._domainLock.inquire(lease)
+        return self._domainLock.inspect(lease)
 
     def getDomainLease(self):
         """
@@ -581,8 +603,11 @@ class StorageDomainManifest(object):
         finally:
             self.releaseHostId(host_id)
 
+    def inspectDomainLock(self):
+        return self._domainLock.inspect(self.getDomainLease())
+
     def inquireDomainLock(self):
-        return self._domainLock.inquire(self.getDomainLease())
+        return self._domainLock.inquire()
 
     def _makeDomainLock(self, domVersion=None):
         if not domVersion:
@@ -626,9 +651,9 @@ class StorageDomainManifest(object):
     def refresh(self):
         pass
 
-    @classmethod
-    def validateCreateVolumeParams(cls, volFormat, srcVolUUID, diskType=None,
-                                   preallocate=None):
+    def validateCreateVolumeParams(self, volFormat, srcVolUUID, diskType=None,
+                                   preallocate=None, add_bitmaps=False,
+                                   bitmap=None):
         """
         Validate create volume parameters
         """
@@ -645,6 +670,26 @@ class StorageDomainManifest(object):
         if preallocate is not None and preallocate not in sc.VOL_TYPE:
             raise se.IncorrectType(preallocate)
 
+        if add_bitmaps and srcVolUUID == sc.BLANK_UUID:
+            raise se.UnsupportedOperation(
+                "Cannot add bitmaps without a parent volume",
+                srcVolUUID=srcVolUUID,
+                add_bitmaps=add_bitmaps)
+
+        if bitmap and volFormat != sc.COW_FORMAT:
+            raise se.UnsupportedOperation(
+                f"Creating bitmap requires volFormat={sc.COW_FORMAT}",
+                volFormat=volFormat,
+                bitmap=bitmap)
+
+        if (add_bitmaps or bitmap) and not self.supports_bitmaps_operations():
+            raise se.UnsupportedOperation(
+                "Cannot perform bitmaps operations on storage domain "
+                "version < 4",
+                domain_version=self.getVersion(),
+                add_bitmaps=add_bitmaps,
+                bitmap=bitmap)
+
     def teardownVolume(self, imgUUID, volUUID):
         """
         Called when a volume is detached from a prepared image during live
@@ -658,6 +703,13 @@ class StorageDomainManifest(object):
         Return a type specific volume generator object
         """
         raise NotImplementedError
+
+    def supports_bitmaps_operations(self):
+        """
+        Return True if this domain supports bitmaps operations,
+        False otherwise.
+        """
+        return self.getVersion() >= 4
 
     # External leases support
 
@@ -716,6 +768,28 @@ class StorageDomainManifest(object):
             with utils.closing(vol):
                 yield vol
 
+    def acquire_external_lease(self, lease_id, host_id):
+        """
+        Acquire an external lease
+        """
+        lease_info = self.lease_info(lease_id)
+        lease = clusterlock.Lease(
+            lease_info.resource,
+            lease_info.path,
+            lease_info.offset)
+        self._domainLock.acquire(host_id, lease, lvb=True)
+
+    def release_external_lease(self, lease_id):
+        """
+        Release an external lease
+        """
+        lease_info = self.lease_info(lease_id)
+        lease = clusterlock.Lease(
+            lease_info.resource,
+            lease_info.path,
+            lease_info.offset)
+        self._domainLock.release(lease)
+
     def lease_info(self, lease_id):
         """
         Return information about external lease that can be used to acquire or
@@ -727,9 +801,157 @@ class StorageDomainManifest(object):
             with self.external_leases_volume() as vol:
                 return vol.lookup(lease_id)
 
+    def lease_status(self, lease_id, host_id):
+        """
+        Return the status of an external lease, indicating whether it is
+        currently held.
+
+        Returns:
+            A dict containing information about the lease, such as:
+            owners - A list of host ids holding the lease
+            version - The version of the host, a lease's owner isa combination
+                      of a host id and a version (controlled by sanlock)
+            metadata - The lvb data stored on the lease.
+
+        """
+        lease_info = self.lease_info(lease_id)
+        lease = clusterlock.Lease(
+            lease_info.resource,
+            lease_info.path,
+            lease_info.offset)
+
+        # Failing here will raise an exception, this expected as we cannot
+        # tell anything about the status of the lease if we couldn't inspect
+        # it.
+        res_version, owner_host_id = self._domainLock.inspect(lease)
+        lvb = None
+
+        # We only care about reading lvb on released leases, as lvb is written
+        # when the lease is released and we'll fail to acquire the lease if
+        # it's held anyway.
+        if owner_host_id is None:
+            try:
+                self.acquire_external_lease(lease_id, host_id)
+            except se.AcquireLockFailure:
+                self.log.warn("Could not acquire lease %s", lease_id)
+                # lease is currently held, return lease info without lvb
+            else:
+                try:
+                    lvb = self.get_lvb(lease_id)
+                finally:
+                    self.release_external_lease(lease_id)
+
+        owners = [owner_host_id] if owner_host_id is not None else []
+
+        response = {
+            "owners": owners,
+            "version": res_version,
+        }
+
+        if lvb is not None:
+            response["metadata"] = lvb
+
+        return response
+
+    def set_lvb(self, lease_id, info):
+        """
+        Write LVB data for lease.
+        Note: Lease must be first acquired with lvb=True
+
+        Arguments:
+            lease_id (str): uuid of the lease
+            info (dict): info to write to the LVB of the lease
+        """
+        lease_info = self.lease_info(lease_id)
+        lease = clusterlock.Lease(
+            lease_info.resource,
+            lease_info.path,
+            lease_info.offset)
+
+        self._domainLock.set_lvb(lease, info)
+
+    def get_lvb(self, lease_id):
+        """
+        Read LVB data for lease.
+        Note: Lease must be first acquired with lvb=True
+
+        Arguments:
+            lease_id (str): uuid of the lease
+        Returns:
+            A dict containing the data read from LVB.
+        """
+        lease_info = self.lease_info(lease_id)
+        lease = clusterlock.Lease(
+            lease_info.resource,
+            lease_info.path,
+            lease_info.offset)
+
+        return self._domainLock.get_lvb(lease)
+
+    def fence_lease(self, lease_id, host_id, metadata):
+        """
+        Fence a lease by updating the metadata based on the job status:
+        * If the job is no longer running - If the lease is free, the job
+          status is PENDING and the generation is correct, we can safely
+          change the job status to FENCED and bump the generation.
+        * If the job is still running, we will fail to acquire the lease,
+          a sanlock error will be raised.
+        * If the lease is free but the job is in a status other than PENDING
+          (SUCCEEDED, FAILED), JobStatusMismatch will be raised.
+
+        Arguments:
+            lease_id (str): uuid of the lease.
+            host_id (int): the id of the host attempting to fence.
+            metadata (dict): expected lease metadata.
+        """
+
+        lease_info = self.lease_info(lease_id)
+        lease = clusterlock.Lease(
+            lease_info.resource,
+            lease_info.path,
+            lease_info.offset)
+        self.acquire_external_lease(lease_id, host_id)
+        try:
+            current_metadata = self.get_lvb(lease_id)
+            self.log.info(
+                "Current lease %s metadata: %r", lease_id, metadata)
+
+            if current_metadata.get("type") != metadata.type:
+                raise se.UnsupportedOperation(
+                    "job type doesn't match supported type",
+                    expected=metadata.type,
+                    actual=current_metadata.get("type"))
+
+            if current_metadata.get("job_id") != metadata.job_id:
+                raise se.UnsupportedOperation(
+                    "job_id on lease doesn't match passed job_id",
+                    exptected=metadata.job_id,
+                    actual=current_metadata.get("job_id"))
+
+            if current_metadata.get("job_status") != metadata.job_status:
+                raise se.JobStatusMismatch(
+                    metadata.job_status, current_metadata.get("job_status"))
+
+            if current_metadata.get("generation") != metadata.generation:
+                raise se.GenerationMismatch(
+                    metadata.generation, current_metadata.get("generation"))
+
+            updated_metadata = current_metadata.copy()
+            updated_metadata["modified"] = int(time.time())
+            updated_metadata["host_hardware_id"] = host.uuid()
+            updated_metadata["generation"] = \
+                su.next_generation(metadata.generation)
+            updated_metadata["job_status"] = sc.JOB_STATUS_FENCED
+
+            self.log.info(
+                "Writing data to lease %s: %r", lease_id, updated_metadata)
+            self._domainLock.set_lvb(lease, updated_metadata)
+        finally:
+            self.release_external_lease(lease_id)
+
 
 class StorageDomain(object):
-    log = logging.getLogger("storage.StorageDomain")
+    log = logging.getLogger("storage.storagedomain")
     mdBackupVersions = config.get('irs', 'md_backup_versions')
     mdBackupDir = config.get('irs', 'md_backup_dir')
     manifestClass = StorageDomainManifest
@@ -743,6 +965,32 @@ class StorageDomain(object):
         # Do not allow attaching SD with an unsupported version
         self.validate_version(manifest.getVersion())
         self._lock = threading.Lock()
+
+    # Life cycle
+
+    def setup(self):
+        """
+        Called after storage domain is produced in the storage domain monitor.
+        """
+
+    def teardown(self):
+        """
+        Called after storage domain monitor finished and will never access the
+        storage domain object.
+        """
+
+    @contextmanager
+    def tearing_down(self):
+        """
+        Context manager which ensures that upon exiting context, storage domain
+        is torn down.
+        """
+        try:
+            yield
+        finally:
+            self.teardown()
+
+    # Other
 
     @property
     def sdUUID(self):
@@ -818,6 +1066,9 @@ class StorageDomain(object):
     def getAllVolumes(self):
         return self._manifest.getAllVolumes()
 
+    def dump(self, full=False):
+        return self._manifest.dump(full=full)
+
     def iter_volumes(self):
         """
         Iterate over all volumes.
@@ -851,6 +1102,10 @@ class StorageDomain(object):
         sparseness or not.
         """
         return self._manifest.supportsSparseness
+
+    @property
+    def supports_inquire(self):
+        return self._manifest.supports_inquire
 
     def recommends_unordered_writes(self, format):
         return self._manifest.recommends_unordered_writes(format)
@@ -950,22 +1205,25 @@ class StorageDomain(object):
         return self.getVolumeClass()(self.mountpoint, self.sdUUID, imgUUID,
                                      volUUID)
 
-    @classmethod
-    def validateCreateVolumeParams(cls, volFormat, srcVolUUID, diskType=None,
-                                   preallocate=None):
-        return cls.manifestClass.validateCreateVolumeParams(
-            volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate)
+    def validateCreateVolumeParams(self, volFormat, srcVolUUID, diskType=None,
+                                   preallocate=None, add_bitmaps=False,
+                                   bitmap=None):
+        return self._manifest.validateCreateVolumeParams(
+            volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate,
+            add_bitmaps=add_bitmaps, bitmap=bitmap)
 
     def createVolume(self, imgUUID, capacity, volFormat, preallocate, diskType,
                      volUUID, desc, srcImgUUID, srcVolUUID,
-                     initial_size=None):
+                     initial_size=None, add_bitmaps=False, legal=True,
+                     sequence=0, bitmap=None):
         """
         Create a new volume
         """
         return self.getVolumeClass().create(
             self._getRepoPath(), self.sdUUID, imgUUID, capacity, volFormat,
             preallocate, diskType, volUUID, desc, srcImgUUID, srcVolUUID,
-            initial_size=initial_size)
+            initial_size=initial_size, add_bitmaps=add_bitmaps, legal=legal,
+            sequence=sequence, bitmap=bitmap)
 
     def getMDPath(self):
         return self._manifest.getMDPath()
@@ -1017,6 +1275,9 @@ class StorageDomain(object):
 
     def releaseClusterLock(self):
         self._manifest.releaseDomainLock()
+
+    def inspectClusterLock(self):
+        return self._manifest.inspectDomainLock()
 
     def inquireClusterLock(self):
         return self._manifest.inquireDomainLock()
@@ -1070,12 +1331,6 @@ class StorageDomain(object):
 
     def getMasterDir(self):
         return os.path.join(self.domaindir, MASTER_FS_DIR)
-
-    def invalidate(self):
-        """
-        Make sure that storage domain is inaccessible
-        """
-        pass
 
     def validateMaster(self):
         """Validate that the master storage domain is correct.
@@ -1162,6 +1417,8 @@ class StorageDomain(object):
         Activate a storage domain that is already a member in a storage pool.
         """
         if self.isBackup():
+            self.log.info("Storage Domain %s is of type backup, "
+                          "adding master directory", self.sdUUID)
             self.mountMaster()
             self.createMasterTree()
 
@@ -1230,7 +1487,7 @@ class StorageDomain(object):
         """
         pass
 
-    def extendVolume(self, volumeUUID, size, isShuttingDown=None):
+    def extendVolume(self, volumeUUID, size, refresh=True):
         pass
 
     def reduceVolume(self, imgUUID, volumeUUID, allowActive=False):
@@ -1337,6 +1594,9 @@ class StorageDomain(object):
         """
         raise NotImplementedError
 
+    def supports_bitmaps_operations(self):
+        return self._manifest.supports_bitmaps_operations()
+
     # External leases support
 
     @classmethod
@@ -1369,6 +1629,13 @@ class StorageDomain(object):
                 alignment=alignment,
                 block_size=block_size)
 
+    @classmethod
+    def is_block(cls):
+        """
+        Returns whether a Storage Domain is block-based
+        """
+        return False
+
     def external_leases_path(self):
         return self._manifest.external_leases_path()
 
@@ -1382,7 +1649,7 @@ class StorageDomain(object):
         """
         raise NotImplementedError
 
-    def create_lease(self, lease_id):
+    def create_lease(self, lease_id, metadata=None, host_id=None):
         """
         Create an external lease on the external leases volume.
 
@@ -1391,6 +1658,27 @@ class StorageDomain(object):
         with self._manifest.external_leases_lock.exclusive:
             with self._manifest.external_leases_volume() as vol:
                 vol.add(lease_id)
+
+        if metadata:
+            metadata = validators.JobMetadata(metadata)
+
+            self._manifest.acquire_external_lease(lease_id, host_id)
+
+            try:
+                now = int(time.time())
+                job_metadata = {
+                    "type": metadata.type,
+                    "generation": metadata.generation,
+                    "job_id": metadata.job_id,
+                    "job_status": metadata.job_status,
+                    "created": now,
+                    "modified": now,
+                    "host_hardware_id": host.uuid(),
+                }
+
+                self._manifest.set_lvb(lease_id, job_metadata)
+            finally:
+                self._manifest.release_external_lease(lease_id)
 
     def delete_lease(self, lease_id):
         """
@@ -1417,6 +1705,16 @@ class StorageDomain(object):
                     backend,
                     alignment=self._manifest.alignment,
                     block_size=self._manifest.block_size)
+
+    def dump_external_leases(self):
+        """
+        Dump the external leases volume index contents.
+
+        May be called on any host.
+        """
+        with self._manifest.external_leases_lock.shared:
+            with self._manifest.external_leases_volume() as vol:
+                return vol.dump()
 
     # Images
 
@@ -1504,3 +1802,43 @@ class StorageDomain(object):
         Must be implemented by concrete storge domains.
         """
         raise NotImplementedError
+
+    # Dumping storage domain
+
+    def dump_lockspace(self):
+        """
+        Dump lockspace records.
+        """
+        return list(sanlock_direct.dump_lockspace(
+            self.getIdsFilePath(),
+            size=self.alignment,
+            block_size=self.block_size,
+            alignment=self.alignment))
+
+
+class ExternalLease(guarded.AbstractLock):
+
+    def __init__(self, host_id, sd_id, lease_id):
+        self._host_id = host_id
+        self._sd_id = sd_id
+        self._lease_id = lease_id
+
+    @property
+    def ns(self):
+        return rm.getNamespace(sc.EXTERNAL_LEASE_NAMESPACE, self._lease_id)
+
+    @property
+    def name(self):
+        return self._lease_id
+
+    @property
+    def mode(self):
+        return rm.EXCLUSIVE
+
+    def acquire(self):
+        dom = sdCache.produce_manifest(self._sd_id)
+        dom.acquire_external_lease(self._lease_id, self._host_id)
+
+    def release(self):
+        dom = sdCache.produce_manifest(self._sd_id)
+        dom.release_external_lease(self._lease_id)

@@ -27,6 +27,7 @@ dist_vdsmstorage_PYTHON = \
 	asyncevent.py \
 	asyncutils.py \
 	backends.py \
+	bitmaps.py \
 	blkdiscard.py \
 	blockSD.py \
 	blockVolume.py \
@@ -39,6 +40,7 @@ dist_vdsmstorage_PYTHON = \
 	devicemapper.py \
 	directio.py \
 	dispatcher.py \
+	dmsetup.py \
 	exception.py \
 	fallocate.py \
 	fileSD.py \
@@ -47,6 +49,7 @@ dist_vdsmstorage_PYTHON = \
 	formatconverter.py \
 	fsutils.py \
 	fuser.py \
+	glance.py \
 	glusterSD.py \
 	glusterVolume.py \
 	guarded.py \
@@ -60,7 +63,9 @@ dist_vdsmstorage_PYTHON = \
 	localFsSD.py \
 	lvm.py \
 	lvmconf.py \
+	lvmdevices.py \
 	lvmfilter.py \
+	lsof.py \
 	mailbox.py \
 	managedvolume.py \
 	managedvolumedb.py \
@@ -68,6 +73,7 @@ dist_vdsmstorage_PYTHON = \
 	misc.py \
 	monitor.py \
 	mount.py \
+	mpathconf.py \
 	mpathhealth.py \
 	multipath.py \
 	nbd.py \
@@ -80,17 +86,21 @@ dist_vdsmstorage_PYTHON = \
 	resourceFactories.py \
 	resourceManager.py \
 	rwlock.py \
+	sanlockconf.py \
+	sanlock_direct.py \
 	sd.py \
 	sdc.py \
 	securable.py \
 	sp.py \
 	spbackends.py \
+	spwd.py \
 	storageServer.py \
 	sysfs.py \
 	task.py \
 	taskManager.py \
 	threadPool.py \
-	udev.py \
+	transientdisk.py \
+	utils.py \
 	validators.py \
 	volume.py \
 	volumemetadata.py \

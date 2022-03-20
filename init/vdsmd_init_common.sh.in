@@ -1,6 +1,6 @@
 #!/bin/sh
 # Copyright 2013 IBM, Inc.
-# Copyright 2017 Red Hat, Inc.
+# Copyright 2017-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,32 +24,30 @@ UPGRADE_LOGGING_PARAMS="--vvverbose --append --logfile=@VDSMLOGDIR@/upgrade.log"
 prog=vdsm
 
 #### pre-start tasks ####
-task_wait_for_network() {
-    # interfaces that we depend upon may not have their IP address ready yet
-    # see https://bugzilla.redhat.com/show_bug.cgi?id=1174611#c34
-
-    @LIBEXECDIR@/wait_for_ipv4s
-
-    # never fail, in order to allow intentionally-downed vdsm-controlled
-    # interfaces
-    return 0
-}
-
-task_configure_coredump() {
-    echo "|/usr/libexec/abrt-hook-ccpp %s %c %p %u %g %t %e %i" > /proc/sys/kernel/core_pattern
-}
-
 task_configure_vdsm_logs() {
     local vdsm_logs="
         @VDSMLOGDIR@/mom.log
         @VDSMLOGDIR@/vdsm.log
     "
+    local wanted_mode="0644"
+    local wanted_owner="@VDSMUSER@:@VDSMGROUP@"
 
     for logfile in ${vdsm_logs}; do
         if [ ! -e "${logfile}" ]; then
             @TOUCH_PATH@ "${logfile}"
-            @CHMOD_PATH@ 0644 "${logfile}"
-            @CHOWN_PATH@ @VDSMUSER@:@VDSMGROUP@ "${logfile}"
+            @CHMOD_PATH@ "${wanted_mode}" "${logfile}"
+            @CHOWN_PATH@ "${wanted_owner}" "${logfile}"
+        else
+            owner=$(stat -c %U:%G "${logfile}")
+            fmode=$(stat -c 0%a "${logfile}")
+            if [ "${owner}" != "${wanted_owner}" ]; then
+                echo "Warning: log file ${logfile} is owned by ${owner}... Fixing..."
+                @CHOWN_PATH@ "${wanted_owner}" "${logfile}"
+            fi
+            if [ "${fmode}" != "${wanted_mode}" ]; then
+                echo "Warning: bad file access mode for log file ${logfile} : ${fmode}... Fixing..."
+                @CHMOD_PATH@ "${wanted_mode}" "${logfile}"
+            fi
         fi
     done
 }
@@ -139,10 +137,28 @@ _mk_console_path() {
     "@CHCON_PATH@" "system_u:object_r:qemu_var_run_t:s0" "${console_path}" > /dev/null 2>&1
 }
 
+_mk_transient_disks_path() {
+    local transient_disks_path="@VDSMTRANSIENTDISKSDIR@"
+    @MKDIR_P@ "${transient_disks_path}"
+    "@CHOWN_PATH@" @VDSMUSER@:@VDSMGROUP@ "${transient_disks_path}"
+}
+
+_mk_backup_path() {
+    local backup_path="@VDSMRUNBACKUPDIR@"
+    @MKDIR_P@ "${backup_path}"
+
+    # qemu create the socket in this directory
+    "@CHMOD_PATH@" 0770 "${backup_path}"
+    "@CHOWN_PATH@" @VDSMUSER@:@VDSMGROUP@ "${backup_path}"
+    "@CHCON_PATH@" "system_u:object_r:qemu_var_run_t:s0" "${backup_path}" > /dev/null 2>&1
+}
+
 task_mkdirs(){
     _mk_data_center
     _mk_run_path
     _mk_console_path
+    _mk_transient_disks_path
+    _mk_backup_path
 }
 
 
@@ -163,7 +179,7 @@ task_test_space() {
 
 
 task_test_lo() {
-    if ! LC_ALL=C "@IP_PATH@" link show lo | "@GREP_PATH@" -q UP; then
+    if ! LC_ALL=C.UTF8 "@IP_PATH@" link show lo | "@GREP_PATH@" -q UP; then
         echo "VDSMD: lo interface is down, can't run !"
         echo "VDSMD: lo interface is down, can't run !" > /dev/kmsg
         return 1
@@ -210,9 +226,7 @@ case "$1" in
     --pre-start)
         run_tasks " \
             mkdirs \
-            configure_coredump \
             configure_vdsm_logs \
-            wait_for_network \
             run_init_hooks \
             check_is_configured \
             validate_configuration \

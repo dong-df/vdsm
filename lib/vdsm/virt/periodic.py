@@ -1,5 +1,5 @@
 #
-# Copyright 2016-2017 Red Hat, Inc.
+# Copyright 2016-2021 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -43,6 +43,8 @@ from vdsm.virt import recovery
 from vdsm.virt import sampling
 from vdsm.virt import virdomain
 from vdsm.virt import vmstatus
+from vdsm.virt.externaldata import ExternalDataKind
+from vdsm.virt.utils import vm_kill_paused_timeout
 
 
 # Just a made up number. Maybe should be equal to number of cores?
@@ -347,7 +349,7 @@ class UpdateVolumes(_RunnableOnVm):
     def required(self):
         return (super(UpdateVolumes, self).required and
                 # Avoid queries from storage during recovery process
-                self._vm.drive_monitor.enabled())
+                self._vm.volume_monitor.enabled())
 
     def _execute(self):
         for drive in self._vm.getDiskDevices():
@@ -372,15 +374,50 @@ class BlockjobMonitor(_RunnableOnVm):
         self._vm.updateVmJobs()
 
 
-class DriveWatermarkMonitor(_RunnableOnVm):
+class VolumeWatermarkMonitor(_RunnableOnVm):
 
     @property
     def required(self):
-        return (super(DriveWatermarkMonitor, self).required and
-                self._vm.drive_monitor.monitoring_needed())
+        return (super(VolumeWatermarkMonitor, self).required and
+                self._vm.volume_monitor.monitoring_needed())
 
     def _execute(self):
-        self._vm.monitor_drives()
+        self._vm.monitor_volumes()
+
+
+class _ExternalDataMonitor(_RunnableOnVm):
+    KIND = None
+
+    @property
+    def required(self):
+        # TPM data is normally initialized in Vm constructor, with the
+        # exception of live migrations where it is transferred by
+        # libvirt, after the migration is started.
+        return self._vm.lastStatus != vmstatus.MIGRATION_DESTINATION
+
+    @property
+    def runnable(self):
+        # This is not dependent on libvirt/QEMU health.
+        return True
+
+    def _execute(self):
+        try:
+            self._vm.update_external_data(self.KIND)
+        except Exception as e:
+            if self._vm.lastStatus == vmstatus.UP:
+                log = self._vm.log.error
+            else:
+                log = self._vm.log.info
+            log("Periodic external data retrieval failed (%s): %s",
+                self.KIND, e)
+
+
+class TpmDataMonitor(_ExternalDataMonitor):
+    KIND = ExternalDataKind.TPM
+
+
+class NvramDataMonitor(_ExternalDataMonitor):
+    KIND = ExternalDataKind.NVRAM
 
 
 def _kill_long_paused_vms(cif):
@@ -414,8 +451,16 @@ def _create(cif, scheduler):
         # from QEMU. It accesses storage and/or QEMU monitor, so can block,
         # thus we need dispatching.
         per_vm_operation(
-            DriveWatermarkMonitor,
+            VolumeWatermarkMonitor,
             config.getint('vars', 'vm_watermark_interval')),
+
+        per_vm_operation(
+            NvramDataMonitor,
+            config.getint('sampling', 'nvram_data_update_interval')),
+
+        per_vm_operation(
+            TpmDataMonitor,
+            config.getint('sampling', 'tpm_data_update_interval')),
 
         Operation(
             lambda: recovery.lookup_external_vms(cif),
@@ -426,7 +471,7 @@ def _create(cif, scheduler):
 
         Operation(
             lambda: _kill_long_paused_vms(cif),
-            config.getint('vars', 'vm_kill_paused_time') // 2,
+            vm_kill_paused_timeout() // 2,
             scheduler,
             exclusive=True,
             discard=False),

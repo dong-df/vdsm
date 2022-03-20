@@ -22,22 +22,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import testlib
 import logging
 import os
 import sys
-
-# When using Python 2, we must monkey patch threading module before importing
-# any other module.
-if sys.version_info[0] == 2:
-    import pthreading
-    pthreading.monkey_patch()
-
-
-from vdsm.common import zombiereaper
-zombiereaper.registerSignalHandler()
-
-import testlib
-
 
 TEST_LOG = '/var/log/vdsm_tests.log'
 
@@ -56,7 +44,8 @@ def configureLogging():
         logging.basicConfig(
             filename=TEST_LOG,
             filemode='a',
-            format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+            format='%(asctime)s,%(msecs)03d %(levelname)-7s (%(threadName)s) '
+                   '[%(name)s] %(message)s (%(module)s:%(lineno)d)',
             datefmt='%H:%M:%S',
             level=logging.DEBUG)
 

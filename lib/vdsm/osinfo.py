@@ -33,6 +33,7 @@ import six
 
 from vdsm import utils
 from vdsm.common import cache
+from vdsm.common import commands
 from vdsm.common import cpuarch
 from vdsm.common import supervdsm
 
@@ -60,6 +61,7 @@ except ImportError:
 KernelFlags = namedtuple('KernelFlags', 'version, realtime')
 NestedVirtualization = namedtuple('NestedVirtualization',
                                   'enabled, kvm_module')
+_FINDMNT = "findmnt"
 
 
 class OSName:
@@ -228,10 +230,10 @@ def version():
 
                 if _next_gen_node():
                     version = _get_version_id()
-                    release_name = er['release'].decode()
+                    release_name = er['release']
                 else:
-                    version = er['version'].decode()
-                    release_name = er['release'].decode()
+                    version = er['version']
+                    release_name = er['release']
     except:
         logging.error('failed to find version/release', exc_info=True)
 
@@ -257,7 +259,8 @@ def package_versions():
             'libvirt': ('libvirt', 'libvirt-daemon-kvm'),
             'mom': ('mom',),
             'ovirt-hosted-engine-ha': ('ovirt-hosted-engine-ha',),
-            'openvswitch': ('openvswitch', 'rhv-openvswitch'),
+            'openvswitch': ('openvswitch', 'ovirt-openvswitch'),
+            'nmstate': ('nmstate',),
             'qemu-img': ('qemu-img', 'qemu-img-rhev', 'qemu-img-ev'),
             'qemu-kvm': ('qemu-kvm', 'qemu-kvm-rhev', 'qemu-kvm-ev'),
             'spice-server': ('spice-server',),
@@ -279,8 +282,8 @@ def package_versions():
                                   KEY_PACKAGES[pkg])
                 else:
                     pkgs[pkg] = {
-                        'version': mi['version'].decode('utf-8'),
-                        'release': mi['release'].decode('utf-8'),
+                        'version': mi['version'],
+                        'release': mi['release'],
                     }
         except Exception:
             logging.error('', exc_info=True)
@@ -359,3 +362,14 @@ def nested_virtualization():
 
 def kernel_features():
     return supervdsm.getProxy().get_cpu_vulnerabilities()
+
+
+@cache.memoized
+def boot_uuid():
+    """
+    Get the OS boot partition UUID
+    """
+    cmd = [_FINDMNT, "--output=UUID", "--noheadings", "--target=/boot"]
+
+    output = commands.run(cmd)
+    return output.decode("utf-8").strip()

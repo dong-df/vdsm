@@ -34,9 +34,7 @@ import itertools
 import logging
 import os
 import re
-import struct
 import threading
-import uuid
 import weakref
 
 import six
@@ -57,10 +55,10 @@ DIRECTFLAG = "direct"
 STR_UUID_SIZE = 36
 UUID_HYPHENS = [8, 13, 18, 23]
 
-log = logging.getLogger('storage.Misc')
+log = logging.getLogger('storage.misc')
 
 
-execCmdLogger = logging.getLogger('storage.Misc.excCmd')
+execCmdLogger = logging.getLogger('storage.misc.exccmd')
 
 
 execCmd = partial(commands.execCmd, execCmdLogger=execCmdLogger)
@@ -162,22 +160,6 @@ def parseBool(var):
         return True
     else:
         return False
-
-
-def packUuid(s):
-    # pylint: disable=no-member
-    # https://github.com/PyCQA/pylint/issues/961
-    value = uuid.UUID(s).int
-    high = value // (2 ** 64)
-    low = value % (2 ** 64)
-    # pack as 128bit little-endian <QQ
-    return struct.pack('<QQ', low, high)
-
-
-def unpackUuid(s):
-    low, high = struct.unpack('<QQ', s)
-    value = low + high * (2 ** 64)
-    return str(uuid.UUID(int=value))
 
 
 UUID_REGEX = re.compile("^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$")
@@ -335,7 +317,7 @@ class SamplingMethod(object):
     Supporting parameters or exception passing to all functions would
     make the code much more complex for no reason.
     """
-    _log = logging.getLogger("storage.SamplingMethod")
+    _log = logging.getLogger("storage.samplingmethod")
 
     def __init__(self, func):
         self.__func = func
@@ -390,7 +372,7 @@ class Event(object):
     _count = itertools.count()
 
     def __init__(self, name, sync=False):
-        self._log = logging.getLogger("storage.Event.%s" % name)
+        self._log = logging.getLogger("storage.event.%s" % name)
         self.name = name
         self._syncRoot = threading.Lock()
         self._registrar = {}
@@ -407,7 +389,8 @@ class Event(object):
     def _emit(self, *args, **kwargs):
         self._log.debug("Emitting event")
         with self._syncRoot:
-            for funcId, (funcRef, oneshot) in self._registrar.items():
+            for funcId in list(self._registrar):
+                funcRef, oneshot = self._registrar[funcId]
                 func = funcRef()
                 if func is None or oneshot:
                     del self._registrar[funcId]
@@ -421,8 +404,9 @@ class Event(object):
                     else:
                         self._start_thread(func, args, kwargs)
                 except:
-                    self._log.warn("Could not run registered method because "
-                                   "of an exception", exc_info=True)
+                    self._log.exception(
+                        "Could not run registered method because of an "
+                        "exception")
 
         self._log.debug("Event emitted")
 
@@ -479,11 +463,11 @@ def isAscii(s):
         return False
 
 
-def walk(top, topdown=True, onerror=None, followlinks=False, blacklist=()):
+def walk(top, topdown=True, onerror=None, followlinks=False, skip=()):
     """Directory tree generator.
 
     Custom implementation of os.walk that doesn't block if the destination of
-    a symlink is on an unreachable blacklisted path (typically a nfs mount).
+    a symlink is on an unreachable skipped path (typically a nfs mount).
     All the general os.walk documentation applies.
     """
 
@@ -499,15 +483,15 @@ def walk(top, topdown=True, onerror=None, followlinks=False, blacklist=()):
             onerror(err)
         return
 
-    # Use absolute and normalized blacklist paths
-    normblacklist = [os.path.abspath(x) for x in blacklist]
+    # Use absolute and normalized skipped paths
+    normskiplist = [os.path.abspath(x) for x in skip]
 
     dirs, nondirs = [], []
     for name in names:
         path = os.path.join(top, name)
 
         # Begin of the part where we handle the unreachable symlinks
-        if os.path.abspath(path) in normblacklist:
+        if os.path.abspath(path) in normskiplist:
             continue
 
         if not followlinks:
@@ -538,7 +522,7 @@ def walk(top, topdown=True, onerror=None, followlinks=False, blacklist=()):
     for name in dirs:
         path = os.path.join(top, name)
         if followlinks or not os.path.islink(path):
-            for x in walk(path, topdown, onerror, followlinks, blacklist):
+            for x in walk(path, topdown, onerror, followlinks, skip):
                 yield x
     if not topdown:
         yield top, dirs, nondirs

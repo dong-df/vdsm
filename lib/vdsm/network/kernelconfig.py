@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2018 Red Hat, Inc.
+# Copyright 2015-2020 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -74,25 +74,8 @@ def normalize(running_config):
     config_copy = copy.deepcopy(running_config)
 
     _normalize_bonding_opts(config_copy)
-    _normalize_ovs_gateway(config_copy)
 
     return config_copy
-
-
-def networks_northbound_ifaces():
-    rconfig = RunningConfig()
-    ifaces = []
-    for netname, net_attrs in six.viewitems(rconfig.networks):
-        if net_attrs['bridged']:
-            ifaces.append(netname)
-        else:
-            iface = net_attrs.get('bonding') or net_attrs.get('nic')
-            vlan = net_attrs.get('vlan')
-            if vlan:
-                iface = '.'.join([iface, str(vlan)])
-            ifaces.append(iface)
-
-    return ifaces
 
 
 def _translate_netinfo_net(net, net_attr, netinfo_, _routes):
@@ -147,7 +130,7 @@ def _translate_default_route(net_attr, _routes):
 
 
 def _translate_nics(attributes, nics):
-    nic, = nics
+    (nic,) = nics
     attributes['nic'] = nic
 
 
@@ -232,18 +215,6 @@ def _normalize_bonding_opts(config_copy):
     # REQUIRED_FOR upgrade from vdsm<=4.16.20
     for net_attr in six.viewvalues(config_copy.networks):
         net_attr.pop('bondingOptions', None)
-
-
-# TODO: Remove when OVS networks will support sourceroute.
-def _normalize_ovs_gateway(config_copy):
-    """
-    OVS networks do not yet support sourceroute, consequently, requesting a
-    gateway on such a network (which is not a default route) will be ignored.
-    """
-    for netattrs in six.viewvalues(config_copy.networks):
-        if not netattrs.get('remove') and netattrs['switch'] == 'ovs':
-            if 'gateway' in netattrs and not netattrs.get('defaultRoute'):
-                netattrs.pop('gateway')
 
 
 def _parse_bond_options(opts):

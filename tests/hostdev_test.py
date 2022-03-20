@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2019 Red Hat, Inc.
+# Copyright 2014-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,7 +25,7 @@ import six
 
 from vdsm.common import exception
 from vdsm.common import xmlutils
-from vdsm.virt.vmdevices import hostdevice, network, hwclass
+from vdsm.virt.vmdevices import network, hwclass
 
 from testlib import VdsmTestCase as TestCaseBase, XMLTestCase
 from testlib import permutations, expandPermutations
@@ -44,6 +44,8 @@ import hostdevlib
 @MonkeyClass(hostdev, '_sriov_totalvfs', hostdevlib.fake_totalvfs)
 @MonkeyClass(hostdev, '_pci_header_type', lambda _: 0)
 @MonkeyClass(hooks, 'after_hostdev_list_by_caps', lambda json: json)
+@MonkeyClass(hostdev, '_get_udev_block_mapping',
+             lambda: hostdevlib.UDEV_BLOCK_MAP)
 class HostdevTests(TestCaseBase):
 
     def testProcessDeviceParams(self):
@@ -175,30 +177,6 @@ class HostdevCreationTests(XMLTestCase):
             'smp': '8', 'maxVCpus': '160',
             'memSize': '1024', 'memGuaranteedSize': '512'}
 
-    @permutations([
-        [device_name]
-        for device_name in hostdevlib.PCI_DEVICES +
-        hostdevlib.USB_DEVICES + [hostdevlib.SCSI_DEVICES[2]]
-    ])
-    def testCreateHostDevice(self, device_name):
-        dev_spec = {'type': 'hostdev', 'device': device_name}
-        device = hostdevice.HostDevice(self.log, **dev_spec)
-        self.assertXMLEqual(xmlutils.tostring(device.getXML()),
-                            hostdevlib.DEVICE_XML[device_name] % ('',))
-
-    @permutations([
-        [device_name]
-        for device_name in hostdevlib.PCI_DEVICES
-    ])
-    def testCreatePCIHostDeviceWithAddress(self, device_name):
-        dev_spec = {'type': 'hostdev', 'device': device_name, 'address':
-                    self._PCI_ADDRESS}
-        device = hostdevice.HostDevice(self.log, **dev_spec)
-        self.assertXMLEqual(
-            xmlutils.tostring(device.getXML()),
-            hostdevlib.DEVICE_XML[device_name] %
-            (self._PCI_ADDRESS_XML))
-
     # TODO: next 2 tests should reside in their own module (interfaceTests.py)
     def testCreateSRIOVVF(self):
         dev_spec = {'type': hwclass.NIC, 'device': 'hostdev',
@@ -274,8 +252,10 @@ class TestMdev(TestCaseBase):
                 (hostdev, '_each_mdev_device', lambda: self.devices)
         ]):
             for mdev_type, mdev_uuid in mdev_specs:
-                hostdev.spawn_mdev(mdev_type, mdev_uuid, mdev_placement,
-                                   self.log)
+                mdev_properties = hostdev.MdevProperties(
+                    mdev_type, mdev_placement, None
+                )
+                hostdev.spawn_mdev(mdev_properties, mdev_uuid, self.log)
         for inst, dev in zip(instances, self.devices):
             dev_inst = []
             for mdev_type in dev.mdev_types:
@@ -290,7 +270,10 @@ class TestMdev(TestCaseBase):
         with MonkeyPatchScope([
                 (hostdev, '_each_mdev_device', lambda: self.devices)
         ]):
+            mdev_properties = hostdev.MdevProperties(
+                'unsupported', placement, None
+            )
             self.assertRaises(
                 exception.ResourceUnavailable,
-                hostdev.spawn_mdev, 'unsupported', '1234', placement, self.log
+                hostdev.spawn_mdev, mdev_properties, '1234', self.log
             )

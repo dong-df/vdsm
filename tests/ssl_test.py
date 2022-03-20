@@ -25,7 +25,6 @@ from __future__ import print_function
 import socket
 
 import pytest
-import six
 
 from vdsm.common import cmdutils
 from vdsm.common import concurrent
@@ -35,7 +34,6 @@ from vdsm.sslutils import SSLContext, SSLHandshakeDispatcher
 from yajsonrpc.betterAsyncore import Reactor
 
 from integration.sslhelper import key_cert_pair  # noqa: F401
-from testing import on_centos, on_fedora
 
 
 @pytest.fixture
@@ -98,8 +96,8 @@ def dummy_register_protocol_detector(monkeypatch):
                         lambda d: d.close())
 
 
-@pytest.fixture  # noqa: F811
-def listener(dummy_register_protocol_detector, key_cert_pair, request):
+@pytest.fixture  # noqa: F811 # TODO: remove after upgrading flake to 3.9.2
+def listener(dummy_register_protocol_detector, key_cert_pair, request):  # noqa: F811, E501
     key_file, cert_file = key_cert_pair
     reactor = Reactor()
 
@@ -120,11 +118,12 @@ def listener(dummy_register_protocol_detector, key_cert_pair, request):
         yield (host, port)
     finally:
         acceptor.stop()
+        reactor.stop()
         t.join()
 
 
-@pytest.fixture  # noqa: F811
-def client_cmd(listener, key_cert_pair):
+@pytest.fixture  # noqa: F811 # TODO: remove after upgrading flake to 3.9.2
+def client_cmd(listener, key_cert_pair):  # noqa: F811
     key_file, cert_file = key_cert_pair
 
     def wrapper(protocol):
@@ -148,15 +147,11 @@ def client_cmd(listener, key_cert_pair):
     ),
     pytest.param(
         '-tls1',
-        id='tls1',
-        marks=pytest.mark.skipif(six.PY3 and on_fedora(),
-                                 reason="permissive crypto policy")
+        id='tls1'
     ),
     pytest.param(
         '-tls1_1',
-        id='tls1.1',
-        marks=pytest.mark.skipif(six.PY3 and on_fedora(),
-                                 reason="permissive crypto policy")
+        id='tls1.1'
     )
 ])
 def test_tls_unsupported_protocols(client_cmd, protocol):
@@ -165,20 +160,6 @@ def test_tls_unsupported_protocols(client_cmd, protocol):
 
 
 @pytest.mark.parametrize('protocol', [
-    pytest.param(
-        '-tls1',
-        id='tls1',
-        marks=pytest.mark.skipif(six.PY2 or on_centos(8),
-                                 reason=("unsupported or blocked "
-                                         "by crypto policy"))
-    ),
-    pytest.param(
-        '-tls1_1',
-        id='tls1.1',
-        marks=pytest.mark.skipif(six.PY2 or on_centos(8),
-                                 reason=("unsupported or blocked "
-                                         "by crypto policy"))
-    ),
     pytest.param(
         '-tls1_2',
         id='tls1.2'

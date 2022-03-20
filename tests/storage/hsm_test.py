@@ -21,6 +21,8 @@
 from __future__ import absolute_import
 from __future__ import division
 
+import os
+
 from contextlib import contextmanager
 
 import pytest
@@ -53,7 +55,7 @@ class TestVerifyUntrustedVolume(object):
     @pytest.mark.parametrize('vol_fmt,', [sc.RAW_FORMAT, sc.COW_FORMAT])
     def test_ok(self, vol_fmt):
         with self.fake_volume(vol_fmt) as vol:
-            qemu_fmt = sc.FMT2STR[vol_fmt]
+            qemu_fmt = sc.fmt2str(vol_fmt)
             op = qemuimg.create(vol.volumePath, size=self.SIZE,
                                 format=qemu_fmt)
             op.run()
@@ -126,10 +128,17 @@ class TestVerifyUntrustedVolume(object):
     def test_wrong_backingfile(self):
         with fake_file_env() as env:
             vol = make_qemu_chain(env, self.SIZE, sc.COW_FORMAT, 2)[1]
-            # Simulate upload of wrong image
-            op = qemuimg.create(vol.volumePath, size=self.SIZE,
-                                format=qemuimg.FORMAT.QCOW2,
-                                backing='wrong-uuid')
+            # Simulate upload image with wrong backing_file.
+            wrong_volume = os.path.join(
+                os.path.dirname(vol.volumePath), "wrong")
+            with open(wrong_volume, "w") as f:
+                f.truncate(self.SIZE)
+            op = qemuimg.rebase(
+                vol.volumePath,
+                "wrong",
+                format=qemuimg.FORMAT.QCOW2,
+                backingFormat=qemuimg.FORMAT.RAW,
+                unsafe=True)
             op.run()
             h = FakeHSM()
             with pytest.raises(se.ImageVerificationError):
@@ -138,10 +147,17 @@ class TestVerifyUntrustedVolume(object):
 
     def test_unexpected_backing_file(self):
         with self.fake_volume(sc.COW_FORMAT) as vol:
-            # Simulate upload of qcow2 with backing file to base image
-            op = qemuimg.create(vol.volumePath, size=self.SIZE,
-                                format=qemuimg.FORMAT.QCOW2,
-                                backing='unexpected')
+            # Simulate upload of qcow2 with unexpected backing file.
+            unexpected_volume = os.path.join(
+                os.path.dirname(vol.volumePath), "unexpected")
+            with open(unexpected_volume, "w") as f:
+                f.truncate(self.SIZE)
+            op = qemuimg.rebase(
+                vol.volumePath,
+                'unexpected',
+                format=qemuimg.FORMAT.QCOW2,
+                backingFormat=qemuimg.FORMAT.RAW,
+                unsafe=True)
             op.run()
             h = FakeHSM()
             with pytest.raises(se.ImageVerificationError):
@@ -218,7 +234,7 @@ class FakePool(object):
     def __init__(self):
         self.size = None
 
-    def extendVolume(self, sdUUID, volUUID, size, isShuttingDown):
+    def extendVolume(self, sdUUID, volUUID, size):
         self.size = size
 
     def is_connected(self):

@@ -1,5 +1,5 @@
 #
-# Copyright 2014-2017 Red Hat, Inc.
+# Copyright 2014-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -167,6 +167,7 @@ DEVICES_PROCESSED = {u'pci_0000_00_1b_0': {'product': '6 Series/C200 Series '
                                        'address': {'bus': '0', 'host': '0',
                                                    'lun': '0', 'target': '0'},
                                        'udev_path': '/dev/sg0',
+                                       'block_path': '/dev/sdc',
                                        'product': 'SSD',
                                        'vendor': 'ATA'},
                      u'scsi_1_0_0_0': {'capability': 'scsi',
@@ -175,7 +176,8 @@ DEVICES_PROCESSED = {u'pci_0000_00_1b_0': {'product': '6 Series/C200 Series '
                                        'is_assignable': 'true',
                                        'address': {'bus': '0', 'host': '1',
                                                    'lun': '0', 'target': '0'},
-                                       'udev_path': '/dev/sg1'},
+                                       'udev_path': '/dev/sg1',
+                                       'block_path': '/dev/sdd'},
                      u'scsi_2_0_0_0': {'capability': 'scsi',
                                        'driver': 'sd',
                                        'parent': 'scsi_target2_0_0',
@@ -293,6 +295,9 @@ DEVICES_PROCESSED = {u'pci_0000_00_1b_0': {'product': '6 Series/C200 Series '
                                    'capability': 'usb_device',
                                    'driver': 'usb',
                                    'is_assignable': 'true'}}
+
+UDEV_BLOCK_MAP = {'/dev/sg0': '/dev/sdc',
+                  '/dev/sg1': '/dev/sdd'}
 
 ADDITIONAL_DEVICE_PROCESSED = {'product': '7500/5520/5500/X58 I/O Hub PCI '
                                'Express Root Port 9',
@@ -481,6 +486,7 @@ class FakeMdevType(object):
         self.instances.append(mdev_uuid)
         self.available_instances -= 1
 
+
 FakeMdevDevice = namedtuple('FakeMdevDevice', ['name', 'vendor', 'mdev_types'])
 
 
@@ -509,8 +515,8 @@ class FakeSuperVdsm:
     def getProxy(self):
         return self
 
-    def mdev_create(self, device, mdev_type, mdev_uuid):
+    def mdev_create(self, device, mdev_properties, mdev_uuid):
         for device_type in device.mdev_types:
-            if device_type.name == mdev_type:
+            if device_type.name == mdev_properties.device_type:
                 break
         device_type.mdev_create(mdev_uuid)

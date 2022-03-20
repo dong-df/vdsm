@@ -33,38 +33,72 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 
+import selinux
 import six
 
 from vdsm import constants
 from vdsm.common.network import address
+from vdsm.common.osutils import get_umask
 
-log = logging.getLogger('storage.fileUtils')
+from . import exception as se
+
+log = logging.getLogger('storage.fileutils')
 
 MIN_PORT = 1
 MAX_PORT = 65535
 
 
-class TarCopyFailed(RuntimeError):
-    pass
-
-
 def tarCopy(src, dst, exclude=()):
+    log.info("Copying %r to %r", src, dst)
+
     excludeArgs = ["--exclude=%s" % path for path in exclude]
 
-    tsrc = subprocess.Popen([constants.EXT_TAR, "cf", "-"] +
-                            excludeArgs + ["-C", src, "."],
-                            stdout=subprocess.PIPE)
-    tdst = subprocess.Popen([constants.EXT_TAR, "xf", "-", "-C", dst,
-                             "--touch"],
-                            stdin=tsrc.stdout, stderr=subprocess.PIPE,
-                            stdout=subprocess.PIPE)
-    tsrc.stdout.close()
-    out, err = tdst.communicate()
-    tsrc.wait()
+    # Start tar process reading from src and writing to stdout.
 
-    if tdst.returncode != 0 or tsrc.returncode != 0:
-        raise TarCopyFailed(tsrc.returncode, tdst.returncode, out, err)
+    cmd = [constants.EXT_TAR, "cf", "-"] + excludeArgs + ["-C", src, "."]
+    log.debug("Starting reader: %s", cmd)
+    r = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # Start tar process reading from reader stdout and writing to dst.
+
+    cmd = [constants.EXT_TAR, "xf", "-", "-C", dst, "--touch"]
+    log.debug("Starting writer: %s", cmd)
+    w = subprocess.Popen(cmd, stdin=r.stdout, stderr=subprocess.PIPE)
+
+    r.stdout.close()
+    r.stdout = None
+
+    # Wait for both child procesesses.
+
+    _, w_err = w.communicate()
+    _, r_err = r.communicate()
+
+    log.debug("Child processes terminated")
+
+    # Sometimes only the reader or writer fail, but sometimes both may fail.
+    # Include all failed commands in the exception.
+
+    errors = {}
+
+    if r.returncode != 0:
+        errors["reader"] = {
+            "cmd": r.args,
+            "rc": r.returncode,
+            "err": r_err.decode(),
+        }
+
+    if w.returncode != 0:
+        errors["writer"] = {
+            "cmd": w.args,
+            "rc": w.returncode,
+            "err": w_err.decode(),
+        }
+
+    if errors:
+        raise se.TarCommandError(errors)
 
 
 def transformPath(remotePath):
@@ -205,11 +239,13 @@ def createdir(dirPath, mode=None):
             raise OSError(errno.ENOTDIR, "Not a directory %s" % dirPath)
         log.debug("Using existing directory: %s", dirPath)
         if mode is not None:
-            curMode = stat.S_IMODE(statinfo.st_mode)
-            if curMode != mode:
-                raise OSError(errno.EPERM,
-                              ("Existing %s permissions %o are not as "
-                               "requested %o") % (dirPath, curMode, mode))
+            actual_mode = stat.S_IMODE(statinfo.st_mode)
+            expected_mode = mode & ~get_umask()
+            if actual_mode != expected_mode:
+                raise OSError(
+                    errno.EPERM,
+                    "Existing {} permissions {:o} are not as requested"
+                    " {:o}".format(dirPath, actual_mode, expected_mode))
 
 
 def resolveUid(user):
@@ -230,7 +266,7 @@ def resolveGid(group):
 
 def chown(path, user=-1, group=-1):
     """
-    Change the owner and\or group of a file.
+    Change the owner and group of a file.
     The user and group parameters can either be a name or an id.
     """
     uid = resolveUid(user)
@@ -246,6 +282,47 @@ def chown(path, user=-1, group=-1):
     log.info("Changing owner for %s, to (%s:%s)", path, uid, gid)
     os.chown(path, uid, gid)
     return True
+
+
+def backup_file(filename):
+    """
+    Backup filename with a timestamp and returns the backup filename.
+    """
+    if os.path.exists(filename):
+        backup = filename + '.' + time.strftime("%Y%m%d%H%M%S")
+        shutil.copyfile(filename, backup)
+        return backup
+
+
+def atomic_write(filename, data, mode=0o644, relabel=False):
+    """
+    Write data to filename atomically using a temporary file.
+
+    Arguments:
+        filename (str): Path to file.
+        data (bytes): Data to write to filename.
+        mode (int): Set mode bits on filename.
+        relabel (bool): If True, set selinux label.
+    """
+    with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=os.path.dirname(filename),
+            prefix=os.path.basename(filename) + ".tmp",
+            delete=False) as tmp:
+        try:
+            tmp.write(data)
+            tmp.flush()
+
+            if relabel:
+                # Force required to preserve "system_u". Without it the
+                # temporary file will be labeled as "unconfined_u".
+                selinux.restorecon(tmp.name, force=True)
+
+            os.chmod(tmp.name, mode)
+            os.rename(tmp.name, filename)
+        except:
+            os.unlink(tmp.name)
+            raise
 
 
 def atomic_symlink(target, name):

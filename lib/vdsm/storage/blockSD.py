@@ -60,7 +60,9 @@ from vdsm.storage import mount
 from vdsm.storage import multipath
 from vdsm.storage import resourceFactories
 from vdsm.storage import resourceManager as rm
+from vdsm.storage import sanlock_direct
 from vdsm.storage import sd
+from vdsm.storage import volumemetadata
 from vdsm.storage.compat import sanlock
 from vdsm.storage.mailbox import MAILBOX_SIZE
 from vdsm.storage.persistent import PersistentDict, DictValidator
@@ -106,8 +108,9 @@ METADATA_LV_SIZE_MB = 128
 MASTER_LV_SIZE_MB = 1024
 
 BlockSDVol = namedtuple("BlockSDVol", "name, image, parent")
+LVTags = namedtuple("LVTags", "mdslot, image, parent")
 
-log = logging.getLogger("storage.BlockSD")
+log = logging.getLogger("storage.blocksd")
 
 # Metadata LV reserved size:
 # 0-1 MiB: V4 metadata area.
@@ -130,23 +133,17 @@ if MAX_PVS > MAX_PVS_LIMIT:
 
 PVS_METADATA_SIZE = MAX_PVS * 142
 
-SD_METADATA_SIZE = 2 * KiB
-DEFAULT_BLOCKSIZE = KiB // 2
+SD_METADATA_SIZE = 2048
+DEFAULT_BLOCKSIZE = 512
 
 DMDK_VGUUID = "VGUUID"
 DMDK_PV_REGEX = re.compile(r"^PV\d+$")
-
-# Reserved leases for special purposes:
-#  - 0       SPM (Backward comapatibility with V0 and V2)
-#  - 1       SDM (SANLock V3)
-#  - 2..100  (Unassigned)
-RESERVED_LEASES = 100
 
 # Metadata area start offset v4
 METADATA_BASE_V4 = 0
 
 # Size of metadata slot in v4
-METADATA_SLOT_SIZE_V4 = KiB // 2
+METADATA_SLOT_SIZE_V4 = 512
 
 # Starting version 5, first 1 MiB is still reserved for version 4 (but
 # zeroed) and therefore when computing metadata offset in version 5,
@@ -177,6 +174,7 @@ def decodePVInfo(value):
     del pvInfo["pv"]
     return pvInfo
 
+
 BLOCK_SD_MD_FIELDS = sd.SD_MD_FIELDS.copy()
 # TBD: Do we really need this key?
 BLOCK_SD_MD_FIELDS.update({
@@ -190,7 +188,7 @@ BLOCK_SD_MD_FIELDS.update({
 })
 
 INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_+.\-/=!:#]")
-LVM_ENC_ESCAPE = re.compile("&(\d+)&")
+LVM_ENC_ESCAPE = re.compile(r"&(\d+)&")
 
 
 # Move to lvm
@@ -203,33 +201,78 @@ def lvmTagDecode(s):
 
 
 def _getVolsTree(sdUUID):
-    lvs = lvm.getLV(sdUUID)
     vols = {}
-    for lv in lvs:
-        if lv.name in SPECIAL_LVS_V4:
-            # Special lvs are not user lvs.
-            continue
-
-        if sc.TAG_VOL_UNINIT in lv.tags:
-            # Uninitialized LVs have no image or parent yet.
-            continue
-
-        image = ""
-        parent = ""
-        for tag in lv.tags:
-            if tag.startswith(sc.TAG_PREFIX_IMAGE):
-                image = tag[len(sc.TAG_PREFIX_IMAGE):]
-            elif tag.startswith(sc.TAG_PREFIX_PARENT):
-                parent = tag[len(sc.TAG_PREFIX_PARENT):]
-            if parent and image:
-                vols[lv.name] = BlockSDVol(lv.name, image, parent)
-                break
+    for lv in _iter_volumes(sdUUID):
+        lvtags = parse_lv_tags(lv)
+        if lvtags.parent and lvtags.image:
+            vols[lv.name] = BlockSDVol(lv.name, lvtags.image, lvtags.parent)
         else:
             log.warning(
                 "Ignoring volume %s that lacks minimal tag set: %s",
                 lv.name, lv.tags)
 
     return vols
+
+
+def _iter_volumes(sdUUID):
+    for lv in lvm.getLV(sdUUID):
+        if lv.name in SPECIAL_LVS_V4:
+            # Exclude special volumes.
+            continue
+
+        if sc.TAG_VOL_UNINIT in lv.tags:
+            # Uninitialized LVs have no mapping yet.
+            continue
+
+        yield lv
+
+
+def _occupied_metadata_slots(sdUUID):
+    stripPrefix = lambda s, pfx: s[len(pfx):]
+    occupiedSlots = []
+
+    for lv in _iter_volumes(sdUUID):
+
+        offset = None
+        for tag in lv.tags:
+            if tag.startswith(sc.TAG_PREFIX_MD):
+                try:
+                    offset = int(stripPrefix(tag, sc.TAG_PREFIX_MD))
+                except Exception as e:
+                    log.warning(
+                        "Failed to parse metadata tag for lv %s/%s: %s",
+                        sdUUID, lv.name, e)
+                break
+
+        if offset is None:
+            log.warning("Could not find mapping for lv %s/%s",
+                        sdUUID, lv.name)
+            continue
+
+        occupiedSlots.append(offset)
+
+    occupiedSlots.sort()
+    return occupiedSlots
+
+
+def parse_lv_tags(lv):
+    image = None
+    parent = None
+    mdslot = None
+
+    for tag in lv.tags:
+        if tag.startswith(sc.TAG_PREFIX_IMAGE):
+            image = tag[len(sc.TAG_PREFIX_IMAGE):]
+        elif tag.startswith(sc.TAG_PREFIX_PARENT):
+            parent = tag[len(sc.TAG_PREFIX_PARENT):]
+        elif tag.startswith(sc.TAG_PREFIX_MD):
+            try:
+                mdslot = int(tag[len(sc.TAG_PREFIX_MD):])
+            except ValueError:
+                log.warning("Invalid tag %r for lv %s/%s",
+                            tag, lv.vg_name, lv.name)
+
+    return LVTags(mdslot, image, parent)
 
 
 def getAllVolumes(sdUUID):
@@ -297,9 +340,8 @@ def zeroImgVolumes(sdUUID, imgUUID, volUUIDs, discard):
         try:
             log.debug('Removing volume %s task %s', volUUID, taskid)
             deleteVolumes(sdUUID, (volUUID,))
-        except se.CannotRemoveLogicalVolume as e:
-            log.exception("Removing volume %s task %s failed: %s",
-                          volUUID, taskid, e)
+        except se.LogicalVolumeRemoveError as e:
+            log.exception("Task %s failed: %s", taskid, e)
 
         log.debug('Zero volume thread finished for '
                   'volume %s task %s', volUUID, taskid)
@@ -312,7 +354,7 @@ def zeroImgVolumes(sdUUID, imgUUID, volUUIDs, discard):
 
 
 class VGTagMetadataRW(object):
-    log = logging.getLogger("storage.Metadata.VGTagMetadataRW")
+    log = logging.getLogger("storage.metadata.vgtagmetadatarw")
     METADATA_TAG_PREFIX = "MDT_"
     METADATA_TAG_PREFIX_LEN = len(METADATA_TAG_PREFIX)
 
@@ -677,7 +719,11 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
             path = lvm.lvPath(sdUUID, volUUID)
 
             if discard:
-                blockdev.discard(path)
+                lvm.activateLVs(sdUUID, (volUUID,))
+                try:
+                    blockdev.discard(path)
+                finally:
+                    lvm.deactivateLVs(sdUUID, (volUUID,))
 
             self.log.debug('Removing volume %s task %s', volUUID, taskid)
             deleteVolumes(sdUUID, (volUUID,))
@@ -765,7 +811,7 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
             yield self._getFreeMetadataSlot()
 
     def _getFreeMetadataSlot(self):
-        occupied_slots = self.occupied_metadata_slots()
+        occupied_slots = _occupied_metadata_slots(self.sdUUID)
         free_slot = self._first_available_slot()
 
         # We have these cases:
@@ -779,35 +825,6 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
 
         self.log.debug("Found free slot %s in VG %s", free_slot, self.sdUUID)
         return free_slot
-
-    def occupied_metadata_slots(self):
-        stripPrefix = lambda s, pfx: s[len(pfx):]
-        occupiedSlots = []
-        special_lvs = self.special_volumes(self.getVersion())
-        for lv in lvm.getLV(self.sdUUID):
-            if lv.name in special_lvs:
-                # Special LVs have no mapping
-                continue
-
-            if sc.TAG_VOL_UNINIT in lv.tags:
-                # Uninitialized LVs have no mapping yet.
-                continue
-
-            offset = None
-            for tag in lv.tags:
-                if tag.startswith(sc.TAG_PREFIX_MD):
-                    offset = int(stripPrefix(tag, sc.TAG_PREFIX_MD))
-                    break
-
-            if offset is None:
-                self.log.warning("Could not find mapping for lv %s/%s",
-                                 self.sdUUID, lv.name)
-                continue
-
-            occupiedSlots.append(offset)
-
-        occupiedSlots.sort()
-        return occupiedSlots
 
     def _first_available_slot(self):
         version = self.getVersion()
@@ -823,11 +840,12 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
         else:
             return 1
 
-    @classmethod
-    def validateCreateVolumeParams(cls, volFormat, srcVolUUID, diskType,
-                                   preallocate=None):
-        super(BlockStorageDomainManifest, cls).validateCreateVolumeParams(
-            volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate)
+    def validateCreateVolumeParams(self, volFormat, srcVolUUID, diskType,
+                                   preallocate=None, add_bitmaps=False,
+                                   bitmap=None):
+        super().validateCreateVolumeParams(
+            volFormat, srcVolUUID, diskType=diskType, preallocate=preallocate,
+            add_bitmaps=add_bitmaps, bitmap=bitmap)
         # Sparse-Raw not supported for block volumes
         if preallocate == sc.SPARSE_VOL and volFormat == sc.RAW_FORMAT:
             raise se.IncorrectFormat(sc.type2name(volFormat))
@@ -882,7 +900,7 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
             sector=self.block_size)
 
     def volume_lease_offset(self, slot):
-        return (RESERVED_LEASES + slot) * self.alignment
+        return (sd.RESERVED_LEASES + slot) * self.alignment
 
     # Metadata volume
 
@@ -928,6 +946,22 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
         data = b"\0" * sc.METADATA_SIZE
         self.write_metadata_block(slot, data)
 
+    # LVs management
+
+    def activate_special_lvs(self):
+        """
+        Activate LVs used by SD itself, e.g. metadata.
+        """
+        special_lvs = self.special_volumes(self.getVersion())
+        lvm.activateLVs(self.sdUUID, special_lvs, refresh=False)
+
+    def deactivate_special_lvs(self):
+        """
+        Deactivate LVs used by SD itself, e.g. metadata.
+        """
+        special_lvs = self.special_volumes(self.getVersion())
+        lvm.deactivateLVs(self.sdUUID, special_lvs)
+
 
 class BlockStorageDomain(sd.StorageDomain):
     manifestClass = BlockStorageDomainManifest
@@ -938,27 +972,46 @@ class BlockStorageDomain(sd.StorageDomain):
 
     def __init__(self, sdUUID):
         manifest = self.manifestClass(sdUUID)
-
-        logical_block_size, physical_block_size = lvm.getVGBlockSizes(sdUUID)
-        self._validate_storage_block_size(
-            manifest.block_size, logical_block_size)
-
         sd.StorageDomain.__init__(self, manifest)
 
-        # TODO: Move this to manifest.activate_special_lvs
-        special_lvs = manifest.special_volumes(manifest.getVersion())
-        lvm.activateLVs(self.sdUUID, special_lvs, refresh=False)
+        self.activate_special_lvs()
 
-        self.metavol = lvm.lvPath(self.sdUUID, sd.METADATA)
+        self._validate_block_sizes()
+        self._registerResourceNamespaces()
+        self._lastUncachedSelftest = 0
+
+    # Life cycle
+
+    def setup(self):
+        """
+        Ensure that unused normal lvs are deactivated, avoiding stale devices.
+        """
+        log.info("Setting up domain %s", self.sdUUID)
+        lvm.deactivateUnusedLVs(self.sdUUID, skiplvs=SPECIAL_LVS_V4)
+
+    def teardown(self):
+        """
+        Ensure that all lvs are deactivated, avoiding stale devices.
+        """
+        log.info("Tearing down domain %s", self.sdUUID)
+        lvm.deactivateVG(self.sdUUID)
+
+    # Other
+
+    def _validate_block_sizes(self):
+        """
+        Validate that SD block size matches underlying storage block size and
+        all devices have same logical and physical block sizes.
+        """
+        logical_block_size, physical_block_size = lvm.getVGBlockSizes(
+            self.sdUUID)
+        self._validate_storage_block_size(
+            self._manifest.block_size, logical_block_size)
 
         # Check that all devices in the VG have the same logical and physical
         # block sizes.
         lvm.checkVGBlockSizes(
-            sdUUID, (logical_block_size, physical_block_size))
-
-        self.imageGarbageCollector()
-        self._registerResourceNamespaces()
-        self._lastUncachedSelftest = 0
+            self.sdUUID, (logical_block_size, physical_block_size))
 
     def _registerResourceNamespaces(self):
         """
@@ -1124,7 +1177,8 @@ class BlockStorageDomain(sd.StorageDomain):
 
         bsd = BlockStorageDomain(sdUUID)
 
-        bsd.initSPMlease()
+        with bsd.special_lvs():
+            bsd.initSPMlease()
 
         return bsd
 
@@ -1170,48 +1224,26 @@ class BlockStorageDomain(sd.StorageDomain):
 
         if now - self._lastUncachedSelftest > timeout:
             self._lastUncachedSelftest = now
-            lvm.chkVG(self.sdUUID)
+            try:
+                lvm.chkVG(self.sdUUID)
+            except se.LVMCommandError as e:
+                raise se.StorageDomainAccessError(self.sdUUID, reason=e)
         elif lvm.getVG(self.sdUUID).partial != lvm.VG_OK:
-            raise se.StorageDomainAccessError(self.sdUUID)
+            raise se.StorageDomainAccessError(
+                self.sdUUID, reason="Volume group is partial.")
 
     def validate(self):
         """
         Validate that the storage domain metadata
         """
         self.log.info("sdUUID=%s", self.sdUUID)
-        lvm.chkVG(self.sdUUID)
+        try:
+            lvm.chkVG(self.sdUUID)
+        except se.LVMCommandError as e:
+            raise se.StorageDomainAccessError(self.sdUUID, reason=e)
         self.invalidateMetadata()
         if not len(self.getMetadata()):
             raise se.StorageDomainAccessError(self.sdUUID)
-
-    def invalidate(self):
-        """
-        Make sure that storage domain is inaccessible.
-        1. Make sure master LV is not mounted
-        2. Deactivate all the volumes from the underlying VG
-        3. Destroy any possible dangling maps left in device mapper
-        """
-        try:
-            self.unmountMaster()
-        except se.StorageDomainMasterUnmountError:
-            self.log.warning("Unable to unmount master LV during invalidateSD")
-        except se.CannotDeactivateLogicalVolume:
-            # It could be that at this point there is no LV, so just ignore it
-            pass
-        except Exception:
-            # log any other exception, but keep going
-            self.log.error("Unexpected error", exc_info=True)
-
-        # FIXME: remove this and make sure nothing breaks
-        try:
-            lvm.deactivateVG(self.sdUUID)
-        except Exception:
-            # log any other exception, but keep going
-            self.log.error("Unexpected error", exc_info=True)
-
-        vgDir = os.path.join("/dev", self.sdUUID)
-        self.log.info("Removing VG directory %r", vgDir)
-        fileUtils.cleanupdir(vgDir)
 
     @classmethod
     def format(cls, sdUUID):
@@ -1238,9 +1270,8 @@ class BlockStorageDomain(sd.StorageDomain):
             # Fix me: Should raise and get resource lock.
             try:
                 lvm.removeLVs(sdUUID, (lv.name,))
-            except se.CannotRemoveLogicalVolume as e:
-                cls.log.warning("Remove logical volume failed %s/%s %s",
-                                sdUUID, lv.name, str(e))
+            except se.LogicalVolumeRemoveError as e:
+                cls.log.warning("Cannot remove logical volume: %s", e)
 
         lvm.removeVG(sdUUID)
         return True
@@ -1329,7 +1360,7 @@ class BlockStorageDomain(sd.StorageDomain):
         to the parent. When creating the qcow layer, we pass a relative path
         which allows us to build a directory with links to all volumes in the
         chain anywhere we want. This method creates a directory with the image
-        uuid under /var/run/vdsm and creates sym links to all the volumes in
+        uuid under /run/vdsm and creates sym links to all the volumes in
         the chain.
 
         srcImgPath: Dir where the image volumes are.
@@ -1501,10 +1532,10 @@ class BlockStorageDomain(sd.StorageDomain):
         try:
             masterMount = mount.getMountFromTarget(masterdir)
         except OSError as ex:
-            if ex.errno == errno.ENOENT:
-                return
+            if ex.errno != errno.ENOENT:
+                raise
+            return
 
-            raise
         if masterMount.isMounted():
             # Try umount, take 1
             try:
@@ -1547,6 +1578,10 @@ class BlockStorageDomain(sd.StorageDomain):
                     # Forcibly rebooting the SPM host would be safer. ???
                     raise se.StorageDomainMasterUnmountError(masterdir, 1)
 
+    @classmethod
+    def is_block(cls):
+        return True
+
     def unmountMaster(self):
         """
         Unmount the master metadata file system. Should be called only by SPM.
@@ -1556,12 +1591,11 @@ class BlockStorageDomain(sd.StorageDomain):
         # It is time to deactivate the master LV now
         lvm.deactivateLVs(self.sdUUID, [MASTERLV])
 
-    def extendVolume(self, volumeUUID, size, isShuttingDown=None):
+    def extendVolume(self, volumeUUID, size, refresh=True):
         with self.manifest.metadata_lock:
             self.log.debug("Extending thinly-provisioned LV for volume %s to "
                            "%d MB", volumeUUID, size)
-            # FIXME: following line.
-            lvm.extendLV(self.sdUUID, volumeUUID, size)  # , isShuttingDown)
+            lvm.extendLV(self.sdUUID, volumeUUID, size, refresh=refresh)
 
     def reduceVolume(self, imgUUID, volUUID, allowActive=False):
         with self.manifest.metadata_lock:
@@ -1635,7 +1669,7 @@ class BlockStorageDomain(sd.StorageDomain):
         with open(path, "rb+") as f:
             dst = mmap.mmap(f.fileno(), RESERVED_METADATA_SIZE)
             with closing(dst):
-                for slot in self._manifest.occupied_metadata_slots():
+                for slot in _occupied_metadata_slots(self.sdUUID):
                     v4_off = self._manifest.metadata_offset(slot)
 
                     self.log.debug("Reading v4 metadata slot %s offset=%s",
@@ -1645,7 +1679,7 @@ class BlockStorageDomain(sd.StorageDomain):
                     try:
                         md = VolumeMetadata.from_lines(
                             v4_data.rstrip(b"\0").splitlines())
-                    except se.MetaDataKeyNotFoundError as e:
+                    except se.InvalidMetadata as e:
                         self.log.warning(
                             "Cannot convert metadata slot %s offset=%s: %s",
                             slot, v4_off, e)
@@ -1686,6 +1720,135 @@ class BlockStorageDomain(sd.StorageDomain):
             f.write(b"\0" * size)
             f.flush()
             os.fsync(f.fileno())
+
+    # Dump metadata
+
+    def dump(self, full=False):
+        # Invalidate the vg pvs and lvs here, to make sure we don't return
+        # stale data from the cache.
+        lvm.invalidateVG(self.sdUUID, invalidateLVs=True, invalidatePVs=True)
+
+        result = {
+            "metadata": self.getInfo(),
+            "volumes": self._dump_volumes()
+        }
+
+        if full:
+            # As blockSD uses sanlock for managing its leases and lockspaces
+            # we always assume to have those.
+            result["leases"] = self._dump_leases()
+            result["lockspace"] = self.dump_lockspace()
+
+            if self.supports_external_leases(self.getVersion()):
+                result["xleases"] = self.dump_external_leases()
+
+        return result
+
+    def _dump_volumes(self):
+        vols_md = {}
+        slots_md = self._parse_volumes_metadata()
+
+        for lv in _iter_volumes(self.sdUUID):
+            lvtags = parse_lv_tags(lv)
+            # Complement volume metadata from parsed slots by slot number.
+            try:
+                vol_md = slots_md[lvtags.mdslot]
+            except KeyError as e:
+                self.log.warning(
+                    "Failed to get metadata from lv tags for lv %s/%s: %s",
+                    self.sdUUID, lv.name, e)
+                vol_md = {"status": sc.VOL_STATUS_INVALID}
+
+            # Try to complement metadata from tags
+            # in case it was missing from slots.
+            if vol_md["status"] != sc.VOL_STATUS_OK:
+                if lvtags.image and "image" not in vol_md:
+                    vol_md["image"] = lvtags.image
+                if lvtags.parent and "parent" not in vol_md:
+                    vol_md["parent"] = lvtags.parent
+
+            if "image" in vol_md:
+                # Add the volume sizes information.
+                try:
+                    vol_size = self.getVolumeSize(vol_md["image"], lv.name)
+                    vol_md["truesize"] = vol_size.truesize
+                    vol_md["apparentsize"] = vol_size.apparentsize
+                except Exception as e:
+                    self.log.warning(
+                        "Failed to get size for lv %s/%s: %s",
+                        self.sdUUID, lv.name, e)
+                    vol_md["status"] = sc.VOL_STATUS_INVALID
+
+            # Check if volume was marked as removed and override status.
+            img = lvtags.image
+            if img is not None and img.startswith(sc.REMOVED_IMAGE_PREFIX):
+                vol_md["status"] = sc.VOL_STATUS_REMOVED
+
+            vols_md[lv.name] = vol_md
+
+        return vols_md
+
+    def _parse_volumes_metadata(self):
+        slots_md = {}
+        slots = _occupied_metadata_slots(self.sdUUID)
+        if len(slots) == 0:
+            return slots_md
+
+        # Slots are sorted in an increasing order,
+        # find slots start and end offsets to read from metadata.
+        start_offset = self._manifest.metadata_offset(slots[0])
+        end_offset = self._manifest.metadata_offset(
+            slots[-1]) + sc.METADATA_SIZE
+
+        # Read the metadata from starting offset to last offset end.
+        path = self._manifest.metadata_volume_path()
+        raw_md = misc.readblock(path, start_offset, end_offset - start_offset)
+
+        # Parse metadata per slot.
+        for slot in slots:
+            offset = self._manifest.metadata_offset(slot) - start_offset
+            slot_raw_md = raw_md[offset:offset + sc.METADATA_SIZE]
+            md_lines = slot_raw_md.rstrip(b"\0").splitlines()
+            slot_md = volumemetadata.dump(md_lines)
+            slot_md["mdslot"] = slot
+            slots_md[slot] = slot_md
+
+        return slots_md
+
+    def _dump_leases(self):
+        path = self.getLeasesFilePath()
+        slots = _occupied_metadata_slots(self.sdUUID)
+
+        if len(slots) > 0:
+            # End offset of last used volume slot. Dumping beyond this point
+            # may return stale volume leases.
+            size = self._manifest.volume_lease_offset(
+                slots[-1]) + self.alignment
+        else:
+            # End offset of reserved slots.
+            size = self._manifest.volume_lease_offset(0)
+
+        return list(sanlock_direct.dump_leases(
+            path,
+            size=size,
+            block_size=self.block_size,
+            alignment=self.alignment))
+
+    # LVs management
+
+    def activate_special_lvs(self):
+        self._manifest.activate_special_lvs()
+
+    def deactivate_special_lvs(self):
+        self._manifest.deactivate_special_lvs()
+
+    @contextmanager
+    def special_lvs(self):
+        self.activate_special_lvs()
+        try:
+            yield
+        finally:
+            self.deactivate_special_lvs()
 
 
 def _external_leases_path(sdUUID):

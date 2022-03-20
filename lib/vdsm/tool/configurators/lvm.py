@@ -17,30 +17,17 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
-from __future__ import division
-
 import errno
-import os
-import selinux
-import shutil
 import sys
-import time
 
+from vdsm.storage import fileUtils
 from vdsm.tool import confmeta
-from vdsm.common import commands
-from vdsm.common import systemctl
-from vdsm.common.cmdutils import CommandPath
 
 from . import YES, NO
-
-_SYSTEMCTL = CommandPath("systemctl", "/bin/systemctl", "/usr/bin/systemctl")
 
 # TODO: use constants.py
 _LVMLOCAL_CUR = "/etc/lvm/lvmlocal.conf"
 _LVMLOCAL_VDSM = "/usr/share/vdsm/lvmlocal.conf"
-_LVMETAD_SERVICE = "lvm2-lvmetad.service"
-_LVMETAD_SOCKET = "lvm2-lvmetad.socket"
 
 
 # Configuratior interface
@@ -53,28 +40,24 @@ def configure():
     Disable and mask lvmetad daemon, and install vdsm managed lvmlocal.conf.
     """
     if not _lvm_conf_configured():
+        backup = fileUtils.backup_file(_LVMLOCAL_CUR)
+        if backup:
+            _log("Previous lvmlocal.conf copied to %s", backup)
+
         # TODO: we should merge the contents of the exisiting file and vdsm
         # settings, in case the user has some useful setting in the
         # lvmlocal.conf.
-        _backup_file(_LVMLOCAL_CUR)
-        _install_file(_LVMLOCAL_VDSM, _LVMLOCAL_CUR)
-    # TODO: remove disabling lvmetad once we don't support Fedora 30. On
-    # Fedora 31 and RHEL8 lvmetad is not supported anymore.
-    if not _lvmetad_configured():
-        _systemctl("mask", _LVMETAD_SERVICE, _LVMETAD_SOCKET)
-        _systemctl("disable", _LVMETAD_SERVICE, _LVMETAD_SOCKET)
-        _systemctl("stop", _LVMETAD_SERVICE, _LVMETAD_SOCKET)
+        _log("Installing %s at %s", _LVMLOCAL_VDSM, _LVMLOCAL_CUR)
+        with open(_LVMLOCAL_VDSM, "rb") as f:
+            fileUtils.atomic_write(_LVMLOCAL_CUR, f.read(), relabel=True)
 
 
 def isconfigured():
     """
-    Return YES if lvmetad service and socket are disabled and masked, and
-    /etc/lvm/lvmlocal.conf is using the correct version, or is marked as
-    private. Otherwise return NO.
+    Return YES if /etc/lvm/lvmlocal.conf is using the correct version, or is
+    marked as private. Otherwise return NO.
     """
-    # TODO: we don't need to check if lvmetad is disabled once we don't support
-    # Fedora 30. On Fedora 31 and RHEL8 lvmetad is not supported anymore.
-    if _lvm_conf_configured() and _lvmetad_configured():
+    if _lvm_conf_configured():
         _log("lvm is configured for vdsm")
         return YES
     else:
@@ -116,70 +99,6 @@ def _lvm_conf_configured():
     return vdsm_conf.revision == cur_conf.revision
 
 
-def _lvmetad_configured():
-    """
-    Return True if both lvmetad service and socket are masked and disabled,
-    otherwise return False.
-
-    TODO: remove this function once we don't support Fedora 30. On Fedora 31
-    and RHEL8 lvmetad is not supported anymore.
-    """
-    pattern = "lvm2-lvmetad*"
-    properties = ("Names", "LoadState", "ActiveState")
-    units = systemctl.show(pattern, properties=properties)
-
-    if not units:
-        # There's no lvmetad and thus nothing to configure
-        return True
-
-    not_configured = []
-    for unit in units:
-        # ActiveState may be "inactive" or "failed", both are good.
-        if unit["LoadState"] != "masked" or unit["ActiveState"] == "active":
-            not_configured.append(unit)
-
-    if not_configured:
-        _log("Units need configuration: %s", not_configured)
-        return False
-
-    return True
-
-
-def _install_file(src, dst):
-    _log("Installing %s at %s", src, dst)
-    tmpfile = _LVMLOCAL_CUR + ".tmp"
-    shutil.copyfile(_LVMLOCAL_VDSM, tmpfile)
-    try:
-        selinux.restorecon(tmpfile)
-        os.chmod(tmpfile, 0o644)
-        os.rename(tmpfile, _LVMLOCAL_CUR)
-    except:
-        try:
-            os.unlink(tmpfile)
-        except Exception:
-            _log("ERROR: cannot remove temporary file: %s", tmpfile)
-        raise
-
-
-def _backup_file(path):
-    """
-    Backup current file with a timestamp.
-
-    TODO: Same code is used in multipath configurator, so this should move to
-    tool utils module. Keeping here for now to make it easier to backport.
-    """
-    if os.path.exists(path):
-        backup = path + '.' + time.strftime("%Y%m%d%H%M")
-        _log("Backing up %s to %s", path, backup)
-        shutil.copyfile(path, backup)
-
-
-def _systemctl(*args):
-    cmd = [_SYSTEMCTL.cmd]
-    cmd.extend(args)
-    return commands.run(cmd)
-
-
-# TODO: use standad logging
+# TODO: use standard logging
 def _log(fmt, *args):
     sys.stdout.write(fmt % args + "\n")

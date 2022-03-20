@@ -1,4 +1,4 @@
-# Copyright 2016 Red Hat, Inc.
+# Copyright 2016-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -23,10 +23,14 @@ from __future__ import division
 import logging
 import os
 import stat
+import tempfile
 import uuid
 
 from vdsm.constants import P_LIBVIRT_VMCHANNELS, P_OVIRT_VMCONSOLES
 from vdsm.storage.fileUtils import resolveGid
+from vdsm.virt import filedata
+from vdsm.common import exception
+from vdsm.common import password
 from vdsm.common.fileutils import parse_key_val_file
 
 from . import expose
@@ -80,13 +84,14 @@ def hugepages_alloc(count, path):
 
 
 @expose
-def mdev_create(device, mdev_type, mdev_uuid=None):
-    """Create the desired mdev type.
+def mdev_create(device, mdev_properties, mdev_uuid=None):
+    """Create the desired mediated device.
 
     Args:
         device: PCI address of the parent device in the format
             (domain:bus:slot.function). Example:  0000:06:00.0.
-        mdev_type: Type to be spawned. Example: nvidia-11.
+        mdev_properties: `vdsm.common.hostdev.MdevProperties` instance
+            specifying the desired device properties
         mdev_uuid: UUID for the spawned device. Keeping None generates a new
             UUID.
 
@@ -98,27 +103,40 @@ def mdev_create(device, mdev_type, mdev_uuid=None):
     """
     path = os.path.join(
         '/sys/class/mdev_bus/{}/mdev_supported_types/{}/create'.format(
-            device, mdev_type
+            device, mdev_properties.device_type
         )
     )
-
     if mdev_uuid is None:
         mdev_uuid = str(uuid.uuid4())
-
     with open(path, 'w') as f:
         f.write(mdev_uuid)
+
+    driver_parameters = mdev_properties.driver_parameters
+    if driver_parameters is not None:
+        param_path = f'/sys/bus/mdev/devices/{mdev_uuid}/nvidia/vgpu_params'
+        try:
+            with open(param_path, 'w') as f:
+                f.write('%s\n' % (driver_parameters,))
+        except:
+            # We must perform the cleanup here, because we may not know the
+            # device UUID elsewhere.
+            try:
+                mdev_delete(device, mdev_uuid)
+            except Exception as e:
+                logging.error("Failed to remove vGPU device with failed "
+                              "driver parameters: %s", e)
+            raise
 
     return mdev_uuid
 
 
 @expose
 def mdev_delete(device, mdev_uuid):
-    """
+    """Remove the given mediated device.
 
     Args:
         device: PCI address of the parent device in the format
             (domain:bus:slot.function). Example:  0000:06:00.0.
-        mdev_type: Type to be spawned. Example: nvidia-11.
         mdev_uuid: UUID for the spawned device. Keeping None generates a new
             UUID.
 
@@ -150,3 +168,85 @@ def check_qemu_conf_contains(key, value):
         logging.error('Could not check %s for %s', QEMU_CONFIG_FILE, key)
         # re-raised exception will be logged, no need to log it here
         raise
+
+
+@expose
+def read_tpm_data(vm_id, last_modified):
+    """
+    Return TPM data of the given VM.
+
+    If data is not newer than `last_modified`, return None.
+    In addition to data, the last detected data modification time is
+    returned; the returned data may be newer, but never older than the
+    returned time.
+
+    :param vm_id: VM id
+    :type vm_id: string
+    :param last_modified: if data file system time stamp is not
+      newer than this time in seconds, None is returned
+    :type last_modified: float
+    :returns: tuple (DATA, MODIFIED) where DATA is encoded TPM data suitable to
+      use in `write_tpm_data()`, wrapped by `password.ProtectedPassword`,
+      or None, and MODIFIED is DATA modification time (which may be older than
+      actual modification time)
+    :rtype: tuple
+    """
+    accessor = filedata.DirectoryData(filedata.tpm_path(vm_id),
+                                      compress=False)
+    currently_modified = accessor.last_modified()
+    data = accessor.retrieve(last_modified=last_modified)
+    return password.ProtectedPassword(data), currently_modified
+
+
+@expose
+def write_tpm_data(vm_id, tpm_data):
+    """
+    Write TPM data for the given VM.
+
+    :param vm_id: VM id
+    :type vm_id: string
+    :param tpm_data: encoded TPM data as previously obtained from
+      `read_tpm_data()`
+    :type tpm_data: ProtectedPassword
+    """
+    tpm_data = password.unprotect(tpm_data)
+    # Permit only archives with plain files and directories to prevent various
+    # kinds of attacks.
+    with tempfile.TemporaryDirectory() as d:
+        accessor = filedata.DirectoryData(os.path.join(d, 'check'))
+        accessor.store(tpm_data)
+        for root, dirs, files in os.walk(d):
+            for f in files:
+                path = os.path.join(root, f)
+                if not os.path.isfile(path):
+                    logging.error("Special file in TPM data: %s", path)
+                    raise exception.ExternalDataFailed(
+                        reason="Cannot write TPM data with non-regular files",
+                        path=path
+                    )
+    # OK, write the data to the target location
+    accessor = filedata.DirectoryData(filedata.tpm_path(vm_id))
+    accessor.store(tpm_data)
+
+
+@expose
+def read_nvram_data(vm_id, last_modified):
+    accessor = filedata.FileData(filedata.nvram_path(vm_id))
+    currently_modified = accessor.last_modified()
+    data = accessor.retrieve(last_modified=last_modified)
+    return password.ProtectedPassword(data), currently_modified
+
+
+@expose
+def write_nvram_data(vm_id, nvram_data):
+    nvram_data = password.unprotect(nvram_data)
+    nvram_path = filedata.nvram_path(vm_id)
+    # Create the file with restricted permissions owned by root
+    if os.path.exists(nvram_path):
+        os.remove(nvram_path)
+    fd = os.open(
+        nvram_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode=0o600)
+    os.close(fd)
+    # Write content
+    accessor = filedata.FileData(nvram_path)
+    accessor.store(nvram_data)

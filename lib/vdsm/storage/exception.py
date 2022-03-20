@@ -33,6 +33,9 @@
 
 from __future__ import absolute_import
 
+import errno
+import re
+
 from vdsm.common.exception import GeneralException
 from vdsm.storage.securable import SecureError
 SPM_STATUS_ERROR = (654, "Not SPM")
@@ -88,6 +91,11 @@ class ResourceException(GeneralException):
 
     def __init__(self, UUID):
         self.value = "UUID={}".format(UUID)
+
+
+class ShuttingDownError(GeneralException):
+    code = 3001
+    msg = "Shutdown in progress"
 
 
 class VolumeGeneralException(GeneralException):
@@ -639,9 +647,23 @@ class GetFileStatsError(StorageException):
     msg = "Cannot get file stats"
 
 
+class TarCommandError(StorageException):
+    code = 331
+    msg = "Tar command failed"
+
+
 #################################################
 #  Domains Exceptions
 #################################################
+
+class StorageDomainIllegalStateError(StorageException):
+    code = 347
+    msg = "Storage domain is in illegal state"
+
+    def __init__(self, sdUUID, expected_state, actual_state):
+        self.value = "sdUUID=%s, expected state=%s, actual state=%s" % (
+            sdUUID, expected_state, actual_state)
+
 
 class StorageDomainBlockSizeMismatch(StorageException):
     code = 348
@@ -820,6 +842,10 @@ class StorageDomainTypeNotBackup(StorageException):
 
 
 class StorageDomainAccessError(StorageException):
+    def __init__(self, sdUUID, reason=None):
+        self.value = "domain=%s" % sdUUID
+        if reason:
+            self.value += " reason=%s" % reason
     code = 379
     msg = "Domain is either partially accessible or entirely inaccessible"
 
@@ -1265,6 +1291,30 @@ class ImageVerificationError(StorageException):
 #  LVM related Exceptions
 #################################################
 
+class LVMCommandError(StorageException):
+    code = 621
+    msg = "LVM command failed"
+
+    def __init__(self, cmd, rc, out, err):
+        self.cmd = cmd
+        self.rc = rc
+        self.out = out
+        self.err = err
+
+    @property
+    def value(self):
+        return "cmd={} rc={} out={} err={}".format(
+            self.cmd, self.rc, self.out, self.err)
+
+    def lv_in_use(self):
+        in_use = r"^Logical volume \S* in use.$"
+        return any([re.search(in_use, x.strip()) for x in self.err])
+
+    @classmethod
+    def from_lvmerror(cls, e):
+        return cls(e.cmd, e.rc, e.out, e.err).with_exception(e)
+
+
 class VolumeGroupActionError(StorageException):
     code = 500
     msg = "Error volume group action"
@@ -1275,16 +1325,12 @@ class VolumeGroupPermissionsError(StorageException):
     msg = "Could not update/change volume group permissions"
 
 
-class VolumeGroupCreateError(StorageException):
-    def __init__(self, vgname, devname):
-        self.value = "vgname=%s, devname=%s" % (vgname, devname)
+class VolumeGroupCreateError(LVMCommandError):
     code = 502
     msg = "Cannot create Volume Group"
 
 
-class VolumeGroupExtendError(StorageException):
-    def __init__(self, vgname, devname):
-        self.value = "vgname=%s, devname=%s" % (vgname, devname)
+class VolumeGroupExtendError(LVMCommandError):
     code = 503
     msg = "Cannot extend Volume Group"
 
@@ -1309,7 +1355,7 @@ class VolumeGroupRenameError(StorageException):
     msg = "Volume Group rename error"
 
 
-class VolumeGroupRemoveError(StorageException):
+class VolumeGroupRemoveError(LVMCommandError):
     code = 508
     msg = "Volume Group remove error"
 
@@ -1339,7 +1385,7 @@ class VolumeGroupHasDomainTag(StorageException):
     msg = "Volume Group has domain tag - requires cleaning"
 
 
-class VolumeGroupReplaceTagError(StorageException):
+class VolumeGroupReplaceTagError(LVMCommandError):
     code = 516
     msg = "Replace Volume Group tag error"
 
@@ -1362,20 +1408,14 @@ class DeviceBlockSizeError(StorageException):
     msg = "Device block size is not supported"
 
 
-class VolumeGroupReduceError(StorageException):
+class VolumeGroupReduceError(LVMCommandError):
     code = 519
     msg = "Cannot reduce the Volume Group"
 
-    def __init__(self, vgname, pvname, err):
-        self.value = "vgname=%s pvname=%s err=%s" % (vgname, pvname, err)
 
-
-class CannotCreateLogicalVolume(StorageException):
+class CannotCreateLogicalVolume(LVMCommandError):
     code = 550
     msg = "Cannot create Logical Volume"
-
-    def __init__(self, vgname, lvname, err):
-        self.value = "vgname=%s lvname=%s err=%s" % (vgname, lvname, err)
 
 
 class CannotRemoveLogicalVolume(StorageException):
@@ -1383,7 +1423,7 @@ class CannotRemoveLogicalVolume(StorageException):
     msg = "Cannot remove Logical Volume"
 
 
-class CannotDeactivateLogicalVolume(StorageException):
+class CannotDeactivateLogicalVolume(LVMCommandError):
     code = 552
     msg = "Cannot deactivate Logical Volume"
 
@@ -1393,10 +1433,7 @@ class CannotAccessLogicalVolume(StorageException):
     msg = "Cannot access Logical Volume"
 
 
-class LogicalVolumeExtendError(StorageException):
-    def __init__(self, vgname, lvname, newsize):
-        self.value = ("vgname=%s lvname=%s "
-                      "newsize=%s" % (vgname, lvname, newsize))
+class LogicalVolumeExtendError(LVMCommandError):
     code = 554
     msg = "Logical Volume extend failed"
 
@@ -1406,7 +1443,7 @@ class LogicalVolumesListError(StorageException):
     msg = "Cannot get Logical Volumes list from Volume Group"
 
 
-class LogicalVolumeRefreshError(StorageException):
+class LogicalVolumeRefreshError(LVMCommandError):
     code = 556
     msg = "Cannot refresh Logical Volume"
 
@@ -1458,7 +1495,7 @@ class GetLogicalVolumeDevError(StorageException):
     msg = "Cannot get physical devices of logical volume"
 
 
-class LogicalVolumeRenameError(StorageException):
+class LogicalVolumeRenameError(LVMCommandError):
     code = 566
     msg = "Cannot rename Logical Volume"
 
@@ -1470,9 +1507,7 @@ class CannotWriteAccessLogialVolume(StorageException):
     msg = "Cannot access logical volume for write"
 
 
-class CannotSetRWLogicalVolume(StorageException):
-    def __init__(self, vgname, lvname, rw):
-        self.value = "vgname=%s lvname=%s rw=%s" % (vgname, lvname, rw)
+class CannotSetRWLogicalVolume(LVMCommandError):
     code = 568
     msg = "Cannot set Logical volume RW permission"
 
@@ -1484,7 +1519,7 @@ class LogicalVolumesScanError(StorageException):
     msg = "Logical volume scanning error"
 
 
-class CannotActivateLogicalVolumes(StorageException):
+class CannotActivateLogicalVolumes(LVMCommandError):
     code = 570
     msg = "Cannot activate Logical Volumes"
 
@@ -1494,9 +1529,14 @@ class GetLogicalVolumeDataError(StorageException):
     msg = "Cannot get Logical Volume Info"
 
 
-class LogicalVolumeReplaceTagError(StorageException):
+class LogicalVolumeReplaceTagError(LVMCommandError):
     code = 572
     msg = "Replace Logical Volume tag error"
+
+
+class LogicalVolumeRemoveError(LVMCommandError):
+    code = 573
+    msg = "Cannot remove Logical Volume"
 
 
 class BlockDeviceActionError(StorageException):
@@ -1504,7 +1544,7 @@ class BlockDeviceActionError(StorageException):
     msg = "Error block device action"
 
 
-class PhysDevInitializationError(StorageException):
+class PhysDevInitializationError(LVMCommandError):
     code = 601
     msg = "Failed to initialize physical device"
 
@@ -1592,9 +1632,7 @@ class SmallVgMetadata(StorageException):
         "issue and how to resolve it")
 
 
-class CouldNotResizePhysicalVolume(StorageException):
-    def __init__(self, pvname, err):
-        self.value = "pvname=%s err=%s" % (pvname, err)
+class CouldNotResizePhysicalVolume(LVMCommandError):
     code = 615
     msg = "Could not resize PV"
 
@@ -1614,13 +1652,10 @@ class ForbiddenPhysicalVolumeOperation(StorageException):
         self.value = "reason=%s" % reason
 
 
-class CouldNotMovePVData(StorageException):
+class CouldNotMovePVData(LVMCommandError):
     code = 618
     msg = "Could not move PV data, there might be leftovers that require" \
           " manual handling - please refer to the pvmove man page"
-
-    def __init__(self, pvname, vgname, err):
-        self.value = "pvname=%s vgname=%s err=%s" % (pvname, vgname, err)
 
 
 class NoSuchPhysicalVolume(StorageException):
@@ -1637,6 +1672,8 @@ class NoSuchDestinationPhysicalVolumes(StorageException):
 
     def __init__(self, pvs, vgname):
         self.value = "pvs=%s vgname=%s" % (pvs, vgname)
+
+# NOTE: code is 621 used by LVMCommandError above.
 
 
 #################################################
@@ -1729,9 +1766,26 @@ class ClusterLockInitError(StorageException):
     msg = "Could not initialize cluster lock"
 
 
-class InquireNotSupportedError(StorageException):
+class InspectNotSupportedError(StorageException):
     code = 702
-    msg = "Cluster lock inquire isnt supported"
+    msg = "Cluster lock inspect isnt supported"
+
+
+class SanlockLVBError(StorageException):
+    code = 703
+    msg = "LVB operation failed"
+
+
+class SanlockInquireError(StorageException):
+    code = 704
+    msg = "Inquire sanlock daemon failed"
+
+    def __init__(self, errno, reason):
+        self.errno = errno
+        self.value = reason
+
+    def is_temporary(self):
+        return self.errno == errno.EBUSY
 
 
 #################################################
@@ -1748,7 +1802,7 @@ class MetaDataKeyError(MetaDataGeneralError):
     msg = "Meta data key error"
 
 
-class MetaDataKeyNotFoundError(MetaDataGeneralError):
+class InvalidMetadata(MetaDataGeneralError):
     code = 751
     msg = "Meta Data key not found error"
 
@@ -1785,7 +1839,7 @@ class MetadataOverflowError(MetaDataGeneralError):
         self.value = "data=%r" % data
 
 
-class MetadataCleared(MetaDataKeyNotFoundError):
+class MetadataCleared(InvalidMetadata):
     code = 757
     msg = "Metadata was cleared, volume is partly deleted"
 
@@ -1887,6 +1941,14 @@ class GenerationMismatch(StorageException):
         self.value = "requested=%s, actual=%s" % (requested, actual)
 
 
+class JobStatusMismatch(StorageException):
+    code = 912
+    msg = "The provided job status does not match the expected job status"
+
+    def __init__(self, expected, actual):
+        self.value = "expected=%s, actual=%s" % (expected, actual)
+
+
 class VolumeIsNotInChain(StorageException):
     code = 920
     msg = "Volume is not part of the chain."
@@ -1969,3 +2031,41 @@ class NoSuchLease(StorageException):
 
     def __init__(self, lease_id):
         self.value = "lease={}".format(lease_id)
+
+
+#################################################
+#  Transient disks Errors
+#  Range: 941-945
+#################################################
+
+
+class TransientDiskAlreadyExists(StorageException):
+    code = 941
+    msg = "Transient disk already exists"
+    expected = True
+
+    def __init__(self, disk_path):
+        self.value = "disk_path={}".format(disk_path)
+
+
+#################################################
+#  Bitmaps errors
+#  Range: 946-955
+#################################################
+
+
+class InvalidBitmapChain(StorageException):
+    code = 946
+    msg = "Invalid bitmap chain"
+
+    def __init__(self, reason, **context):
+        context["reason"] = reason
+        self.value = "{}".format(context)
+
+
+class BitmapDoesNotExist(StorageException):
+    code = 947
+    msg = "Bitmap does not exist"
+
+    def __init__(self, **context):
+        self.value = "{}".format(context)
