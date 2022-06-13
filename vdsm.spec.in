@@ -56,7 +56,7 @@
 %{!?vdsm_release: %global vdsm_release @PACKAGE_RELEASE@}
 
 Name:           %{vdsm_name}
-Version:        4.50.0.10
+Version:        4.50.1.2
 Release:        %{vdsm_release}%{?dist}%{?extra_release}
 Summary:        Virtual Desktop Server Manager
 
@@ -66,6 +66,11 @@ Url:            http://www.ovirt.org/develop/developer-guide/vdsm/vdsm/
 Source0:        https://github.com/oVirt/vdsm/releases/download/v%{version}/%{vdsm_name}-%{version}.tar.gz
 
 %{!?_licensedir:%global license %%doc}
+
+%if 0%{?rhel} >= 9
+# qemu-kvm is not available for ppc64le on RHEL 9
+ExcludeArch:   ppc64le
+%endif
 
 BuildRequires: openssl
 BuildRequires: python3
@@ -373,7 +378,10 @@ Requires:       ovirt-openvswitch >= 2.15
 # Workaround for BZ#1966143
 Requires:       ovirt-python-openvswitch >= 2.15
 Requires:       nmstate >= 1.0
+%if 0%{?rhel} < 9
 Requires:       nmstate-plugin-ovsdb
+%endif
+Requires:       python3-libnmstate
 Requires:       libnl3
 Requires:       lldpad
 Requires:       python3-six
@@ -1190,5 +1198,5 @@ exit 0
 %endif
 
 %changelog
-* Tue Mar 15 2022 Milan Zamazal <mzamazal@redhat.com> - 4.50.0.10
+* Wed Jul 8 2022 Milan Zamazal <mzamazal@redhat.com> - 4.50.1.2
 - See %{_docdir}/%{vdsm_name}/ChangeLog for the complete list of Vdsm changes.

@@ -58,6 +58,7 @@ When extending the volume failed:
 
 import logging
 import threading
+import time
 
 import xml.etree.ElementTree as etree
 
@@ -66,6 +67,7 @@ import pytest
 
 from vdsm import utils
 from vdsm.common import response
+from vdsm.common.config import config
 from vdsm.common.units import MiB, GiB
 from vdsm.virt.vmdevices.storage import Drive, DISK_TYPE, BLOCK_THRESHOLD
 from vdsm.virt.vmdevices import hwclass
@@ -78,9 +80,10 @@ from testlib import maybefail
 
 from . import vmfakelib as fake
 
-CHUNK_SIZE = 1 * GiB
-CHUNK_PCT = 50
+CHUNK_SIZE = 2560 * MiB
+FREE_PCT = 80
 REPLICA_BASE_INDEX = 1000
+EXTEND_TIMEOUT = config.getfloat("thinp", "extend_timeout")
 
 log = logging.getLogger("test")
 
@@ -104,8 +107,8 @@ def drive_config(**kw):
 
 
 def block_info(
-        name="vda", path="/virtio/0", backingIndex=1, capacity=4 * GiB,
-        allocation=0, physical=4 * GiB, threshold=0):
+        name="vda", path="/virtio/0", backingIndex=1, capacity=10 * GiB,
+        allocation=0, physical=5 * GiB, threshold=0):
     return {
         "name": name,
         "path": path,
@@ -132,7 +135,8 @@ def drive_infos():
                 # libvirt starts backingIndex at 1.
                 backingIndex=1,
                 allocation=1 * GiB,
-                physical=2 * GiB,
+                physical=5 * GiB,
+                capacity=10 * GiB,
             ),
         ),
         (
@@ -147,7 +151,8 @@ def drive_infos():
                 path="/virtio/1",
                 backingIndex=2,
                 allocation=1 * GiB,
-                physical=2 * GiB,
+                physical=5 * GiB,
+                capacity=10 * GiB,
             ),
         ),
     )
@@ -157,7 +162,7 @@ def drive_infos():
 def tmp_config(monkeypatch):
     # the Drive class use those two tunables as class constants.
     monkeypatch.setattr(Drive, 'VOLWM_CHUNK_SIZE', CHUNK_SIZE)
-    monkeypatch.setattr(Drive, 'VOLWM_FREE_PCT', CHUNK_PCT)
+    monkeypatch.setattr(Drive, 'VOLWM_FREE_PCT', FREE_PCT)
 
 
 def allocation_threshold_for_resize_mb(block_info, drive):
@@ -199,7 +204,8 @@ def test_extend(tmp_config):
     drv = drives[1]
 
     # first run: does nothing but set the block thresholds
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
+    assert drv.threshold_state == BLOCK_THRESHOLD.SET
 
     # Simulate writing to drive vdb
     vdb = vm.block_stats[2]
@@ -214,23 +220,18 @@ def test_extend(tmp_config):
     vm.volume_monitor.on_block_threshold(
         'vdb', '/virtio/1', alloc, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.SET
+    assert len(vm.cif.irs.extensions) == 0
 
     # Simulating block threshold event
     vm.volume_monitor.on_block_threshold(
         'vdb[1]', '/virtio/1', alloc, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
-
-    # Simulating periodic check
-    extended = vm.monitor_volumes()
-    assert extended is True
     assert len(vm.cif.irs.extensions) == 1
     check_extension(vdb, drives[1], vm.cif.irs.extensions[0])
     assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
 
     # Simulate completed extend operation, invoking callback
-
     simulate_extend_callback(vm.cif.irs, extension_id=0)
-
     assert drv.threshold_state == BLOCK_THRESHOLD.SET
 
 
@@ -239,7 +240,7 @@ def test_extend_no_allocation(tmp_config):
     drives = vm.getDiskDevices()
 
     # first run: does nothing but set the block thresholds
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
 
     # Simulate writing to drive vdb
     vdb = vm.block_stats[2]
@@ -254,13 +255,26 @@ def test_extend_no_allocation(tmp_config):
     vm.volume_monitor.on_block_threshold(
         'vdb[1]', '/virtio/1', 0, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
-
-    # Simulating periodic check
-    extended = vm.monitor_volumes()
-    assert extended is True
     assert len(vm.cif.irs.extensions) == 1
     check_extension(vdb, drives[1], vm.cif.irs.extensions[0])
     assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
+
+
+def test_extend_improbable_allocation(tmp_config):
+    vm = FakeVM(drive_infos())
+    drive = vm.getDiskDevices()[0]
+
+    # Fake an improbable allocation value.
+    vdb = vm.block_stats[2]
+    next_vol_size = drive.getNextVolumeSize(vdb["physical"], vdb["capacity"])
+    vdb['allocation'] = next_vol_size + 1
+
+    # Monitoring should raise and pause the VM.
+    with pytest.raises(thinp.ImprobableAllocationError):
+        vm.volume_monitor.monitor_volumes()
+
+    assert vm._lastStatus == vmstatus.PAUSED
+    assert vm.pause_code == "EOTHER"
 
 
 @pytest.mark.parametrize("drive_info,expected_state,threshold", [
@@ -270,7 +284,7 @@ def test_extend_no_allocation(tmp_config):
     pytest.param(
         (
             drive_config(format='cow', diskType=DISK_TYPE.FILE),
-            block_info(),
+            block_info(allocation=1 * GiB, physical=1 * GiB),
         ),
         BLOCK_THRESHOLD.UNSET,
         None,
@@ -280,7 +294,7 @@ def test_extend_no_allocation(tmp_config):
     pytest.param(
         (
             drive_config(format='raw', diskType=DISK_TYPE.BLOCK),
-            block_info(physical=4 * GiB),
+            block_info(physical=10 * GiB),
         ),
         BLOCK_THRESHOLD.UNSET,
         None,
@@ -290,7 +304,7 @@ def test_extend_no_allocation(tmp_config):
     pytest.param(
         (
             drive_config(format='raw', diskType=DISK_TYPE.FILE),
-            block_info(physical=4 * GiB),
+            block_info(allocation=1 * GiB, physical=10 * GiB),
         ),
         BLOCK_THRESHOLD.UNSET,
         None,
@@ -300,7 +314,7 @@ def test_extend_no_allocation(tmp_config):
     pytest.param(
         (
             drive_config(format='raw', diskType=DISK_TYPE.NETWORK),
-            block_info(physical=4 * GiB),
+            block_info(physical=10 * GiB),
         ),
         BLOCK_THRESHOLD.UNSET,
         None,
@@ -318,7 +332,7 @@ def test_extend_no_allocation(tmp_config):
                     'size': 2 * GiB,
                 },
             ),
-            block_info(allocation=2 * GiB, physical=2 * GiB),
+            block_info(allocation=2 * GiB, physical=5 * GiB),
         ),
         BLOCK_THRESHOLD.UNSET,
         None,
@@ -333,27 +347,26 @@ def test_extend_no_allocation(tmp_config):
                 diskReplicate={
                     'format': 'cow',
                     'diskType': DISK_TYPE.BLOCK,
-                    'size': 2 * GiB,
+                    # We extended once by 2 chunks.
+                    'size': int(7.5 * GiB),
                 },
             ),
             # Libvirt reports same allocation and physical for files, so
             # we take the physical value from the replica.
-            block_info(allocation=750 * MiB, physical=750 * MiB),
+            block_info(allocation=1 * GiB, physical=1 * GiB),
         ),
         BLOCK_THRESHOLD.SET,
-        # During replication we use 2 * GiB chunk size instead of 1 GiB.
-        # With 50% utilization, we set the threshold to 1 GiB.
-        1 * GiB,
+        int(3.5 * GiB),
         id="replicate-to-block",
     ),
 
     pytest.param(
         (
             drive_config(format='cow', diskType=DISK_TYPE.BLOCK),
-            block_info(allocation=1 * GiB, physical=2 * GiB),
+            block_info(allocation=1 * GiB, physical=5 * GiB),
         ),
         BLOCK_THRESHOLD.SET,
-        1536 * MiB,
+        3 * GiB,
         id="cow-block",
     ),
 
@@ -365,13 +378,14 @@ def test_extend_no_allocation(tmp_config):
                 diskReplicate={
                     'format': 'cow',
                     'diskType': DISK_TYPE.BLOCK,
-                    'size': 3 * GiB,
+                    'size': 5 * GiB,
                 },
             ),
-            block_info(allocation=1 * GiB, physical=3 * GiB),
+            block_info(allocation=750 * MiB, physical=5 * GiB),
         ),
         BLOCK_THRESHOLD.SET,
-        2 * GiB,
+        # During replication we use 2 * chunk size.
+        1 * GiB,
         id="cow-block-replicate-to-cow-block",
     ),
 
@@ -383,13 +397,14 @@ def test_extend_no_allocation(tmp_config):
                 diskReplicate={
                     'format': 'cow',
                     'diskType': DISK_TYPE.FILE,
-                    'size': 3 * GiB,
+                    'size': 750 * MiB,
                 },
             ),
-            block_info(allocation=1 * GiB, physical=3 * GiB),
+            block_info(allocation=750 * MiB, physical=5 * GiB),
         ),
         BLOCK_THRESHOLD.SET,
-        2 * GiB,
+        # During replication we use 2 * chunk size.
+        1 * GiB,
         id="cow-block-replicate-to-cow-file",
     ),
 ])
@@ -410,7 +425,7 @@ def test_set_new_threshold_when_state_unset(
     assert vda.threshold_state == BLOCK_THRESHOLD.UNSET
 
     # first run: does nothing but set the block thresholds
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
 
     assert vda.threshold_state == expected_state
     if threshold is not None:
@@ -429,7 +444,7 @@ def test_set_new_threshold_when_state_unset_but_fails(tmp_config):
         libvirt.VIR_ERR_OPERATION_FAILED, "fake error")
 
     # first run: does nothing but set the block thresholds
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
 
     for drive in drives:
         assert drive.threshold_state == BLOCK_THRESHOLD.UNSET
@@ -440,13 +455,13 @@ def test_monitor_all_drives_set(tmp_config):
     drives = vm.getDiskDevices()
 
     # first run: does nothing but set the block thresholds
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
 
     assert drives[0].threshold_state == BLOCK_THRESHOLD.SET
     assert drives[1].threshold_state == BLOCK_THRESHOLD.SET
 
     # Next call should skip both drives.
-    assert not vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
     assert len(vm.cif.irs.extensions) == 0
 
 
@@ -466,7 +481,7 @@ def test_force_drive_threshold_state_exceeded(tmp_config):
     vda['allocation'] = allocation_threshold_for_resize_mb(
         vda, drives[0]) + 1 * MiB
 
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
 
     # forced to exceeded by monitor_volumes() even if no
     # event received.
@@ -482,8 +497,6 @@ def test_event_received_before_write_completes(tmp_config):
     # is possible that at the time we receive the event the
     # the write was not completed yet, or failed, and the
     # volume size is still bellow the threshold.
-    # We will not extend the drive, but keep it marked for
-    # extension.
     vm = FakeVM(drive_infos())
     drives = vm.getDiskDevices()
 
@@ -502,17 +515,14 @@ def test_event_received_before_write_completes(tmp_config):
     vm.volume_monitor.on_block_threshold(
         'vda', '/virtio/0', alloc, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.UNSET
+    assert len(vm.cif.irs.extensions) == 0
 
     # Simulating block threshold event
     vm.volume_monitor.on_block_threshold(
         'vda[0]', '/virtio/0', alloc, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
-
-    vm.monitor_volumes()
-
-    # The threshold state is correctly kept as exceeded, so extension
-    # will be tried again next cycle.
-    assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
+    assert len(vm.cif.irs.extensions) == 1
+    check_extension(vda, drives[0], vm.cif.irs.extensions[0])
 
 
 def test_block_threshold_set_failure_after_drive_extended(tmp_config):
@@ -520,7 +530,7 @@ def test_block_threshold_set_failure_after_drive_extended(tmp_config):
     drives = vm.getDiskDevices()
 
     # first run: does nothing but set the block thresholds
-    vm.monitor_volumes()
+    vm.volume_monitor.monitor_volumes()
 
     # Simulate write on drive vdb
     vdb = vm.block_stats[2]
@@ -541,25 +551,118 @@ def test_block_threshold_set_failure_after_drive_extended(tmp_config):
     vm.volume_monitor.on_block_threshold(
         'vdb', '/virtio/1', alloc, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.SET
+    assert len(vm.cif.irs.extensions) == 0
 
     # Simulating block threshold event
     vm.volume_monitor.on_block_threshold(
         'vdb[1]', '/virtio/1', alloc, 1 * MiB)
     assert drv.threshold_state == BLOCK_THRESHOLD.EXCEEDED
-
-    # Simulating periodic check
-    vm.monitor_volumes()
     assert len(vm.cif.irs.extensions) == 1
 
-    # Simulate completed extend operation, invoking callback
-
-    # Simulate setBlockThreshold failure
+    # Simulate completed extend operation, failing to set block threshold.
     vm._dom.errors["setBlockThreshold"] = fake.Error(
         libvirt.VIR_ERR_OPERATION_FAILED, "fake error")
 
     simulate_extend_callback(vm.cif.irs, extension_id=0)
-
     assert drv.threshold_state == BLOCK_THRESHOLD.UNSET
+
+
+def test_exceeded_max_size(tmp_config):
+    vm = FakeVM(drive_infos())
+    drive = vm.getDiskDevices()[1]
+    vdb = vm.block_stats[2]
+
+    # Simulate drive extended to maximum size after guest reached block
+    # threshold at 8 GiB.
+    vdb["allocation"] = 8 * GiB
+    vdb["capacity"] = 10 * GiB
+    vdb["physical"] = 11 * GiB
+
+    # first run: does nothing but set the block threshold.
+    vm.volume_monitor.monitor_volumes()
+
+    # Simulate block threshold event when guest write to new threshold.
+    alloc = allocation_threshold_for_resize_mb(vdb, drive) + 1
+    vdb["allocation"] = alloc
+    vm.volume_monitor.on_block_threshold('vdb[1]', '/virtio/1', alloc, 1)
+
+    # Because the drive is already extended, disable monitoring.
+    assert drive.threshold_state == BLOCK_THRESHOLD.DISABLED
+
+    # And no extesion request should be sent.
+    assert len(vm.cif.irs.extensions) == 0
+
+    # Next monitoring cycle will not modify the drive.
+    vm.volume_monitor.monitor_volumes()
+    assert drive.threshold_state == BLOCK_THRESHOLD.DISABLED
+    assert len(vm.cif.irs.extensions) == 0
+
+
+def test_resize_maxed_drive(tmp_config):
+    vm = FakeVM(drive_infos())
+    drive = vm.getDiskDevices()[1]
+    vdb = vm.block_stats[2]
+
+    # Simulate drive extended to maximum size.
+    vdb["allocation"] = 9 * GiB + 1
+    vdb["capacity"] = 10 * GiB
+    vdb["physical"] = 11 * GiB
+    drive.threshold_state = BLOCK_THRESHOLD.DISABLED
+
+    # first run: does nothing, drive is disabled.
+    vm.volume_monitor.monitor_volumes()
+    assert drive.threshold_state == BLOCK_THRESHOLD.DISABLED
+
+    # Simulate resizing drive to 15 GiB.
+    vdb["capacity"] = 15 * GiB
+    drive.threshold_state = BLOCK_THRESHOLD.UNSET
+
+    # Simulate the next monitoring cycle.
+    vm.volume_monitor.monitor_volumes()
+
+    # Since drive already exceeded, mark it as exceeded.
+    assert drive.threshold_state == BLOCK_THRESHOLD.EXCEEDED
+
+    # And extned to next size.
+    assert len(vm.cif.irs.extensions) == 1
+
+
+def test_skip_extend_if_extend_in_progress(tmp_config):
+    vm = FakeVM(drive_infos())
+    drive = vm.getDiskDevices()[1]
+
+    # Simulate a drive that was extended recently.
+    drive.extend_time = time.monotonic() - EXTEND_TIMEOUT / 2
+    drive.threshold_state = BLOCK_THRESHOLD.EXCEEDED
+
+    # Simulating periodic check skip the extend since the previous extend is in
+    # progress.
+    vm.volume_monitor.monitor_volumes()
+    assert vm.cif.irs.extensions == []
+
+    # If enough time passed since the last extend, trigger a new extend.
+    drive.extend_time = time.monotonic() - EXTEND_TIMEOUT
+    vm.volume_monitor.monitor_volumes()
+    assert len(vm.cif.irs.extensions) == 1
+
+
+def test_dont_skip_if_drive_needs_extend(tmp_config):
+    vm = FakeVM(drive_infos())
+    drive = vm.getDiskDevices()[1]
+
+    # Simulate a drive that was extended recently.
+    drive.extend_time = time.monotonic() - EXTEND_TIMEOUT / 2
+
+    # But setting block threshold after the extend failed.
+    drive.threshold_state = BLOCK_THRESHOLD.UNSET
+
+    # And the guest wrote after the threshold.
+    vdb = vm.block_stats[2]
+    vdb["allocation"] = allocation_threshold_for_resize_mb(vdb, drive) + 1
+
+    # Simulating periodic check should ignore the time since the last extend
+    # and extend again immediately.
+    vm.volume_monitor.monitor_volumes()
 
 
 class FakeVM(Vm):
@@ -570,7 +673,12 @@ class FakeVM(Vm):
         self._dom = FakeDomain()
         self.cif = FakeClientIF(FakeIRS())
         self.id = 'volume_monitor_vm'
-        self.volume_monitor = thinp.VolumeMonitor(self, self.log)
+
+        # Simplify testing by dispatching on the calling thread.
+        self.volume_monitor = thinp.VolumeMonitor(
+            self, self.log,
+            dispatch=lambda func, **kw: func())
+
         self.block_stats = {}
 
         disks = []
@@ -629,7 +737,7 @@ class FakeDomain(object):
         self.thresholds = {}
 
     # The following is needed in the 'pause' flow triggered
-    # by the ImprobableResizeRequestError
+    # by the ImprobableAllocationError.
 
     def XMLDesc(self, flags=0):
         domain = etree.Element("domain")

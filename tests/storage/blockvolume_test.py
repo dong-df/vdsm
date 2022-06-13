@@ -23,8 +23,7 @@ from __future__ import division
 
 from contextlib import contextmanager
 
-import pytest
-
+from vdsm import utils
 from vdsm.common.units import MiB, GiB
 from vdsm.storage import blockVolume
 from vdsm.storage import constants as sc
@@ -39,8 +38,6 @@ from storage.storagetestlib import (
     fake_env,
     make_qemu_chain,
 )
-
-from . import qemuio
 
 from testlib import make_config
 from testlib import make_uuid
@@ -112,17 +109,19 @@ class TestBlockVolumeSize(VdsmTestCase):
 class TestBlockVolumeManifest(VdsmTestCase):
 
     @contextmanager
-    def make_volume(self, size, storage_type='block', format=sc.RAW_FORMAT):
+    def make_volume(self, size, format=sc.RAW_FORMAT, prealloc=sc.SPARSE_VOL):
         img_id = make_uuid()
         vol_id = make_uuid()
         # TODO fix make_volume helper to create the qcow image when needed
-        with fake_env(storage_type) as env:
+        with fake_env(storage_type='block') as env:
             if format == sc.RAW_FORMAT:
-                env.make_volume(size, img_id, vol_id, vol_format=format)
+                env.make_volume(
+                    size, img_id, vol_id, vol_format=format, prealloc=prealloc)
                 vol = env.sd_manifest.produceVolume(img_id, vol_id)
                 yield vol
             else:
-                chain = make_qemu_chain(env, size, format, 1)
+                chain = make_qemu_chain(
+                    env, size, format, chain_len=1, prealloc=prealloc)
                 yield chain[0]
 
     def test_max_size_raw(self):
@@ -142,33 +141,42 @@ class TestBlockVolumeManifest(VdsmTestCase):
             self.assertEqual(vol.optimal_size(), GiB)
 
     @MonkeyPatch(blockVolume, 'config', CONFIG)
-    def test_optimal_size_cow_leaf_empty(self):
-        # verify optimal size equals to actual size + one chunk.
-        with self.make_volume(size=GiB, format=sc.COW_FORMAT) as vol:
+    def test_optimal_size_cow_leaf(self):
+        # Optimal size calculated using actual size and chunk size.
+        with self.make_volume(size=2 * GiB, format=sc.COW_FORMAT) as vol:
             chunk_size = GiB
             check = qemuimg.check(vol.getVolumePath(), qemuimg.FORMAT.QCOW2)
-            actual_size = check['offset'] + chunk_size
-            self.assertEqual(vol.optimal_size(), actual_size)
+            optimal_size = utils.round(
+                check['offset'] + chunk_size, vol.align_size)
+            self.assertEqual(vol.optimal_size(), optimal_size)
+            self.assertEqual(
+                vol.optimal_cow_size(check["offset"], 2 * GiB, vol.isLeaf()),
+                optimal_size)
 
-    @pytest.mark.slow
     @MonkeyPatch(blockVolume, 'config', CONFIG)
-    def test_optimal_size_cow_leaf_not_empty(self):
-        # verify that optimal size is limited to max size.
-        with self.make_volume(size=GiB, format=sc.COW_FORMAT) as vol:
-            qemuio.write_pattern(
-                path=vol.volumePath,
-                format=sc.fmt2str(vol.getFormat()),
-                len=200 * MiB)
-            max_size = vol.max_size(GiB, vol.getFormat())
+    def test_optimal_size_cow_leaf_max(self):
+        # Optimal size is limited to maximum size.
+        size = 512 * MiB
+        with self.make_volume(size=size, format=sc.COW_FORMAT) as vol:
+            max_size = vol.max_size(size, vol.getFormat())
             self.assertEqual(vol.optimal_size(), max_size)
+            check = qemuimg.check(vol.getVolumePath(), qemuimg.FORMAT.QCOW2)
+            self.assertEqual(
+                vol.optimal_cow_size(check["offset"], 512 * MiB, vol.isLeaf()),
+                max_size)
 
     @permutations([
-        # actual_size, optimal_size
-        (200 * MiB, 256 * MiB),
-        (1023 * MiB, 1024 * MiB),
-        (1024 * MiB, 1024 * MiB + blockVolume.MIN_PADDING),
+        # virtual_size, actual_size, optimal_size
+        # Limited by max size.
+        (512 * MiB, 200 * MiB, 256 * MiB),
+        # Empty qcow2 image - align to extent size.
+        (2 * GiB, 262144, sc.VG_EXTENT_SIZE),
+        # Align to extent size.
+        (2 * GiB, 1023 * MiB, 1024 * MiB),
+        (2 * GiB, 1024 * MiB, 1024 * MiB),
     ])
-    def test_optimal_size_cow_internal(self, actual_size, optimal_size):
+    def test_optimal_size_cow_internal(
+            self, virtual_size, actual_size, optimal_size):
         def fake_check(path, format):
             return {'offset': actual_size}
 
@@ -177,8 +185,25 @@ class TestBlockVolumeManifest(VdsmTestCase):
             # fake qemuimg check to return big volumes size, instead of writing
             # big data to volumes, an operation that takes long time.
             with MonkeyPatchScope([(qemuimg, 'check', fake_check)]):
-                env.chain = make_qemu_chain(env, actual_size, sc.COW_FORMAT, 3)
-                self.assertEqual(env.chain[1].optimal_size(), optimal_size)
+                env.chain = make_qemu_chain(
+                    env, virtual_size, sc.COW_FORMAT, 3)
+                vol = env.chain[1]
+                self.assertEqual(vol.optimal_size(), optimal_size)
+                self.assertEqual(
+                    vol.optimal_cow_size(
+                        actual_size, virtual_size, vol.isLeaf()),
+                    optimal_size)
+
+    @MonkeyPatch(blockVolume, 'config', CONFIG)
+    def test_optimal_size_cow_internal_as_leaf(self):
+        def fake_check(path, format):
+            return {'offset': 512 * MiB}
+
+        with fake_env('block') as env:
+            with MonkeyPatchScope([(qemuimg, 'check', fake_check)]):
+                env.chain = make_qemu_chain(env, 3 * GiB, sc.COW_FORMAT, 3)
+                vol = env.chain[1]
+                self.assertEqual(vol.optimal_size(as_leaf=True), 1536 * MiB)
 
     @permutations([
         # capacity, virtual_size, expected_capacity
@@ -196,3 +221,17 @@ class TestBlockVolumeManifest(VdsmTestCase):
 
             vol.updateInvalidatedSize()
             assert vol.getMetadata().capacity == expected_capacity
+
+    @permutations([
+        # format, prealloc, can_reduce
+        # Raw or preallocated disks cannot be reduced.
+        (sc.RAW_FORMAT, sc.PREALLOCATED_VOL, False),
+        (sc.COW_FORMAT, sc.PREALLOCATED_VOL, False),
+        # Cow sparse can be reduced.
+        (sc.COW_FORMAT, sc.SPARSE_VOL, True),
+        # Raw sparse is an invalid combination.
+    ])
+    def test_can_reduce(self, format, prealloc, can_reduce):
+        with self.make_volume(
+                size=GiB, format=format, prealloc=prealloc) as vol:
+            assert vol.can_reduce() == can_reduce

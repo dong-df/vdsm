@@ -35,16 +35,12 @@ from vdsm.storage import exception as se
 from vdsm.storage import lvm
 from vdsm.storage import qemuimg
 from vdsm.storage import resourceManager as rm
-from vdsm.storage import task
 from vdsm.storage import volume
 from vdsm.storage.sdc import sdCache
 from vdsm.storage.volumemetadata import VolumeMetadata
 
 
 QCOW_OVERHEAD_FACTOR = 1.1
-
-# Minimal padding to be added to internal volume optimal size.
-MIN_PADDING = MiB
 
 log = logging.getLogger('storage.volume')
 
@@ -69,6 +65,9 @@ class BlockVolumeManifest(volume.VolumeManifest):
 
     def chunked(self):
         return self.getFormat() == sc.COW_FORMAT
+
+    def can_reduce(self):
+        return self.chunked() and self.getType() == sc.SPARSE_VOL
 
     def getMetadataId(self):
         """
@@ -400,56 +399,65 @@ class BlockVolumeManifest(volume.VolumeManifest):
             if pvolUUID != sc.BLANK_UUID:
                 cls.teardown(sdUUID=sdUUID, volUUID=pvolUUID, justme=False)
 
-    def optimal_size(self):
+    @classmethod
+    def optimal_cow_size(cls, required_size, capacity, is_leaf):
         """
-        Return the optimal size of the volume.
+        Return the optimal size for a volume based on the required allocation,
+        volume capacity, and volume type.
 
-        Returns:
-            optimal size is the minimum of the volume maximum size and the
-            volume actual size plus padding. For leaf volumes, the padding
-            is one chunk, and for internal volumes the padding is
-            `MIN_PADDING`.
-            Size is returned in bytes.
+        This is a class method so we can use this calculation for the base
+        volume during merge, using the mesured size for the merged instead of
+        the actual volume size.
+        """
+        # Add free space.
+        if is_leaf:
+            # For leaf volumes, add one chunk of free space so the VM
+            # will not pause quickly when it is started.
+            free_space = config.getint(
+                "irs", "volume_utilization_chunk_mb") * MiB
+            optimal_size = required_size + free_space
+        else:
+            # For internal volumes, use the required size. It cannot be zero
+            # since it includes qcow2 metadata.
+            assert required_size > 0
+            optimal_size = required_size
 
-        Note:
-            the volume must be prepared when calling this helper.
+        # Align to align_size (lvm extent size) so callers can compare optimal
+        # size with the actual size of the logical volume.
+        optimal_size = utils.round(optimal_size, cls.align_size)
+
+        # Limit by maximum size.
+        max_size = cls.max_size(capacity, sc.COW_FORMAT)
+        optimal_size = min(optimal_size, max_size)
+
+        cls.log.debug(
+            "COW format, required_size=%s max_size=%s optimal_size=%s",
+            required_size, max_size, optimal_size)
+
+        return optimal_size
+
+    def optimal_size(self, as_leaf=False):
+        """
+        Return the optimal size of the volume, based on actual allocation.
+
+        If as_leaf is True, calculate the optimal size as if this volume is a
+        leaf. This is used when calculating the optimal size for the base
+        volume after a merge, before the top volume is deleted and the base
+        volume becomes the leaf.
+
+        NOTE: The volume must be prepared so we can check the actual
+        allocation.
         """
         if self.getFormat() == sc.RAW_FORMAT:
             virtual_size = self.getCapacity()
             self.log.debug("RAW format, using virtual size: %s", virtual_size)
             return virtual_size
-
-        # Read actual size.
-        check = qemuimg.check(self.getVolumePath(), qemuimg.FORMAT.QCOW2)
-        actual_size = check['offset']
-
-        # Add padding.
-        if self.isLeaf():
-            # For leaf volumes, the padding is one chunk.
-            chnuk_size_mb = int(config.get("irs",
-                                           "volume_utilization_chunk_mb"))
-            padding = chnuk_size_mb * MiB
-            self.log.debug("Leaf volume, using padding: %s", padding)
-
-            potential_optimal_size = actual_size + padding
-
         else:
-            # For internal volumes, using minimal padding.
-            padding = MIN_PADDING
-            self.log.debug("Internal volume, using padding: %s", padding)
-
-            potential_optimal_size = actual_size + padding
-
-            # Limit optimal size to the minimal volume size.
-            potential_optimal_size = max(sc.MIN_CHUNK, potential_optimal_size)
-
-        # Limit optimal size by maximum size.
-        max_size = self.max_size(self.getCapacity(), self.getFormat())
-        optimal_size = min(potential_optimal_size, max_size)
-        self.log.debug("COW format, actual_size: %s, max_size: %s, "
-                       "optimal_size: %s",
-                       actual_size, max_size, optimal_size)
-        return optimal_size
+            check = qemuimg.check(self.getVolumePath(), qemuimg.FORMAT.QCOW2)
+            return self.optimal_cow_size(
+                check['offset'],
+                self.getCapacity(),
+                self.isLeaf() or as_leaf)
 
 
 class BlockVolume(volume.Volume):
@@ -683,47 +691,6 @@ class BlockVolume(volume.Volume):
                       self.imgUUID, self.sdUUID, new_size, allowActive)
         sizemb = utils.round(new_size, MiB) // MiB
         lvm.reduceLV(self.sdUUID, self.volUUID, sizemb, force=allowActive)
-
-    @classmethod
-    def renameVolumeRollback(cls, taskObj, sdUUID, oldUUID, newUUID):
-        try:
-            cls.log.info("renameVolumeRollback: sdUUID=%s oldUUID=%s "
-                         "newUUID=%s", sdUUID, oldUUID, newUUID)
-            lvm.renameLV(sdUUID, oldUUID, newUUID)
-        except Exception:
-            cls.log.error("Failure in renameVolumeRollback: sdUUID=%s "
-                          "oldUUID=%s newUUID=%s", sdUUID, oldUUID, newUUID,
-                          exc_info=True)
-
-    def rename(self, newUUID, recovery=True):
-        """
-        Rename volume
-        """
-        self.log.info("Rename volume %s as %s ", self.volUUID, newUUID)
-        if not self.imagePath:
-            self._manifest.validateImagePath()
-
-        if os.path.lexists(self.getVolumePath()):
-            self.log.info("Unlinking volume symlink %r", self.getVolumePath())
-            os.unlink(self.getVolumePath())
-
-        if recovery:
-            name = "Rename volume rollback: " + newUUID
-            vars.task.pushRecovery(task.Recovery(
-                name, "blockVolume", "BlockVolume", "renameVolumeRollback",
-                [self.sdUUID, newUUID, self.volUUID]))
-
-        # Save the metadaId before renaming the LV, because getMetadataId()
-        # uses the volume UUID and we need the metadataId before perform the
-        # rename.
-        metadataId = self.getMetadataId()
-
-        lvm.renameLV(self.sdUUID, self.volUUID, newUUID)
-
-        self.renameLease(metadataId, newUUID, recovery=recovery)
-
-        self._manifest.volUUID = newUUID
-        self._manifest.volumePath = os.path.join(self.imagePath, newUUID)
 
     def getDevPath(self):
         return self._manifest.getDevPath()

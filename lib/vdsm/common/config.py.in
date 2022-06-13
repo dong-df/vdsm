@@ -1,5 +1,5 @@
 #
-# Copyright 2011-2021 Red Hat, Inc.
+# Copyright 2011-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -80,7 +80,17 @@ parameters = [
 
         ('migration_listener_timeout', '30',
             'Time to wait (in seconds) for migration destination to start '
-            'listening before migration begins.'),
+            'listening before migration begins. The timeout may be prolonged '
+            'automatically to account for system or VM status, up to '
+            'max_migration_listener_timeout.'),
+
+        ('max_migration_listener_timeout', '600',
+            'Maximum time to wait (in seconds) for migration destination to '
+            'start listening before migration begins.'),
+
+        ('migration_listener_prepare_disk_timeout', '2.0',
+            'Time (in seconds) to prolong migration_listener_timeout per each '
+            'disk needing modifying udev rules.'),
 
         ('migration_max_bandwidth', '52',
             'Local VDSM setting of the maximum bandwidth for sending '
@@ -428,6 +438,42 @@ parameters = [
             '(default 20)'),
     ]),
 
+    # Section: [mailbox]
+    ('mailbox', [
+
+        ('events_enable', 'true',
+            'If enabled, hosts use storage events to signal the SPM '
+            'when sending an extend request, and the SPM uses storage '
+            'events to detect extend requests quickly. Enabling events '
+            'decreases the time to extend a thin volume and lowers the '
+            'risk of pausing virtual machines when a thin volume is '
+            'extended automatically. (default true)'),
+
+        ('events_interval', '0.5',
+            'Interval in seconds between mailbox events checks. '
+            'Shorter interval decreases the time to extend a volume, '
+            'but increases CPU usage and I/O to the inbox special volume '
+            'on the SPM, and to the outbox special volume on other hosts. '
+            '(default 0.5)'),
+    ]),
+
+    # Section: [thinp]
+    ('thinp', [
+
+        ('monitor_timeout', '0.5',
+            'Time in seconds to wait for drive monitor lock during periodic '
+            'monitoring. On timeout, the drive will be monitored in the '
+            'next monitoring cycle. (default 0.5)'),
+
+        ('extend_timeout', '2.0',
+            'Time in seconds to wait for extend completion during periodic '
+            'monitoring before retrying to extend. (default 2.0)'),
+
+        ('refresh_timeout', '60.0',
+            'Time in seconds to wait for drive monitor lock when refreshing '
+            'a volume after extend completed. (default 60.0)'),
+    ]),
+
     # Section: [multipath]
     ('multipath', [
 
@@ -709,6 +755,9 @@ parameters = [
         ('qga_disk_info_period', '300',
             'Period (in sec) for gathering filesystem information and disk'
             ' mapping.'),
+
+        ('qga_cpu_info_period', '60',
+            'Period (in sec) for gathering information about CPUs.'),
 
     ]),
 ]

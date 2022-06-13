@@ -346,6 +346,29 @@ class DriveXMLTests(XMLTestCase):
             """
         self.check(conf, xml)
 
+    def test_reservations(self):
+        conf = drive_config(
+            device='lun',
+            iface='scsi',
+            path='/dev/mapper/lun1',
+            serial='54-a672-23e5b495a9ea',
+            sgio='unfiltered',
+            diskType=DISK_TYPE.BLOCK,
+            managed_reservation=True,
+        )
+        xml = """
+            <disk device="lun" sgio="unfiltered" snapshot="no" type="block">
+                <source dev="/dev/mapper/lun1">
+                    <reservations managed='yes' />
+                    <seclabel model="dac" relabel="no" type="none" />
+                </source>
+                <target bus="scsi" dev="sda"/>
+                <driver cache="none" error_policy="stop"
+                        io="native" name="qemu" type="raw"/>
+            </disk>
+            """
+        self.check(conf, xml)
+
     def check(self, device_conf, xml):
         drive = Drive(self.log, **device_conf)
         self.assertXMLEqual(xmlutils.tostring(drive.getXML()), xml)
@@ -603,8 +626,8 @@ class DriveDiskTypeTests(VdsmTestCase):
         drive.path = '/new/path'
         assert drive.threshold_state == BLOCK_THRESHOLD.UNSET
 
-    def test_block_threshold_set_state(self):
-        path = '/old/path'
+    def test_on_block_threshold_set(self):
+        path = '/path'
         conf = drive_config(diskType=DISK_TYPE.BLOCK, path=path)
         drive = Drive(self.log, **conf)
         drive.threshold_state = BLOCK_THRESHOLD.SET
@@ -612,13 +635,47 @@ class DriveDiskTypeTests(VdsmTestCase):
         drive.on_block_threshold(path)
         assert drive.threshold_state == BLOCK_THRESHOLD.EXCEEDED
 
-    def test_block_threshold_stale_path(self):
+    def test_on_block_threshold_set_stale_path(self):
         conf = drive_config(diskType=DISK_TYPE.BLOCK, path='/new/path')
         drive = Drive(self.log, **conf)
         drive.threshold_state = BLOCK_THRESHOLD.SET
 
         drive.on_block_threshold('/old/path')
         assert drive.threshold_state == BLOCK_THRESHOLD.SET
+
+    def test_on_block_threshold_exceeded(self):
+        path = '/path'
+        conf = drive_config(diskType=DISK_TYPE.BLOCK, path=path)
+        drive = Drive(self.log, **conf)
+        drive.threshold_state = BLOCK_THRESHOLD.EXCEEDED
+
+        # When exceeded, call does nothing.
+        drive.on_block_threshold(path)
+
+    def test_on_enospc_unset(self):
+        conf = drive_config(diskType=DISK_TYPE.BLOCK)
+        drive = Drive(self.log, **conf)
+        drive.threshold_state = BLOCK_THRESHOLD.UNSET
+
+        drive.on_enospc()
+        assert drive.threshold_state == BLOCK_THRESHOLD.EXCEEDED
+
+    def test_on_enospc_set(self):
+        conf = drive_config(diskType=DISK_TYPE.BLOCK)
+        drive = Drive(self.log, **conf)
+        drive.threshold_state = BLOCK_THRESHOLD.SET
+
+        drive.on_enospc()
+        assert drive.threshold_state == BLOCK_THRESHOLD.EXCEEDED
+
+    def test_on_enospc_exceeded(self):
+        conf = drive_config(diskType=DISK_TYPE.BLOCK)
+        drive = Drive(self.log, **conf)
+        drive.threshold_state = BLOCK_THRESHOLD.EXCEEDED
+
+        # When exceeded, call does nothing.
+        drive.on_enospc()
+        assert drive.threshold_state == BLOCK_THRESHOLD.EXCEEDED
 
 
 def test_drive_exceeded_time(monkeypatch):

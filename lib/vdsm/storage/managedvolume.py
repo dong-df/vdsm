@@ -56,6 +56,17 @@ from vdsm.storage import managedvolumedb
 HELPER = '/usr/libexec/vdsm/managedvolume-helper'
 DEV_MAPPER = "/dev/mapper"
 DEV_RBD = "/dev/rbd"
+VOLUME_LINK_DIR = "/run/vdsm/managedvolumes/"
+
+# Drivers that have been tested and are known to work.
+SUPPORTED_DRIVERS = (
+    # Drivers tested by the oVirt team
+    "rbd",
+    "iscsi",
+
+    # Tested by Muli Ben-Yehuda <info (at) lightbitslabs.com>
+    "lightos",
+)
 
 log = logging.getLogger("storage.managedvolume")
 
@@ -85,7 +96,7 @@ def connector_info():
 
 
 @requires_os_brick
-def attach_volume(vol_id, connection_info):
+def attach_volume(sd_id, vol_id, connection_info):
     """
     Attach volume with os-brick.
     """
@@ -107,27 +118,27 @@ def attach_volume(vol_id, connection_info):
                     multipath_id=attachment.get("multipath_id"))
                 _invalidate_lvm_devices(attachment)
                 volume_type = connection_info["driver_volume_type"]
-                if volume_type not in ("rbd", "iscsi"):
+                if volume_type not in SUPPORTED_DRIVERS:
                     raise se.UnsupportedOperation(
                         "Unsupported volume type, supported types are: "
-                        "rbd, iscsi")
+                        f"{SUPPORTED_DRIVERS}")
 
-                _add_udev_rule(vol_id, path)
+                run_link = _add_run_link(sd_id, vol_id, path)
+                _add_udev_rule(sd_id, vol_id, path)
             except:
                 _silent_detach(connection_info, attachment)
                 raise
         except:
-            _silent_remove(db, vol_id)
+            _silent_remove(db, sd_id, vol_id)
             raise
-
     log.debug("Attached volume %s attachment=%s", vol_id, attachment)
 
     return {"result": {'attachment': attachment, 'path': path,
-                       'vol_id': vol_id}}
+                       'vol_id': vol_id, 'managed_path': run_link}}
 
 
 @requires_os_brick
-def detach_volume(vol_id):
+def detach_volume(sd_id, vol_id):
     """
     Detach volume with os-brick.
     """
@@ -143,7 +154,8 @@ def detach_volume(vol_id):
         if "path" in vol_info and os.path.exists(vol_info["path"]):
             run_helper("detach", vol_info)
 
-        _remove_udev_rule(vol_info['vol_id'])
+        _remove_udev_rule(sd_id, vol_info['vol_id'])
+        _remove_run_link(sd_id, vol_id)
         db.remove_volume(vol_id)
 
 
@@ -258,14 +270,18 @@ def _invalidate_lvm_devices(attachment):
         lvm.invalidate_devices()
 
 
-def _silent_remove(db, vol_id):
+def _silent_remove(db, sd_id, vol_id):
     """
-    Remove volume from db during cleanup flow, logging errors.
+    Remove volume from db, udev rule and link during cleanup flow, logging
+    errors.
     """
     try:
         db.remove_volume(vol_id)
     except Exception:
         log.exception("Failed to remove managed volume %s from DB", vol_id)
+
+    _remove_udev_rule(sd_id, vol_id)
+    _remove_run_link(sd_id, vol_id)
 
 
 def _silent_detach(connection_info, attachment):
@@ -280,20 +296,45 @@ def _silent_detach(connection_info, attachment):
         log.exception("Failed to detach managed volume %s", vol_info)
 
 
-def _add_udev_rule(vol_id, path):
+def _add_udev_rule(sd_id, vol_id, path):
     proxy = supervdsm.getProxy()
-    proxy.add_managed_udev_rule(vol_id, path)
+    proxy.add_managed_udev_rule(sd_id, vol_id, path)
     try:
         proxy.trigger_managed_udev_rule(path)
     except:
-        _remove_udev_rule(vol_id)
+        _remove_udev_rule(sd_id, vol_id)
         raise
 
 
-def _remove_udev_rule(vol_id):
+def _remove_udev_rule(sd_id, vol_id):
     try:
         proxy = supervdsm.getProxy()
-        proxy.remove_managed_udev_rule(vol_id)
+        proxy.remove_managed_udev_rule(sd_id, vol_id)
     except Exception:
         log.exception(
             "Failed to remove udev rule for volume %s", vol_id)
+
+
+def _add_run_link(sd_id, vol_id, path):
+    _create_run_dir()
+    run_path = _run_link(sd_id, vol_id)
+    os.symlink(path, run_path)
+    return run_path
+
+
+def _remove_run_link(sd_id, vol_id):
+    try:
+        os.remove(_run_link(sd_id, vol_id))
+    except Exception:
+        log.exception("Failed to remove run link for volume %s", vol_id)
+
+
+def _create_run_dir():
+    try:
+        os.mkdir(VOLUME_LINK_DIR)
+    except FileExistsError:
+        pass
+
+
+def _run_link(sd_id, vol_id):
+    return os.path.join(VOLUME_LINK_DIR, f"{sd_id}_{vol_id}")

@@ -37,7 +37,6 @@ import pprint as pp
 import threading
 
 from itertools import chain
-import six
 
 from vdsm import constants
 from vdsm import utils
@@ -300,7 +299,7 @@ def _buildConfig(dev_filter="", use_lvmpolld="1"):
 def normalize_args(args=None):
     if args is None:
         args = []
-    elif isinstance(args, six.string_types):
+    elif isinstance(args, str):
         args = [args]
 
     return args
@@ -506,62 +505,114 @@ class LVMCache(object):
         self._reloadvgs()
         self._loadAllLvs()
 
-    def _reloadpvs(self, pvName=None):
-        cmd = list(PVS_CMD)
+    def _updatepvs_locked(self, pvs_output, pv_names):
+        """
+        Update cached PVs based on the output of the LVM command:
+        - Add new PVs to the cache.
+        - Replace PVs in the cache with PVs reported by the 'pvs' command,
+          updating the PV attributes.
+        - If called without pv names, remove all PVs from the cache not
+          reported by LVM.
+        - If called with pv names, remove specifed PVs from the cache if they
+          were not reported by LVM.
+        Must be called while holding the lock.
+        Return dict of updated PVs.
+        """
+        updated_pvs = {}
+        for line in pvs_output:
+            fields = [field.strip() for field in line.split(SEPARATOR)]
+            if len(fields) != PV_FIELDS_LEN:
+                raise InvalidOutputLine("pvs", line)
 
-        pvNames = normalize_args(pvName)
-        if pvNames:
-            cmd.extend(pvNames)
+            pv = PV.fromlvm(*fields)
+            if pv.name == UNKNOWN:
+                log.error("Missing pv: %s in vg: %s", pv.uuid, pv.vg_name)
+                continue
+            self._pvs[pv.name] = pv
+            updated_pvs[pv.name] = pv
+
+        # Remove stale PVs
+        stale_pvs = [name for name in (pv_names or self._pvs)
+                     if name not in updated_pvs]
+        for name in stale_pvs:
+            if name in self._pvs:
+                log.warning("Removing stale PV %s", name)
+                del self._pvs[name]
+
+        return updated_pvs
+
+    def _update_stale_pvs_locked(self, pv_names):
+        """
+        Check if any PV is stale after an LVM command and make it Unreadable.
+        Log a warning if any PV has been made Unreadable.
+        Must be called while holding the lock.
+        """
+        updated_pvs = {}
+        for p in (pv_names or self._pvs):
+            pv = self._pvs.get(p)
+            if pv and pv.is_stale():
+                pv = Unreadable(pv.name)
+                self._pvs[p] = pv
+                updated_pvs[p] = pv
+
+        if updated_pvs:
+            # This may be a real error (failure to reload existing PV)
+            # or no error at all (failure to reload non-existing PV),
+            # so we cannot make this an error.
+            log.warning(
+                "Marked pvs=%r as Unreadable due to reload failure",
+                logutils.Head(updated_pvs, max_items=20))
+
+        return updated_pvs
+
+    def _reload_single_pv(self, pv_name):
+        """
+        Run LVM 'pvs' command and update PV pv_name.
+        Raise InaccessiblePhysDev if a PV is not updated.
+        Return the updated PV.
+        """
+        cmd = list(PVS_CMD)
+        cmd.append(pv_name)
 
         out, error = self.run_command_error(cmd)
 
         with self._lock:
-            updatedPVs = {}
-
             if error:
-                pvNames = pvNames if pvNames else self._pvs
-                for p in pvNames:
-                    pv = self._pvs.get(p)
-                    if pv and pv.is_stale():
-                        pv = Unreadable(pv.name)
-                        self._pvs[p] = pv
-                        updatedPVs[p] = pv
+                updated_pvs = self._update_stale_pvs_locked([pv_name])
+                if pv_name not in updated_pvs:
+                    raise se.InaccessiblePhysDev.from_error((pv_name,), error)
 
-                if updatedPVs:
-                    # This may be a real error (failure to reload existing PV)
-                    # or no error at all (failure to reload non-existing PV),
-                    # so we cannot make this an error.
-                    log.warning(
-                        "Marked pvs=%r as Unreadable due to reload failure",
-                        logutils.Head(updatedPVs, max_items=20))
+                return updated_pvs[pv_name]
 
-                return updatedPVs
+            updated_pvs = self._updatepvs_locked(out, [pv_name])
+            if pv_name not in updated_pvs:
+                # This should not happen.
+                raise se.InaccessiblePhysDev((pv_name,))
 
-            for line in out:
-                fields = [field.strip() for field in line.split(SEPARATOR)]
-                if len(fields) != PV_FIELDS_LEN:
-                    raise InvalidOutputLine("pvs", line)
+            return updated_pvs[pv_name]
 
-                pv = PV.fromlvm(*fields)
-                if pv.name == UNKNOWN:
-                    log.error("Missing pv: %s in vg: %s", pv.uuid, pv.vg_name)
-                    continue
-                self._pvs[pv.name] = pv
-                updatedPVs[pv.name] = pv
+    def _reloadpvs(self, pv_name=None):
+        """
+        Run LVM 'pvs' command and update all PVs from pv_names.
+        If no PV name is provided, reload all PVs.
+        """
+        pv_names = normalize_args(pv_name)
+        cmd = list(PVS_CMD)
+        cmd.extend(pv_names)
 
-            # Remove stalePVs
-            stalePVs = [name for name in (pvNames or self._pvs)
-                        if name not in updatedPVs]
-            for name in stalePVs:
-                if name in self._pvs:
-                    log.warning("Removing stale PV %s", name)
-                    del self._pvs[name]
+        out, error = self.run_command_error(cmd)
+
+        with self._lock:
+            if error:
+                return self._update_stale_pvs_locked(pv_names)
+
+            updated_pvs = self._updatepvs_locked(out, pv_names)
 
             # If we updated all the PVs drop stale flag
-            if not pvName:
+            if not pv_name:
                 self._stalepv = False
 
-        return updatedPVs
+        return updated_pvs
 
     def _getVGDevs(self, vgNames):
         devices = []
@@ -578,71 +629,126 @@ class LVMCache(object):
                 devices = tuple(devices)
         return devices
 
-    def _reloadvgs(self, vgName=None):
-        cmd = list(VGS_CMD)
+    def _updatevgs_locked(self, vgs_output, vg_names):
+        """
+        Update cached VGs based on the output of the LVM command:
+        - Add new VGs to the cache.
+        - Replace VGs in the cache with VGs reported by the 'vgs' command,
+          updating the VG attributes.
+        - If called without vg names, remove all VGs from the cache not
+          reported by LVM.
+        - If called with vg names, remove specifed VGs from the cache if they
+          were not reported by LVM.
+        Must be called while holding the lock.
+        Return dict of updated VGs.
+        """
+        updatedVGs = {}
+        vgsFields = {}
+        for line in vgs_output:
+            fields = [field.strip() for field in line.split(SEPARATOR)]
+            if len(fields) != VG_FIELDS_LEN:
+                raise InvalidOutputLine("vgs", line)
 
+            uuid = fields[VG._fields.index("uuid")]
+            pvNameIdx = VG._fields.index("pv_name")
+            pv_name = fields[pvNameIdx]
+            if pv_name == UNKNOWN:
+                # PV is missing, e.g. device lost of target not connected
+                continue
+            if uuid not in vgsFields:
+                fields[pvNameIdx] = [pv_name]  # Make a pv_names list
+                vgsFields[uuid] = fields
+            else:
+                vgsFields[uuid][pvNameIdx].append(pv_name)
+        for fields in vgsFields.values():
+            vg = VG.fromlvm(*fields)
+            if int(vg.pv_count) != len(vg.pv_name):
+                log.error("vg %s has pv_count %s but pv_names %s",
+                          vg.name, vg.pv_count, vg.pv_name)
+            self._vgs[vg.name] = vg
+            updatedVGs[vg.name] = vg
+
+        # Remove stale VGs
+        staleVGs = [name for name in (vg_names or self._vgs)
+                    if name not in updatedVGs]
+        for name in staleVGs:
+            if name in self._vgs:
+                log.warning("Removing stale VG %s", name)
+                del self._vgs[name]
+                # Remove fresh lvs indication of the vg removed from cache.
+                self._freshlv.discard(name)
+
+        return updatedVGs
+
+    def _update_stale_vgs_locked(self, vg_names):
+        """
+        Check if any VG is stale after an LVM command and make it Unreadable.
+        Log a warning if any VG has been made Unreadable.
+        Must be called while holding the lock.
+        """
+        unreadable_vgs = []
+        for v in (vg_names or self._vgs):
+            vg = self._vgs.get(v)
+            if vg and vg.is_stale():
+                self._vgs[v] = Unreadable(vg.name)
+                unreadable_vgs.append(vg.name)
+
+        if unreadable_vgs:
+            # This may be a real error (failure to reload existing VG)
+            # or no error at all (failure to reload non-existing VG),
+            # so we cannot make this an error.
+            log.warning(
+                "Marked vgs=%r as Unreadable due to reload failure",
+                logutils.Head(unreadable_vgs, max_items=20))
+
+    def _reload_single_vg(self, vg_name):
+        """
+        Run LVM 'vgs' command and update VG name.
+        Raise VolumeGroupDoesNotExist if an LVM error occurred without output
+        or VG is stale (not updated).
+        Return the updated VG.
+        """
+        cmd = list(VGS_CMD)
+        cmd.append(vg_name)
+        out, error = self.run_command_error(
+            cmd, devices=self._getVGDevs([vg_name]))
+
+        with self._lock:
+            if error:
+                self._update_stale_vgs_locked([vg_name])
+
+                # Reload a specific VG name and failing
+                # might be indicative of a real error.
+                raise se.VolumeGroupDoesNotExist.from_error(vg_name, error)
+
+            updated_vgs = self._updatevgs_locked(out, [vg_name])
+
+            if vg_name not in updated_vgs:
+                # This should not happen.
+                raise se.VolumeGroupDoesNotExist(vg_name=vg_name)
+
+        return updated_vgs[vg_name]
+
+    def _reloadvgs(self, vgName=None):
+        """
+        Run LVM 'vgs' command and update VG names.
+        If no VG name is provided, reload all VGs.
+        """
         vgNames = normalize_args(vgName)
-        if vgNames:
-            cmd.extend(vgNames)
+        cmd = list(VGS_CMD)
+        cmd.extend(vgNames)
 
         out, error = self.run_command_error(
             cmd, devices=self._getVGDevs(vgNames))
 
         with self._lock:
             if error:
-                unreadable_vgs = []
-                for v in (vgNames or self._vgs):
-                    vg = self._vgs.get(v)
-                    if vg and vg.is_stale():
-                        self._vgs[v] = Unreadable(vg.name)
-                        unreadable_vgs.append(vg.name)
-
-                if unreadable_vgs:
-                    # This may be a real error (failure to reload existing VG)
-                    # or no error at all (failure to reload non-existing VG),
-                    # so we cannot make this an error.
-                    log.warning(
-                        "Marked vgs=%r as Unreadable due to reload failure",
-                        logutils.Head(unreadable_vgs, max_items=20))
+                self._update_stale_vgs_locked(vgNames)
 
                 # NOTE: vgs may return useful output even on failure, so we
-                # don't retrun here.
+                # don't return here.
 
-            updatedVGs = {}
-            vgsFields = {}
-            for line in out:
-                fields = [field.strip() for field in line.split(SEPARATOR)]
-                if len(fields) != VG_FIELDS_LEN:
-                    raise InvalidOutputLine("vgs", line)
-
-                uuid = fields[VG._fields.index("uuid")]
-                pvNameIdx = VG._fields.index("pv_name")
-                pv_name = fields[pvNameIdx]
-                if pv_name == UNKNOWN:
-                    # PV is missing, e.g. device lost of target not connected
-                    continue
-                if uuid not in vgsFields:
-                    fields[pvNameIdx] = [pv_name]  # Make a pv_names list
-                    vgsFields[uuid] = fields
-                else:
-                    vgsFields[uuid][pvNameIdx].append(pv_name)
-            for fields in six.itervalues(vgsFields):
-                vg = VG.fromlvm(*fields)
-                if int(vg.pv_count) != len(vg.pv_name):
-                    log.error("vg %s has pv_count %s but pv_names %s",
-                              vg.name, vg.pv_count, vg.pv_name)
-                self._vgs[vg.name] = vg
-                updatedVGs[vg.name] = vg
-
-            # Remove stale VGs
-            staleVGs = [name for name in (vgNames or self._vgs)
-                        if name not in updatedVGs]
-            for name in staleVGs:
-                if name in self._vgs:
-                    log.warning("Removing stale VG %s", name)
-                    del self._vgs[name]
-                    # Remove fresh lvs indication of the vg removed from cache.
-                    self._freshlv.discard(name)
+            updatedVGs = self._updatevgs_locked(out, vgNames)
 
             # If we updated all the VGs drop stale flag
             if not vgName:
@@ -650,14 +756,9 @@ class LVMCache(object):
 
         return updatedVGs
 
-    def _reloadlvs(self, vgName, lvNames=None):
+    def _reloadlvs(self, vgName):
         cmd = list(LVS_CMD)
-
-        lvNames = normalize_args(lvNames)
-        if lvNames:
-            cmd.extend("%s/%s" % (vgName, lvName) for lvName in lvNames)
-        else:
-            cmd.append(vgName)
+        cmd.append(vgName)
 
         out, error = self.run_command_error(
             cmd, devices=self._getVGDevs((vgName,)))
@@ -666,8 +767,7 @@ class LVMCache(object):
             updatedLVs = {}
 
             if error:
-                if not lvNames:
-                    lvNames = (lvn for vgn, lvn in self._lvs if vgn == vgName)
+                lvNames = (lvn for vgn, lvn in self._lvs if vgn == vgName)
                 for lvName in lvNames:
                     key = (vgName, lvName)
                     lv = self._lvs.get(key)
@@ -698,22 +798,17 @@ class LVMCache(object):
                     updatedLVs[(lv.vg_name, lv.name)] = lv
 
             # Determine if there are stale LVs
-            if lvNames:
-                staleLVs = [lvName for lvName in lvNames
-                            if (vgName, lvName) not in updatedLVs]
-            else:
-                # All the LVs in the VG
-                staleLVs = [lvName for v, lvName in self._lvs
-                            if (v == vgName) and
-                            ((vgName, lvName) not in updatedLVs)]
+            # All the LVs in the VG
+            staleLVs = [lvName for v, lvName in self._lvs
+                        if (v == vgName) and
+                        ((vgName, lvName) not in updatedLVs)]
 
             for lvName in staleLVs:
                 if (vgName, lvName) in self._lvs:
                     log.warning("Removing stale lv: %s/%s", vgName, lvName)
                     del self._lvs[(vgName, lvName)]
 
-            if not lvNames:
-                self._freshlv.add(vgName)
+            self._freshlv.add(vgName)
 
             log.debug("lvs reloaded")
 
@@ -815,13 +910,15 @@ class LVMCache(object):
         self._invalidateAllVgs()
         self._invalidateAllLvs()
 
-    def getPv(self, pvName):
-        # Get specific PV
-        pv = self._pvs.get(pvName)
+    def getPv(self, pv_name):
+        """
+        Get specific PV.
+        Raise a InaccessiblePhysDev if PV is missing.
+        """
+        pv = self._pvs.get(pv_name)
         if not pv or pv.is_stale():
             self.stats.miss()
-            pvs = self._reloadpvs(pvName)
-            pv = pvs.get(pvName)
+            pv = self._reload_single_pv(pv_name)
         else:
             self.stats.hit()
         return pv
@@ -833,7 +930,7 @@ class LVMCache(object):
             pvs = self._reloadpvs()
         else:
             pvs = self._pvs.copy()
-            stalepvs = [pv.name for pv in six.itervalues(pvs) if pv.is_stale()]
+            stalepvs = [pv.name for pv in pvs.values() if pv.is_stale()]
             if stalepvs:
                 self.stats.miss()
                 for name in stalepvs:
@@ -842,7 +939,7 @@ class LVMCache(object):
                 pvs.update(reloaded)
             else:
                 self.stats.hit()
-        return list(six.itervalues(pvs))
+        return list(pvs.values())
 
     def getPvs(self, vgName):
         """
@@ -852,28 +949,30 @@ class LVMCache(object):
         stalepvs = []
         pvs = []
         vg = self.getVg(vgName)
-        for pvName in vg.pv_name:
-            pv = self._pvs.get(pvName)
+        for pv_name in vg.pv_name:
+            pv = self._pvs.get(pv_name)
             if pv is None or pv.is_stale():
-                stalepvs.append(pvName)
+                stalepvs.append(pv_name)
             else:
                 pvs.append(pv)
 
         if stalepvs:
             self.stats.miss()
-            reloadedpvs = self._reloadpvs(pvName=stalepvs)
+            reloadedpvs = self._reloadpvs(pv_name=stalepvs)
             pvs.extend(reloadedpvs.values())
         else:
             self.stats.hit()
         return pvs
 
     def getVg(self, vgName):
-        # Get specific VG
+        """
+        Get specific VG.
+        Raise a VolumeGroupDoesNotExist for LVM command errors or missing VG.
+        """
         vg = self._vgs.get(vgName)
         if not vg or vg.is_stale():
             self.stats.miss()
-            vgs = self._reloadvgs(vgName)
-            vg = vgs.get(vgName)
+            vg = self._reload_single_vg(vgName)
         else:
             self.stats.hit()
         return vg
@@ -886,7 +985,7 @@ class LVMCache(object):
         Only returns found VGs.
         """
         self.stats.miss()
-        return [vg for vgName, vg in six.iteritems(self._reloadvgs(vgNames))
+        return [vg for vgName, vg in self._reloadvgs(vgNames).items()
                 if vgName in vgNames]
 
     def getAllVgs(self):
@@ -896,7 +995,7 @@ class LVMCache(object):
             vgs = self._reloadvgs()
         else:
             vgs = self._vgs.copy()
-            stalevgs = [vg.name for vg in six.itervalues(vgs) if vg.is_stale()]
+            stalevgs = [vg.name for vg in vgs.values() if vg.is_stale()]
             if stalevgs:
                 self.stats.miss()
                 for name in stalevgs:
@@ -905,7 +1004,7 @@ class LVMCache(object):
                 vgs.update(reloaded)
             else:
                 self.stats.hit()
-        return list(six.itervalues(vgs))
+        return list(vgs.values())
 
     def getLv(self, vgName, lvName=None):
         """
@@ -1177,11 +1276,12 @@ def _lvs_proc_info(vg, lvs):
 #
 
 
-def getPV(pvName):
-    pv = _lvminfo.getPv(_fqpvname(pvName))
-    if pv is None:
-        raise se.InaccessiblePhysDev((pvName,))
-    return pv
+def getPV(pv_name):
+    """
+    Return PV named tuple. Raise se.InaccessiblePhysDev if the
+    PV does not exist.
+    """
+    return _lvminfo.getPv(_fqpvname(pv_name))
 
 
 def getAllPVs():
@@ -1274,11 +1374,11 @@ def movePV(vgName, src_device, dst_devices):
 
 
 def getVG(vgName):
-    vg = _lvminfo.getVg(vgName)  # returns single VG namedtuple
-    if not vg:
-        raise se.VolumeGroupDoesNotExist(vgName)
-    else:
-        return vg
+    """
+    Return VG named tupple. Raise se.VolumeGroupDoesNotExist if the
+    VG does not exist.
+    """
+    return _lvminfo.getVg(vgName)
 
 
 def getVGs(vgNames):
@@ -1302,14 +1402,14 @@ def getVGbyUUID(vgUUID):
             log.debug("%s", e, exc_info=True)
             continue
     # If not cry loudly
-    raise se.VolumeGroupDoesNotExist("vg_uuid: %s" % vgUUID)
+    raise se.VolumeGroupDoesNotExist(vg_uuid=vgUUID)
 
 
 def getLV(vgName, lvName=None):
     lv = _lvminfo.getLv(vgName, lvName)
     # getLV() should not return None
     if not lv:
-        raise se.LogicalVolumeDoesNotExistError("%s/%s" % (vgName, lvName))
+        raise se.LogicalVolumeDoesNotExistError(vgName, lvName)
     else:
         return lv
 
@@ -1487,20 +1587,14 @@ def _checkpvsblksize(pvs, vgBlkSize=None):
             raise se.VolumeGroupBlockSizeError(vgBlkSize, pvBlkSize)
 
 
-def checkVGBlockSizes(vgUUID, vgBlkSize=None):
-    pvs = listPVNames(vgUUID)
-    if not pvs:
-        raise se.VolumeGroupDoesNotExist("vg_uuid: %s" % vgUUID)
-    _checkpvsblksize(pvs, vgBlkSize)
+def checkVGBlockSizes(vg_name, vgBlkSize=None):
+    _checkpvsblksize(listPVNames(vg_name), vgBlkSize)
 
 
-def getVGBlockSizes(vgUUID):
-    pvs = listPVNames(vgUUID)
-    if not pvs:
-        raise se.VolumeGroupDoesNotExist("vg_uuid: %s" % vgUUID)
+def getVGBlockSizes(vg_name):
     # Returning the block size of the first pv is correct since we don't allow
     # devices with different block size to be on the same VG.
-    return _getpvblksize(pvs[0])
+    return _getpvblksize(listPVNames(vg_name)[0])
 
 #
 # Public Logical volume interface
@@ -1720,18 +1814,6 @@ def deactivateLVs(vgName, lvNames):
         _setLVAvailability(vgName, toDeactivate, "n")
 
 
-def renameLV(vg, oldlv, newlv):
-    log.info("Renaming LV (vg=%s, oldlv=%s, newlv=%s)", vg, oldlv, newlv)
-    cmd = ("lvrename",) + LVM_NOBACKUP + (vg, oldlv, newlv)
-    try:
-        _lvminfo.run_command(cmd, devices=_lvminfo._getVGDevs((vg, )))
-    except se.LVMCommandError as e:
-        raise se.LogicalVolumeRenameError.from_lvmerror(e)
-    else:
-        _lvminfo._removelvs(vg, oldlv)
-        _lvminfo._reloadlvs(vg, newlv)
-
-
 def refreshLVs(vgName, lvNames):
     log.info("Refreshing LVs (vg=%s, lvs=%s)", vgName, lvNames)
     _refreshLVs(vgName, lvNames)
@@ -1845,11 +1927,7 @@ def getVgMetadataPv(vgName):
 
 
 def listPVNames(vgName):
-    try:
-        pvNames = _lvminfo._vgs[vgName].pv_name
-    except (KeyError, AttributeError):
-        pvNames = getVG(vgName).pv_name
-    return pvNames
+    return getVG(vgName).pv_name
 
 
 def setrwLV(vg_name, lv_name, rw=True):

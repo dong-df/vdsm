@@ -81,6 +81,7 @@ from vdsm.common.logutils import SimpleLogAdapter, Suppressed
 from vdsm.network import api as net_api
 
 # TODO: remove these imports, code using this should use storage apis.
+from vdsm.storage import constants as sc
 from vdsm.storage import qemuimg
 from vdsm.storage import sdc
 
@@ -93,6 +94,7 @@ from vdsm.virt import guestagent
 from vdsm.virt import libvirtxml
 from vdsm.virt import metadata
 from vdsm.virt import migration
+from vdsm.virt import periodic
 from vdsm.virt import sampling
 from vdsm.virt import saslpasswd2
 from vdsm.virt import thinp
@@ -116,7 +118,7 @@ from vdsm.virt.vmdevices import hwclass
 from vdsm.virt.vmdevices import storagexml
 from vdsm.virt.vmdevices.common import get_metadata
 from vdsm.virt.vmdevices.common import identify_from_xml_elem
-from vdsm.virt.vmdevices.storage import DISK_TYPE
+from vdsm.virt.vmdevices.storage import BLOCK_THRESHOLD, DISK_TYPE
 from vdsm.virt.vmdevices.storagexml import change_disk
 from vdsm.virt.vmpowerdown import VmShutdown, VmReboot
 from vdsm.virt.utils import isVdsmImage, cleanup_guest_socket
@@ -356,6 +358,7 @@ class Vm(object):
         else:
             self._lastStatus = vmstatus.WAIT_FOR_LAUNCH
             self._altered_state = _AlteredState()
+        self._initial_vcpupin = params.pop('initialVCPUPin', None)
         elapsedTimeOffset = float(params.pop('elapsedTimeOffset', 0))
         # we need to make sure the 'devices' key exists in vm.conf regardless
         # how the Vm is initialized, either through XML or from conf.
@@ -363,10 +366,14 @@ class Vm(object):
         self.conf.update(params)
         self._external = params.get('external', False)
         self.arch = cpuarch.effective()
+        migrated_guest_info = {}
         self._src_domain_xml = params.get('_srcDomXML')
         if self._src_domain_xml is not None:
             self._domain = DomainDescriptor(
                 self._src_domain_xml, xml_source=XmlSource.MIGRATION_SOURCE)
+            for k in ['guestFQDN', 'netIfaces', 'username']:
+                if k in params:
+                    migrated_guest_info[k] = params[k]
         else:
             self._domain = DomainDescriptor(
                 params['xml'], xml_source=XmlSource.INITIAL)
@@ -437,7 +444,7 @@ class Vm(object):
         self._hotunplugged_devices = {}  # { alias: device_object }
 
         self.volume_monitor = thinp.VolumeMonitor(
-            self, self.log, enabled=False)
+            self, self.log, dispatch=periodic.dispatch, enabled=False)
         self._connection = libvirtconnection.get(cif)
         if (recover and
             # status retrieved from the recovery file (legacy style)
@@ -457,7 +464,8 @@ class Vm(object):
             self._guestSocketFile, self.cif.channelListener, self.log,
             self._onGuestStatusChange,
             lambda: self.cif.qga_poller.get_guest_info(self.id),
-            self._guest_agent_api_version)
+            self._guest_agent_api_version,
+            **migrated_guest_info)
         self._qga_lock = threading.Lock()
         self._released = threading.Event()
         self._releaseLock = threading.Lock()
@@ -1163,7 +1171,7 @@ class Vm(object):
                 self.setDownStatus(exit_code, reason)
         self._powerDownEvent.set()
 
-    def _loadCorrectedTimeout(self, base, doubler=20, load=None):
+    def _load_corrected_timeout(self, base, doubler=20, load=None):
         """
         Return load-corrected base timeout
 
@@ -1175,6 +1183,26 @@ class Vm(object):
         if load is None:
             load = len(self.cif.vmContainer)
         return base * (doubler + load) / doubler
+
+    def _disk_preparation_timeout(self):
+        """
+        Return approximate timeout for disk preparation.
+
+        Some disk devices require modifying and reloading udev rules.
+        Currently, udev rules are reloaded for each such device individually.
+        This function returns a wild-guess timeout value based on the number
+        of such devices.
+
+        :returns: The timeout in seconds (int).
+        """
+        n_disks_to_appropriate = 0
+        for element in self._domain.devices.findall('./disk/source[@dev]'):
+            if element.attrib['dev'].startswith('/dev/mapper/'):
+                n_disks_to_appropriate += 1
+        per_disk_time = config.getfloat(
+            'vars', 'migration_listener_prepare_disk_timeout'
+        )
+        return per_disk_time * n_disks_to_appropriate
 
     def onReboot(self):
         try:
@@ -1298,16 +1326,13 @@ class Vm(object):
         _, raw_stats = res[0]
         return raw_stats
 
-    def monitor_volumes(self):
+    def extend_volume(self, vmDrive, volumeID, new_size, callback=None):
         """
-        Return True if at least one volume is being extended, False otherwise.
-        """
-        return self.volume_monitor.monitor_volumes()
+        Extend drive volume and its replica volume during replication to
+        new_size.
 
-    def extend_volume(self, vmDrive, volumeID, curSize, capacity,
-                      callback=None):
-        """
-        Extend drive volume and its replica volume during replication.
+        The new size of the volume may be bigger than the requested value
+        because the actual volume size is always aligned to lvm extent size.
 
         Must be called only when the drive or its replica are chunked.
 
@@ -1321,7 +1346,7 @@ class Vm(object):
         called.
         """
         self.volume_monitor.extend_volume(
-            vmDrive, volumeID, curSize, capacity, callback=callback)
+            vmDrive, volumeID, new_size, callback=callback)
 
     def should_refresh_destination_volume(self):
         """
@@ -1494,7 +1519,7 @@ class Vm(object):
             return False
 
     def _acquireCpuLockWithTimeout(self, flow):
-        timeout = self._loadCorrectedTimeout(
+        timeout = self._load_corrected_timeout(
             config.getint('vars', 'vm_command_timeout'))
         self._guestCpuLock.acquire(timeout, flow)
 
@@ -2027,6 +2052,7 @@ class Vm(object):
         return self._external_data[kind].update(force=force)
 
     def migration_parameters(self):
+        guest_stats = self._getGuestStats()
         return {
             '_srcDomXML': self._dom.XMLDesc(),
             'vmId': self.id,
@@ -2034,6 +2060,9 @@ class Vm(object):
             'elapsedTimeOffset': (
                 time.time() - self._startTime
             ),
+            'guestFQDN': guest_stats['guestFQDN'],
+            'username': guest_stats['username'],
+            'netIfaces': guest_stats.get('netIfaces', []),
         }
 
     def migratable_domain_xml(self):
@@ -2102,8 +2131,9 @@ class Vm(object):
                 return True
         return False
 
-    def _process_migration_cpusets(self, cpusets):
-        xml_cpusets = []
+    def _validate_migration_cpusets(self, cpusets):
+        if cpusets is None:
+            return
         if len(cpusets) != self.get_number_of_cpus():
             raise exception.InvalidParameter(
                 "length of cpusets (%d) must match"
@@ -2112,7 +2142,6 @@ class Vm(object):
         for vcpu, cpuset in enumerate(cpusets):
             if cpuset is None:
                 continue
-            vcpupin = ET.Element('vcpupin')
             # Try parsing the content to validate it
             try:
                 taskset.cpulist_parse(cpuset)
@@ -2120,19 +2149,29 @@ class Vm(object):
                 raise exception.InvalidParameter(
                     "One or more invalid cpuset list descriptions in: %r" %
                     cpusets)
-            vcpupin.set('vcpu', str(vcpu))
-            vcpupin.set('cpuset', str(cpuset))
-            xml_cpusets.append(vcpupin)
-        return xml_cpusets
+
+    def _validate_migration_numa_nodesets(self, numaNodesets):
+        if numaNodesets is None:
+            return
+        if len(numaNodesets) != self._domain.vnuma_count:
+            raise exception.InvalidParameter(
+                "length of numaNodesets (%d) must match"
+                " number of vNUMA nodes (%d)" % (
+                    len(numaNodesets), self._domain.vnuma_count))
+        for nodeset in numaNodesets:
+            try:
+                # Validate node set string just like cpu list
+                taskset.cpulist_parse(nodeset)
+            except ValueError:
+                raise exception.InvalidParameter(
+                    "One or more invalid node set descriptions in: %r" %
+                    numaNodesets)
 
     @api.guard(_not_migrating)
     @api.guard(_not_paused_on_io_error)
     def migrate(self, params):
-        if params.get('cpusets') is not None:
-            # Validate content and turn it into <vcpupin> elements here to
-            # avoid failures later during migration
-            params['cpusets'] = self._process_migration_cpusets(
-                params['cpusets'])
+        self._validate_migration_cpusets(params.get('cpusets'))
+        self._validate_migration_numa_nodesets(params.get('numaNodesets'))
         self._acquireCpuLockWithTimeout(flow='migrate')
         try:
             # It is unlikely, but we could receive migrate()
@@ -2775,32 +2814,42 @@ class Vm(object):
             hooks.before_vm_start(self._buildDomainXML(), self._custom)
 
             fromSnapshot = self._altered_state.from_snapshot
-            srcDomXML = self._src_domain_xml
-            if fromSnapshot:
-                # If XML was provided by Engine, disk paths have already been
-                # corrected in __init__.  If legacy configuration
-                # (e.g. 'vmName') is present, we use the legacy path here.
-                # Otherwise we leave srcDomXML untouched, since we don't have
-                # anything from Engine (4.2.0) to update it with.
-                if 'vmName' in self.conf:
-                    srcDomXML = self._correct_disk_volumes_from_conf(srcDomXML)
-                srcDomXML = self._correctGraphicsConfiguration(srcDomXML)
-            hooks.before_vm_dehibernate(srcDomXML, self._custom,
-                                        {'FROM_SNAPSHOT': str(fromSnapshot)})
-
-            # TODO: this is debug information. For 3.6.x we still need to
-            # see the XML even with 'info' as default level.
-            self.log.info("%s", srcDomXML)
-
-            self._connection.defineXML(srcDomXML)
             restore_path = self._altered_state.path
             fname = self.cif.prepareVolumePath(restore_path)
             try:
                 if fromSnapshot:
-                    self._connection.restoreFlags(
-                        fname, srcDomXML, libvirt.VIR_DOMAIN_SAVE_PAUSED)
+                    srcDomXML = self._src_domain_xml
+                    # If XML was provided by Engine, disk paths have already
+                    # been corrected in __init__.  If legacy configuration
+                    # (e.g. 'vmName') is present, we use the legacy path here.
+                    # Otherwise we leave srcDomXML untouched, since we don't
+                    # have anything from Engine (4.2.0) to update it with.
+                    if 'vmName' in self.conf:
+                        srcDomXML = self._correct_disk_volumes_from_conf(
+                            srcDomXML)
+                    srcDomXML = self._correctGraphicsConfiguration(srcDomXML)
                 else:
-                    self._connection.restore(fname)
+                    srcDomXML = self._connection.saveImageGetXMLDesc(fname)
+                    # Modify CPU pinning -- remove pinning saved during
+                    # hibernation and replace it with pinning provided by
+                    # engine in API call.
+                    dom = xmlutils.fromstring(srcDomXML)
+                    dom = cpumanagement.replace_cpu_pinning(
+                        self, dom, self._initial_vcpupin)
+                    srcDomXML = xmlutils.tostring(dom)
+                hooks.before_vm_dehibernate(
+                    srcDomXML, self._custom,
+                    {'FROM_SNAPSHOT': str(fromSnapshot)})
+
+                # TODO: this is debug information. For 3.6.x we still need to
+                # see the XML even with 'info' as default level.
+                self.log.info("%s", srcDomXML)
+
+                self._connection.defineXML(srcDomXML)
+                flags = 0
+                if fromSnapshot:
+                    flags |= libvirt.VIR_DOMAIN_SAVE_PAUSED
+                self._connection.restoreFlags(fname, srcDomXML, flags)
             finally:
                 self.cif.teardownVolumePath(restore_path)
 
@@ -4307,7 +4356,7 @@ class Vm(object):
         vdsm.virt.jobs.schedule(job)
         return {'status': doneCode}
 
-    def diskReplicateStart(self, srcDisk, dstDisk):
+    def diskReplicateStart(self, srcDisk, dstDisk, need_extend=True):
         try:
             drive = self.findDriveByUUIDs(srcDisk)
         except LookupError:
@@ -4354,15 +4403,13 @@ class Vm(object):
             self._delDiskReplica(drive)
             return response.error('replicaErr')
 
-        if drive.chunked or drive.replicaChunked:
+        if need_extend and (drive.chunked or drive.replicaChunked):
             try:
                 block_info = self.volume_monitor.query_block_info(
                     drive, drive.volumeID)
-                self.extend_volume(
-                    drive,
-                    drive.volumeID,
-                    block_info.physical,
-                    block_info.capacity)
+                new_size = drive.getNextVolumeSize(
+                    block_info.physical, block_info.capacity)
+                self.extend_volume(drive, drive.volumeID, new_size)
             except Exception:
                 self.log.exception("Initial extension request failed for %s",
                                    drive.name)
@@ -4562,6 +4609,12 @@ class Vm(object):
                                drive.name, newSizeBytes, e)
             return response.error('updateDevice')
         finally:
+            # If the disk was resized to maximum size and drive monitoring was
+            # disabled, we need to start monitoring the drive again after the
+            # resize. Change the threshold state to UNSET so the periodic
+            # monitor will pick it up again on the next monitoring cycle.
+            drive.threshold_state = BLOCK_THRESHOLD.UNSET
+
             # Note that newVirtualSize may be larger than the requested size
             # because of rounding in qemu.
             try:
@@ -5139,11 +5192,18 @@ class Vm(object):
             self._pause_time = vdsm.common.time.monotonic_time()
             self._setGuestCpuRunning(False, flow='IOError')
             self._logGuestCpuStatus('onIOError')
-            if reason == 'ENOSPC':
-                if not self.monitor_volumes():
-                    self.log.info("No volumes were extended")
 
-            self._send_ioerror_status_event(reason, blockDevAlias)
+            try:
+                drive = vmdevices.lookup.device_by_alias(
+                    self._devices[hwclass.DISK][:], blockDevAlias)
+            except LookupError:
+                drive = None
+                self.log.warning('unknown disk alias: %s', blockDevAlias)
+            else:
+                if reason == 'ENOSPC':
+                    self.volume_monitor.on_enospc(drive)
+
+            self._send_ioerror_status_event(reason, blockDevAlias, drive=drive)
             self._update_metadata()
 
         elif action == libvirt.VIR_DOMAIN_EVENT_IO_ERROR_REPORT:
@@ -5154,14 +5214,9 @@ class Vm(object):
             self.log.warning('unexpected action %i on device %s error %s',
                              action, blockDevAlias, reason)
 
-    def _send_ioerror_status_event(self, reason, alias):
+    def _send_ioerror_status_event(self, reason, alias, drive=None):
         io_error_info = {'alias': alias}
-        try:
-            drive = vmdevices.lookup.device_by_alias(
-                self._devices[hwclass.DISK][:], alias)
-        except LookupError:
-            self.log.warning('unknown disk alias: %s', alias)
-        else:
+        if drive is not None:
             io_error_info['name'] = drive.name
             io_error_info['path'] = drive.path
 
@@ -5742,17 +5797,24 @@ class Vm(object):
             if alias in aliasToDevice:
                 aliasToDevice[alias]._deviceXML = xmlutils.tostring(deviceXML)
 
+    def _migration_destination_prepare_timeout(self):
+        prepare_timeout = self._load_corrected_timeout(
+            config.getint('vars', 'migration_listener_timeout'), doubler=5
+        ) + self._disk_preparation_timeout()
+        max_timeout = config.getint('vars', 'max_migration_listener_timeout')
+        prepare_timeout = min(prepare_timeout, max_timeout)
+        return prepare_timeout
+
     def waitForMigrationDestinationPrepare(self):
         """Wait until paths are prepared for migration destination"""
         # Wait for the VM to start its creation. There is no reason to start
         # the timed waiting for path preparation before the work has started.
         self.log.debug('migration destination: waiting for VM creation')
         self._vmCreationEvent.wait()
-        prepareTimeout = self._loadCorrectedTimeout(
-            config.getint('vars', 'migration_listener_timeout'), doubler=5)
+        prepare_timeout = self._migration_destination_prepare_timeout()
         self.log.debug('migration destination: waiting %ss '
-                       'for path preparation', prepareTimeout)
-        self._incoming_migration_prepared.wait(prepareTimeout)
+                       'for path preparation', prepare_timeout)
+        self._incoming_migration_prepared.wait(prepare_timeout)
         if not self._incoming_migration_prepared.isSet():
             self.log.debug('Timeout while waiting for path preparation')
             return False
@@ -6045,6 +6107,27 @@ class Vm(object):
         self._updateDomainDescriptor()
 
     # Accessing storage
+
+    def measure(self, domainID, imageID, topID, dest_format, backing=True,
+                baseID=None):
+        """
+        Measure size required for merging top into base.
+        """
+        res = self.cif.irs.measure(
+            domainID,
+            imageID,
+            topID,
+            sc.name2type(dest_format),
+            backing=backing,
+            baseUUID=baseID)
+
+        if res['status']['code'] != 0:
+            message = res['status']['message']
+            raise errors.StorageUnavailableError(
+                f"Unable to measure domain {domainID} image {imageID} top "
+                f"{topID} base {baseID}: {message}")
+
+        return res['result']
 
     def getVolumeSize(self, domainID, poolID, imageID, volumeID):
         """ Return volume size info by accessing storage """

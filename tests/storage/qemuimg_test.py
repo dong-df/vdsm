@@ -25,6 +25,8 @@ import io
 import json
 import os
 import pprint
+
+from collections import namedtuple
 from functools import partial
 
 import pytest
@@ -1465,6 +1467,126 @@ class TestAmend:
             assert info['format-specific']['data']['compat'] == desired_compat
 
 
+Chain = namedtuple("Chain", "top,base,parent")
+
+
+@pytest.fixture(params=['0.10', '1.1'])
+def file_chain(tmpdir, request):
+    compat = request.param
+    size = 1 * GiB
+
+    # Create base parent volume
+    parent = str(tmpdir.join("parent"))
+    op = qemuimg.create(
+        parent,
+        size=size,
+        format=qemuimg.FORMAT.RAW,
+        qcow2Compat=compat)
+    op.run()
+
+    # Write 1 MiB to parent
+    qemuio.write_pattern(
+        parent,
+        format=qemuimg.FORMAT.RAW,
+        offset=0 * MiB,
+        len=1 * MiB,
+        pattern=0xf0)
+
+    # Create base volume over parent
+    base = str(tmpdir.join("base"))
+    op = qemuimg.create(
+        base,
+        size=size,
+        format=qemuimg.FORMAT.QCOW2,
+        qcow2Compat=compat,
+        backing=parent,
+        backingFormat=qemuimg.FORMAT.RAW)
+    op.run()
+
+    # Write 1 MiB to base
+    qemuio.write_pattern(
+        base,
+        format=qemuimg.FORMAT.QCOW2,
+        offset=1 * MiB,
+        len=1 * MiB,
+        pattern=0xf1)
+
+    # Create top volume over base
+    top = str(tmpdir.join("top"))
+    op = qemuimg.create(
+        top,
+        size=size,
+        format=qemuimg.FORMAT.QCOW2,
+        qcow2Compat=compat,
+        backing=base,
+        backingFormat=qemuimg.FORMAT.QCOW2)
+    op.run()
+
+    # Write 1 MiB to top
+    qemuio.write_pattern(
+        top,
+        format=qemuimg.FORMAT.QCOW2,
+        offset=2 * MiB,
+        len=1 * MiB,
+        pattern=0xf2)
+
+    return Chain(top, base, parent)
+
+
+@pytest.fixture(params=['0.10', '1.1'])
+def block_chain(tmp_storage, request):
+    compat = request.param
+    dev_size = 1 * GiB
+
+    # Create raw parent volume
+    parent = tmp_storage.create_device(dev_size)
+    op = qemuimg.create(
+        parent,
+        size=dev_size,
+        format=qemuimg.FORMAT.RAW)
+    op.run()
+
+    # Create base volume over parent
+    base = tmp_storage.create_device(dev_size)
+    op = qemuimg.create(
+        base,
+        size=dev_size,
+        format=qemuimg.FORMAT.QCOW2,
+        qcow2Compat=compat,
+        backing=parent,
+        backingFormat=qemuimg.FORMAT.RAW)
+    op.run()
+
+    # Write 1 MiB to base
+    qemuio.write_pattern(
+        base,
+        format=qemuimg.FORMAT.QCOW2,
+        offset=1 * MiB,
+        len=1 * MiB,
+        pattern=0xf1)
+
+    # Create top volume over base
+    top = tmp_storage.create_device(dev_size)
+    op = qemuimg.create(
+        top,
+        size=dev_size,
+        format=qemuimg.FORMAT.QCOW2,
+        qcow2Compat=compat,
+        backing=base,
+        backingFormat=qemuimg.FORMAT.QCOW2)
+    op.run()
+
+    # Write 1 MiB to top
+    qemuio.write_pattern(
+        top,
+        format=qemuimg.FORMAT.QCOW2,
+        offset=2 * MiB,
+        len=1 * MiB,
+        pattern=0xf2)
+
+    return Chain(top, base, parent)
+
+
 class TestMeasure:
 
     @pytest.mark.parametrize("format,compressed", [
@@ -1540,66 +1662,130 @@ class TestMeasure:
                 f.write(b"x" * MiB)
         self.check_measure(filename, compat, format, compressed)
 
-    @pytest.mark.parametrize("compat", ['0.10', '1.1'])
     @requires_root
-    def test_measure_leaf(self, tmp_storage, compat):
-        dev_size = 1 * GiB
+    def test_block(self, block_chain):
+        # Creating a block chain is very slow, so we reuse it for many tests.
 
-        # Create base volume
-        base = tmp_storage.create_device(dev_size)
-        op = qemuimg.create(
-            base,
-            size=dev_size,
-            format=qemuimg.FORMAT.QCOW2,
-            qcow2Compat=compat
-        )
-        op.run()
-
-        # Write 1 MiB to base
-        qemuio.write_pattern(
-            base,
-            format=qemuimg.FORMAT.QCOW2,
-            offset=0,
-            len=MiB,
-            pattern=0xf0)
-
-        # Create top volume over base
-        top = tmp_storage.create_device(dev_size)
-        op = qemuimg.create(
-            top,
-            size=dev_size,
-            format=qemuimg.FORMAT.QCOW2,
-            qcow2Compat=compat,
-            backing=base,
-            backingFormat=qemuimg.FORMAT.QCOW2
-        )
-        op.run()
-
-        # Write 1 MiB to top
-        qemuio.write_pattern(
-            top,
-            format=qemuimg.FORMAT.QCOW2,
-            offset=1 * MiB,
-            len=MiB,
-            pattern=0xf0)
-
-        entire_image = qemuimg.measure(
-            top,
+        top = qemuimg.measure(
+            block_chain.top,
             format=qemuimg.FORMAT.QCOW2,
             output_format=qemuimg.FORMAT.QCOW2,
-            is_block=True,
-            backing=True
-        )
+            is_block=True)
+
+        base = qemuimg.measure(
+            block_chain.base,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=True)
+
+        parent = qemuimg.measure(
+            block_chain.parent,
+            format=qemuimg.FORMAT.RAW,
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=True)
+
+        # Becasue parent is raw, measuring any layer including the backing
+        # chain reports fully allocated value.
+        assert top["required"] == base["required"] == parent["required"]
+        assert GiB < top["required"] < GiB + 0.5 * MiB
 
         top_only = qemuimg.measure(
-            top,
+            block_chain.top,
             format=qemuimg.FORMAT.QCOW2,
             output_format=qemuimg.FORMAT.QCOW2,
             is_block=True,
-            backing=False
-        )
+            backing=False)
 
-        assert entire_image["required"] >= top_only["required"] + MiB
+        assert MiB < top_only["required"] < 1.5 * MiB
+
+        base_only = qemuimg.measure(
+            block_chain.base,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=True,
+            backing=False)
+
+        assert top_only == base_only
+
+        sub_chain = qemuimg.measure(
+            block_chain.top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            is_block=True,
+            base=block_chain.base)
+
+        assert 2 * MiB < sub_chain["required"] < 2.5 * MiB
+
+        with pytest.raises(ValueError) as e:
+            qemuimg.measure(
+                block_chain.top,
+                format=qemuimg.FORMAT.QCOW2,
+                output_format=qemuimg.FORMAT.QCOW2,
+                base=block_chain.parent)
+
+        # Check that we include the invalid and actual base in the error.
+        assert block_chain.parent in str(e.value)
+        assert block_chain.base in str(e.value)
+
+    def test_file_base(self, file_chain):
+        entire_chain = qemuimg.measure(
+            file_chain.top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2)
+
+        # parent <- [base <- top]
+        sub_chain1 = qemuimg.measure(
+            file_chain.top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            base=file_chain.base)
+
+        assert entire_chain["required"] >= sub_chain1["required"] + MiB
+
+        # [parent <- base] <- top
+        sub_chain2 = qemuimg.measure(
+            file_chain.base,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            base=file_chain.parent)
+
+        assert sub_chain1 == sub_chain2
+
+    def test_file_base_invalid(self, file_chain):
+        # Trying to measure unsupported chain:
+        # [parent <- base <- top]
+        with pytest.raises(ValueError) as e:
+            qemuimg.measure(
+                file_chain.top,
+                format=qemuimg.FORMAT.QCOW2,
+                output_format=qemuimg.FORMAT.QCOW2,
+                base=file_chain.parent)
+
+        # Check that we include the invalid and actual base in the error.
+        assert file_chain.parent in str(e.value)
+        assert file_chain.base in str(e.value)
+
+    def test_file_leaf(self, file_chain):
+        entire_chain = qemuimg.measure(
+            file_chain.top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2)
+
+        top_only = qemuimg.measure(
+            file_chain.top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            backing=False)
+
+        assert entire_chain["required"] >= top_only["required"] + 2 * MiB
+
+        base_only = qemuimg.measure(
+            file_chain.base,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2,
+            backing=False)
+
+        assert top_only == base_only
 
     def check_measure(self, filename, compat, format, compressed):
         if format != qemuimg.FORMAT.RAW:
@@ -1616,6 +1802,31 @@ class TestMeasure:
         error_pct = 100 * float(estimated_size - actual_size) / virtual_size
         assert estimated_size >= actual_size
         assert error_pct <= 0.1, error_pct
+
+    def test_active_image_fail(self, file_chain):
+        # Measuring an active image without unsafe=True fails.
+        with qemuio.open(file_chain.top, qemuimg.FORMAT.QCOW2):
+            with pytest.raises(cmdutils.Error):
+                qemuimg.measure(
+                    file_chain.top,
+                    format=qemuimg.FORMAT.QCOW2,
+                    output_format=qemuimg.FORMAT.QCOW2)
+
+    def test_active_image_unsafe(self, file_chain):
+        # We can measure an active image with unsafe=True.
+        with qemuio.open(file_chain.top, qemuimg.FORMAT.QCOW2):
+            active = qemuimg.measure(
+                file_chain.top,
+                format=qemuimg.FORMAT.QCOW2,
+                output_format=qemuimg.FORMAT.QCOW2,
+                unsafe=True)
+
+        inactive = qemuimg.measure(
+            file_chain.top,
+            format=qemuimg.FORMAT.QCOW2,
+            output_format=qemuimg.FORMAT.QCOW2)
+
+        assert active == inactive
 
 
 class TestBitmaps:

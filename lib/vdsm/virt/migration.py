@@ -139,7 +139,7 @@ class SourceThread(object):
                  tunneled=False, dstqemu='', abortOnError=False,
                  consoleAddress=None, compressed=False,
                  autoConverge=False, recovery=False, encrypted=False,
-                 cpusets=None, parallel=None, **kwargs):
+                 cpusets=None, parallel=None, numaNodesets=None, **kwargs):
         self.log = vm.log
         self._vm = vm
         self._dom = DomainAdapter(self._vm)
@@ -202,6 +202,7 @@ class SourceThread(object):
         # the first extend of the disk during migration if finished.
         self._supports_disk_refresh = None
         self._destination_cpusets = cpusets
+        self._destination_numa_nodesets = numaNodesets
 
     def start(self):
         self._thread.start()
@@ -631,28 +632,23 @@ class SourceThread(object):
                 normalize_literal_addr(self.remoteHost)
         xml = self._vm.migratable_domain_xml()
         # REQUIRED_FOR: destination Vdsm < 4.3
+        dom = xmlutils.fromstring(xml)
         if self._legacy_payload_path is not None:
             alias, path = self._legacy_payload_path
-            dom = xmlutils.fromstring(xml)
             source = dom.find(".//alias[@name='%s']/../source" % (alias,))
             source.set('file', path)
-            xml = xmlutils.tostring(dom)
         # Remove & replace CPU pinning added by VDSM
-        dom = xmlutils.fromstring(xml)
-        cputune = dom.find('cputune')
-        if cputune is not None:
-            for vcpu in vmxml.find_all(cputune, 'vcpupin'):
-                vcpu_id = int(vcpu.get('vcpu'))
-                if (self._vm.cpu_policy() == cpumanagement.CPU_POLICY_MANUAL
-                        and vcpu_id in self._vm.manually_pinned_cpus()):
-                    continue
-                cputune.remove(vcpu)
-        if self._destination_cpusets is not None:
-            if cputune is None:
-                cputune = xml.etree.ElementTree.Element('cputune')
-                dom.append(cputune)
-            for vcpupin in self._destination_cpusets:
-                cputune.append(vcpupin)
+        dom = cpumanagement.replace_cpu_pinning(self._vm, dom,
+                                                self._destination_cpusets)
+        if self._destination_numa_nodesets is not None:
+            numatune = dom.find('numatune')
+            if numatune is not None:
+                for memnode in vmxml.find_all(numatune, 'memnode'):
+                    cellid = int(memnode.get('cellid'))
+                    if (cellid >= 0 and
+                            cellid < len(self._destination_numa_nodesets)):
+                        memnode.set('nodeset',
+                                    self._destination_numa_nodesets[cellid])
         xml = xmlutils.tostring(dom)
         self._vm.log.debug("Migrating domain XML: %s", xml)
         params[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = xml

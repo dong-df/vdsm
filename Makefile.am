@@ -35,6 +35,10 @@ SUBDIRS = \
 # prepared before running.
 SUBDIRS += tests
 
+VENV_DIR = $(HOME)/.venv/vdsm
+VENV = $(VENV_DIR)/bin
+RPM_TOPDIR = $(PWD)/build
+
 include $(top_srcdir)/build-aux/Makefile.subs
 
 # This is an *exception*, we ship also vdsm.spec so it's possible to build the
@@ -135,6 +139,12 @@ check-unit:
 .PHONY: lint
 lint: gitignore execcmd black flake8 pylint
 
+.PHONY: venv
+venv:
+	python3 -m venv $(VENV_DIR) && \
+	$(VENV)/python3 -m pip install --upgrade pip && \
+	$(VENV)/python3 -m pip install -r docker/requirements.txt
+
 .PHONY: tests
 tests: tox
 	tox -e "tests,lib,network,virt,gluster,hooks"
@@ -147,17 +157,29 @@ tests-storage: tox
 storage:
 	python3 tests/storage/userstorage.py setup
 
+.PHONY: clean-storage
+clean-storage:
+	python3 tests/storage/userstorage.py teardown
+
 all-local: \
 	vdsm.spec
 
-.PHONY: srpm rpm
+clean-local: clean-build
 
-srpm: dist
+.PHONY: upgrade
+upgrade:
+	sudo dnf upgrade $(RPM_TOPDIR)/RPMS/*/*.rpm
+
+.PHONY: srpm rpm clean-build
+
+srpm: clean-build dist
 	rpmbuild -ts $(if $(BUILDID),--define="extra_release .$(BUILDID)") \
+		--define="_topdir $(RPM_TOPDIR)" \
 		$(DIST_ARCHIVES)
 
-rpm: dist
+rpm: clean-build dist
 	rpmbuild -ta $(if $(BUILDID),--define="extra_release .$(BUILDID)") \
+		--define="_topdir $(RPM_TOPDIR)" \
 		--define="qemu_user $(QEMUUSER)" \
 		--define="qemu_group $(QEMUGROUP)" \
 		--define="with_ovirt_vmconsole $(OVIRT_VMCONSOLE)" \
@@ -167,6 +189,9 @@ rpm: dist
 		--define="vdsm_version $(PACKAGE_VERSION)" \
 		--define="vdsm_release $(PACKAGE_RELEASE)" \
 		$(DIST_ARCHIVES)
+
+clean-build:
+	rm -rf $(RPM_TOPDIR)
 
 dist-hook: gen-VERSION gen-ChangeLog
 .PHONY: gen-VERSION gen-ChangeLog

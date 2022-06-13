@@ -27,6 +27,8 @@ import os
 import threading
 import xml.etree.ElementTree as ET
 
+from contextlib import contextmanager
+
 from vdsm.common import conv
 from vdsm.common import cpuarch
 from vdsm.common import errors
@@ -43,6 +45,12 @@ from . import core
 from . import drivename
 from . import hwclass
 from . import lease
+
+
+class MonitorBusy(Exception):
+    """
+    Raised when acquiring the monitor lock times out.
+    """
 
 
 DEFAULT_INTERFACE_FOR_ARCH = {
@@ -85,6 +93,8 @@ class BLOCK_THRESHOLD:
     SET = "set"
     # event delivered, Drive waiting to be picked up for check and extension
     EXCEEDED = "exceeded"
+    # Drive extended to maximum size and does not need monitoring.
+    DISABLED = "disabled"
 
 
 class VolumeNotFound(errors.Base):
@@ -117,8 +127,9 @@ class Drive(core.Base):
                  'extSharedState', 'drv', 'sgio', 'GUID', 'diskReplicate',
                  '_diskType', 'hosts', 'protocol', 'auth', 'discard',
                  'vm_custom', '_block_info', '_threshold_state', '_lock',
-                 '_monitorable', 'guestName', '_iotune', 'RBD', 'managed',
-                 'scratch_disk', 'exceeded_time')
+                 '_monitor_lock', '_monitorable', 'guestName', '_iotune',
+                 'RBD', 'managed', 'scratch_disk', 'exceeded_time',
+                 'extend_time', 'managed_reservation')
     VOLWM_CHUNK_SIZE = (config.getint('irs', 'volume_utilization_chunk_mb') *
                         MiB)
     VOLWM_FREE_PCT = 100 - config.getint('irs', 'volume_utilization_percent')
@@ -217,6 +228,7 @@ class Drive(core.Base):
         if not kwargs.get('serial'):
             self.serial = kwargs.get('imageID'[-20:]) or ''
         self._lock = threading.Lock()
+        self._monitor_lock = threading.Lock()
         self._path = None
         self._diskType = None
         # device needs to be initialized in prior
@@ -228,6 +240,7 @@ class Drive(core.Base):
         self._iotune = {}
         self.managed = False
         self.scratch_disk = None
+        self.managed_reservation = False
 
         super(Drive, self).__init__(log, **kwargs)
 
@@ -235,6 +248,7 @@ class Drive(core.Base):
             self.vm_custom = {}
         self._monitorable = True
         self.threshold_state = BLOCK_THRESHOLD.UNSET
+        self.extend_time = 0.0  # Distant past.
         # Keep sizes as int
         self.reqsize = int(kwargs.get('reqsize', '0'))  # Backward compatible
         self.truesize = int(kwargs.get('truesize', '0'))
@@ -377,8 +391,8 @@ class Drive(core.Base):
     @property
     def replicaChunked(self):
         """
-        Return True if drive is replicating to chuked storage and the replica
-        volume may require extending. See Drive.chunkd for more info.
+        Return True if drive is replicating to chunked storage and the replica
+        volume may require extending. See Drive.chunked for more info.
         """
         replica = getattr(self, "diskReplicate", {})
         return (replica.get("diskType") == DISK_TYPE.BLOCK and
@@ -451,8 +465,8 @@ class Drive(core.Base):
 
     def needs_monitoring(self):
         """
-        Return True if the drive needs to be picked by
-        a Drivemonitor periodic check, False otherwise.
+        Return True if the drive needs to be picked by the VolumeMonitor
+        periodic check, False otherwise.
 
         Drive needs monitoring in a subset of the above cases. We can
         can have two states:
@@ -922,10 +936,12 @@ class Drive(core.Base):
 
     def on_block_threshold(self, reported_path):
         """
-        Callback to be executed when we receive a BLOCK_THRESHOLD
-        event from libvirt. We mark this drive accordingly,
-        so the periodic check will pick up this drive for
-        extension.
+        Called when disk allocation exceeds configured threshold.
+
+        Mark this drive for extension, to be picked by the periodic monitor
+        later.
+
+        Return True if threshold state was modified.
         """
         with self._lock:
             if reported_path != self._path:
@@ -933,11 +949,51 @@ class Drive(core.Base):
                     "block threshold event mismatch drive %r path=%r "
                     "reported path=%r - ignored",
                     self.name, self._path, reported_path)
-                return
+                return False
 
-            self._threshold_state = BLOCK_THRESHOLD.EXCEEDED
-            self.exceeded_time = time.monotonic_time()
-            self.log.info("drive %r threshold exceeded", self.name)
+            return self._mark_for_extension()
+
+    def on_enospc(self):
+        """
+        Called when a VM was paused because of ENOSPC error when writing to
+        this drive.
+
+        We mark the drive for extension so it will be picked up by the periodic
+        monitor later.
+
+        Return True if threshold state was modified.
+        """
+        with self._lock:
+            return self._mark_for_extension()
+
+    def _mark_for_extension(self):
+        """
+        Must be called when holding self._lock.
+        """
+        if self._threshold_state == BLOCK_THRESHOLD.EXCEEDED:
+            self.log.debug(
+                "drive %r block threshold already exceeded, ignored",
+                self.name)
+            return False
+
+        self.log.info("drive %r needs extension", self.name)
+        self._threshold_state = BLOCK_THRESHOLD.EXCEEDED
+        self.exceeded_time = time.monotonic_time()
+        return True
+
+    @contextmanager
+    def monitor_lock(self, timeout):
+        """
+        Context manager acquiring lock for monitoring thin provisioned drive.
+        Raises MonitorBusy if acquiring the lock times out.
+        """
+        if not self._monitor_lock.acquire(timeout=timeout):
+            raise MonitorBusy(
+                f"Timeout acquiring monitor lock for drive {self.name}")
+        try:
+            yield
+        finally:
+            self._monitor_lock.release()
 
 
 def chain_index(actual_chain, vol_id, drive_name):
@@ -1039,6 +1095,10 @@ def _getSourceXML(drive):
     if drive["diskType"] == DISK_TYPE.BLOCK:
         needs_seclabel = True
         source.setAttrs(dev=drive["path"])
+        if 'managed_reservation' in drive and drive["managed_reservation"]:
+            reservations = vmxml.Element('reservations')
+            reservations.set('managed', 'yes')
+            source.appendChild(reservations)
     elif drive["diskType"] == DISK_TYPE.NETWORK:
         if drive["protocol"] == "gluster":
             needs_seclabel = True

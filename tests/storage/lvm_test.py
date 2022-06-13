@@ -645,7 +645,7 @@ def test_removevg_failure_cache(monkeypatch, fake_devices):
 
 
 def test_deactivatevg_failure_cache(monkeypatch, fake_devices):
-    fake_runner = FakeRunner(rc=5)
+    fake_runner = FakeRunner(rc=5, err=b"Fake lvm error")
     lc = lvm.LVMCache(fake_runner)
 
     monkeypatch.setattr(lvm, "_lvminfo", lc)
@@ -666,6 +666,15 @@ def test_deactivatevg_failure_cache(monkeypatch, fake_devices):
     # TODO: verify that vg mappings were removed
     # Verify that lvs are invalidated after deactivateVG() failed.
     assert lvm._lvminfo._lvs[(fake_vg.name, fake_lv.name)].is_stale()
+    # Verify that getVG raises with a LVM error
+    with pytest.raises(se.VolumeGroupDoesNotExist) as e:
+        lvm.getVG("non-existing-vg-name")
+    # Ensure that the error is captured and printed in the exception.
+    assert "Fake lvm error" in str(e.value)
+    # Local cache shall remain intact after an LVM error
+    assert len(lc._vgs) == 1
+    assert len(lc._pvs) == 1
+    assert len(lc._lvs) == 1
 
 
 def test_resizepv_success_cache(monkeypatch):
@@ -952,9 +961,11 @@ def test_vg_create_remove_single_device(tmp_storage):
 
     # We remove the VG
     clear_stats()
-    with pytest.raises(se.VolumeGroupDoesNotExist):
+    with pytest.raises(se.VolumeGroupDoesNotExist) as e:
         lvm.getVG(vg_name)
     check_stats(hits=0, misses=1)
+
+    assert vg_name in str(e.value)
 
     # But keep the PVs, not sure why.
     clear_stats()
@@ -1009,9 +1020,11 @@ def test_vg_create_multiple_devices(tmp_storage):
 
     # We remove the VG
     clear_stats()
-    with pytest.raises(se.VolumeGroupDoesNotExist):
+    with pytest.raises(se.VolumeGroupDoesNotExist) as e:
         lvm.getVG(vg_name)
     check_stats(hits=0, misses=1)
+
+    assert vg_name in str(e.value)
 
     # But keep the PVs, not sure why.
     for dev in dev1, dev2, dev3:
@@ -1021,6 +1034,63 @@ def test_vg_create_multiple_devices(tmp_storage):
 
         assert pv.name == dev
         assert pv.vg_name == ""
+
+
+@requires_root
+@pytest.mark.root
+def test_vg_remove_by_uuid(tmp_storage):
+    dev_size = 10 * GiB
+
+    dev1 = tmp_storage.create_device(dev_size)
+    dev2 = tmp_storage.create_device(dev_size)
+    vg1_name = str(uuid.uuid4())
+    vg2_name = str(uuid.uuid4())
+
+    lvm.createVG(vg1_name, [dev1], "initial-tag", 128)
+    lvm.createVG(vg2_name, [dev2], "initial-tag", 128)
+
+    vg = lvm.getVG(vg1_name)
+
+    clear_stats()
+    lvm.removeVGbyUUID(vg.uuid)
+    check_stats(hits=0, misses=1)
+
+    # Ensure we have removed the matching VG.
+    with pytest.raises(se.VolumeGroupDoesNotExist):
+        lvm.getVGbyUUID(vg.uuid)
+
+    with pytest.raises(se.VolumeGroupDoesNotExist):
+        lvm.getVG(vg1_name)
+
+    assert len(lvm.getAllVGs()) == 1
+
+    # The other VG is still available.
+    vg2 = lvm.getVG(vg2_name)
+    assert vg2.name == vg2_name
+
+
+def test_vg_invalid_output(monkeypatch, fake_devices):
+    fake_runner = FakeRunner(out=b"Fake lvm output")
+    lc = lvm.LVMCache(fake_runner)
+    lc._stalevg = False
+
+    # Create fake devices.
+    fake_pv = make_pv(pv_name=fake_devices[0], vg_name="vg")
+    fake_vg = make_vg(pvs=[fake_pv.name], vg_name="vg")
+
+    # Assign fake PV, VG to cache.
+    lc._pvs = {fake_pv.name: fake_pv}
+    lc._vgs = {fake_vg.name: fake_vg}
+
+    monkeypatch.setattr(lvm, "_lvminfo", lc)
+
+    # TODO: is this the best way to handle this unlikely error
+    # An error with an LVM invalid output shall keep the local cache intact
+    with pytest.raises(lvm.InvalidOutputLine) as e:
+        lvm.getVG("vg-name")
+    assert "Fake lvm output" in str(e.value)
+    assert len(lc._vgs) == 1
+    assert len(lc._pvs) == 1
 
 
 @pytest.fixture
@@ -1038,17 +1108,18 @@ def stale_pv(tmp_storage):
     pvs = sorted(pv.name for pv in lvm.getAllPVs())
     assert pvs == sorted([good_pv_name, stale_pv_name])
 
+    devices = ",".join([good_pv_name, stale_pv_name])
     # Simulate removal of the second PV on another host, leaving stale PV in
     # the cache.
     commands.run([
         "vgreduce",
-        "--config", tmp_storage.lvm_config(),
+        "--devices", devices,
         vg_name,
         stale_pv_name,
     ])
     commands.run([
         "pvremove",
-        "--config", tmp_storage.lvm_config(),
+        "--devices", devices,
         stale_pv_name,
     ])
 
@@ -1513,7 +1584,7 @@ def stale_vg(tmp_storage):
     # the cache.
     commands.run([
         "vgremove",
-        "--config", tmp_storage.lvm_config(),
+        "--devices", dev2,
         stale_vg_name,
     ])
 
@@ -1626,6 +1697,7 @@ def test_lv_activate_deactivate(tmp_storage):
 @requires_root
 @pytest.mark.root
 def test_lv_deactivate_in_use(tmp_storage):
+    # TODO: This test does not work in active hosts.
     dev_size = 1 * GiB
     dev = tmp_storage.create_device(dev_size)
     vg_name = str(uuid.uuid4())
@@ -1753,7 +1825,7 @@ def test_lv_refresh(tmp_storage):
     # Simulate extending the LV on the SPM.
     commands.run([
         "lvextend",
-        "--config", tmp_storage.lvm_config(),
+        "--devices", dev,
         "-L+1g",
         lv_fullname
     ])
@@ -1766,7 +1838,7 @@ def test_lv_refresh(tmp_storage):
     # Simulate extending the LV on the SPM.
     commands.run([
         "lvextend",
-        "--config", tmp_storage.lvm_config(),
+        "--devices", dev,
         "-L+1g",
         lv_fullname
     ])
@@ -1775,53 +1847,6 @@ def test_lv_refresh(tmp_storage):
     lvm.activateLVs(vg_name, [lv_name])
     lv = lvm.getLV(vg_name, lv_name)
     assert int(lv.size) == 3 * GiB
-
-
-@requires_root
-@pytest.mark.root
-def test_lv_rename_success(tmp_storage):
-    dev_size = 10 * GiB
-    dev = tmp_storage.create_device(dev_size)
-    vg_name = str(uuid.uuid4())
-    lv_name = str(uuid.uuid4())
-
-    lvm.createVG(vg_name, [dev], "initial-tag", 128)
-
-    lvm.createLV(vg_name, lv_name, 1024)
-
-    new_lv_name = "renamed-" + lv_name
-
-    lvm.renameLV(vg_name, lv_name, new_lv_name)
-
-    lv = lvm.getLV(vg_name, new_lv_name)
-    assert lv.name == new_lv_name
-
-
-def test_lv_rename_failure(monkeypatch, fake_devices):
-    fake_runner = FakeRunner(rc=5)
-    lc = lvm.LVMCache(fake_runner)
-
-    monkeypatch.setattr(lvm, "_lvminfo", lc)
-
-    # Create fake devices.
-    fake_pv = make_pv(pv_name="pv", vg_name="vg")
-    fake_vg = make_vg(pvs=[fake_pv.name], vg_name="vg")
-    fake_lv = make_lv(vg_name=fake_vg.name, pvs=[fake_pv.name], lv_name="lv")
-
-    # Assign fake PV, VG, LV to cache.
-    lc._pvs = {fake_pv.name: fake_pv}
-    lc._vgs = {fake_vg.name: fake_vg}
-    lc._lvs = {(fake_vg.name, fake_lv.name): fake_lv}
-
-    # Run failing renameLV().
-    with pytest.raises(se.LVMCommandError):
-        lvm.renameLV(fake_vg.name, fake_lv.name, "newname")
-
-    # Verify that cache was not changed after renameLV() failed.
-    assert lc._lvs[(fake_vg.name, fake_lv.name)] == fake_lv
-
-    # Verify that renamed lv is not invalidated after renameLV() failed.
-    assert not lvm._lvminfo._lvs[(fake_vg.name, fake_lv.name)].is_stale()
 
 
 @requires_root
@@ -1935,8 +1960,8 @@ def stale_lv(tmp_storage):
     # the cache.
     commands.run([
         "lvremove",
-        "--config", tmp_storage.lvm_config(),
-        "{}/{}".format(vg_name, stale_lv_name),
+        "--devices", dev,
+        f"{vg_name}/{stale_lv_name}",
     ])
 
     # The cache still keeps both lvs.

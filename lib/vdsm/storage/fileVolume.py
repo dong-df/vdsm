@@ -24,6 +24,8 @@ import errno
 import logging
 import os
 
+import sanlock
+
 from vdsm import constants
 from vdsm import utils
 from vdsm.common import cmdutils
@@ -40,7 +42,6 @@ from vdsm.storage import outOfProcess as oop
 from vdsm.storage import qemuimg
 from vdsm.storage import task
 from vdsm.storage import volume
-from vdsm.storage.compat import sanlock
 from vdsm.storage.sdc import sdCache
 from vdsm.storage.volumemetadata import VolumeMetadata
 
@@ -568,7 +569,7 @@ class FileVolume(volume.Volume):
             # If the image is preallocated, allocate the rest of the image
             # using fallocate helper. qemu-img create always writes zeroes to
             # the first block so we should skip it during preallocation.
-            if preallocate == sc.PREALLOCATED_VOL:
+            if size > 4096 and preallocate == sc.PREALLOCATED_VOL:
                 op = fallocate.allocate(vol_path, size - 4096, offset=4096)
 
                 # This is fast on NFS 4.2, GlusterFS, XFS and ext4, but can be

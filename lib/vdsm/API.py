@@ -191,8 +191,10 @@ class VM(APIBase):
         """
         # self._UUID is None in this call, it must be retrieved from XML
         xml = vmParams.get('_srcDomXML') or vmParams['xml']
-        self._UUID = DomainDescriptor(xml, xml_source=XmlSource.INITIAL).id
+        descriptor = DomainDescriptor(xml, xml_source=XmlSource.INITIAL)
+        self._UUID = descriptor.id
         vmParams['vmId'] = self._UUID
+        vmParams['initialVCPUPin'] = descriptor.pinned_cpus
         try:
             if vmParams.get('vmId') in self._cif.vmContainer:
                 self.log.warning('vm %s already exists' % vmParams['vmId'])
@@ -549,8 +551,9 @@ class VM(APIBase):
 
     @api.logged(on="api.virt")
     @api.method
-    def diskReplicateStart(self, srcDisk, dstDisk):
-        return self.vm.diskReplicateStart(srcDisk, dstDisk)
+    def diskReplicateStart(self, srcDisk, dstDisk, needExtend=True):
+        return self.vm.diskReplicateStart(
+            srcDisk, dstDisk, need_extend=needExtend)
 
     @api.logged(on="api.virt")
     @api.method
@@ -899,10 +902,10 @@ class Volume(APIBase):
         return self._irs.setVolumeLegality(self._sdUUID, self._spUUID,
                                            self._imgUUID, self._UUID, legality)
 
-    def measure(self, dstVolFormat, backing_chain=True):
+    def measure(self, dstVolFormat, backing_chain=True, baseID=None):
         return self._irs.measure(
             self._sdUUID, self._imgUUID, self._UUID, dstVolFormat,
-            backing=backing_chain)
+            backing=backing_chain, baseUUID=baseID)
 
     def teardown(self):
         return self._irs.teardownVolume(
@@ -1808,16 +1811,19 @@ class ManagedVolume(APIBase):
 
     @api.logged(on="api.storage")
     @api.method
-    def attach_volume(self, vol_id, connection_info):
+    def attach_volume(self, vol_id, connection_info, sd_id):
         """
         attach volume and return attached device information
         """
-        return managedvolume.attach_volume(vol_id, connection_info)
+        return managedvolume.attach_volume(
+            sd_id,
+            vol_id,
+            connection_info)
 
     @api.logged(on="api.storage")
     @api.method
-    def detach_volume(self, vol_id):
-        return managedvolume.detach_volume(vol_id)
+    def detach_volume(self, vol_id, sd_id):
+        return managedvolume.detach_volume(sd_id, vol_id)
 
     @api.logged(on="api.storage")
     @api.method

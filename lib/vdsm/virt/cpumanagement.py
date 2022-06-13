@@ -18,9 +18,11 @@
 
 import libvirt
 import threading
+import xml.etree.ElementTree as ET
 
 from vdsm import numa
 from vdsm.virt import virdomain
+from vdsm.virt import vmxml
 
 # no policy defined, CPUs from shared pool will be used
 CPU_POLICY_NONE = "none"
@@ -136,6 +138,27 @@ def _assign_shared(cif, target_vm=None):
                 # pool for other VMs.
 
 
+def _flatten_cpusets(cpusets_dict):
+    """
+    Convert dictionary with cpusets (key: vCPU ID, value: frozenset) into a
+    list where on index <vCPU_ID> is string description of cpuset if such is
+    specified in the dictionary and None otherwise. The first form is used
+    when parsing libvirt domain XML and the second form is used in VDSM API
+    calls.
+
+    :param cpusets_dict: Dictionary with CPU sets
+    :type cpusets_dict: dict
+
+    :returns: list of strings
+    """
+    if len(cpusets_dict.keys()) == 0:
+        return []
+    result = [None] * (max(cpusets_dict.keys()) + 1)
+    for cpu_id, cpuset in cpusets_dict.items():
+        result[cpu_id] = ",".join(map(str, cpuset))
+    return result
+
+
 def libvirt_cpuset_spec(cpus, cpu_list_length):
     """
     Turn set of CPU IDs to a CPU set list for libvirt API. That is a tuple of
@@ -158,6 +181,59 @@ def libvirt_cpuset_spec(cpus, cpu_list_length):
     for cpu in cpus:
         cpuset[cpu] = True
     return tuple(cpuset)
+
+
+def replace_cpu_pinning(vm, dom, target_vcpupin):
+    """
+    Replace <vcpupin> elements in <cputune>. This removes all vCPU pinning
+    added by VDSM and honors list of manaually pinned CPUs. It then adds and
+    replaces remainging <vcpupin> elements to match requested vCPU pinning.
+
+    :param vm: associated VM object
+    :type vm: vdsm.virt.VM
+    :param dom: DOM of the libvirt XML
+    :type dom: xml.etree.ElementTree.Element
+    :param target_vcpupin: Dictionary describing requested vCPU pinning --
+      key: vCPU ID, value: cpuset.
+    :type target_vcpupin: dict
+    """
+    cputune = dom.find('cputune')
+    if cputune is not None:
+        for vcpu in vmxml.find_all(cputune, 'vcpupin'):
+            vcpu_id = int(vcpu.get('vcpu'))
+            if (vm.cpu_policy() == CPU_POLICY_MANUAL
+                    and vcpu_id in vm.manually_pinned_cpus()):
+                continue
+            cputune.remove(vcpu)
+    # Reconfigure CPU pinning based on the call parameter
+    if target_vcpupin is not None and len(target_vcpupin) > 0:
+        if type(target_vcpupin) == dict:
+            target_vcpupin = _flatten_cpusets(target_vcpupin)
+        else:
+            # Make sure we don't modify original list
+            target_vcpupin = list(target_vcpupin)
+        if cputune is None:
+            cputune = ET.Element('cputune')
+            dom.append(cputune)
+        # First modify existing elements
+        for vcpupin in vmxml.find_all(cputune, 'vcpupin'):
+            vcpu_id = int(vcpupin.get('vcpu'))
+            if vcpu_id >= 0 and vcpu_id < len(target_vcpupin):
+                vcpupin.set('cpuset',
+                            str(target_vcpupin[vcpu_id]))
+                target_vcpupin[vcpu_id] = None
+        # Now create elements for pinning that was not there before.
+        # This should happen only for pinning that was removed above. It
+        # should not happen for manual CPU pinning because it would render
+        # the value of manuallyPinedCPUs metadata invalid.
+        for vcpu_id, cpuset in enumerate(target_vcpupin):
+            if cpuset is None:
+                continue
+            vcpupin = ET.Element('vcpupin')
+            vcpupin.set('vcpu', str(vcpu_id))
+            vcpupin.set('cpuset', str(cpuset))
+            cputune.append(vcpupin)
+    return dom
 
 
 def _shared_pool(cif, online_cpus, core_cpus):

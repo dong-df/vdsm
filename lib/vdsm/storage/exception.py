@@ -1315,6 +1315,23 @@ class LVMCommandError(StorageException):
         return cls(e.cmd, e.rc, e.out, e.err).with_exception(e)
 
 
+class _HoldingLVMCommandError(StorageException):
+    def __init__(self, error=None):
+        if error is not None and not isinstance(error, LVMCommandError):
+            raise TypeError(
+                f"Expecting instance of LVMCommandError, got {type(error)}")
+
+        self.error = error
+
+    @property
+    def value(self):
+        pairs = [(k, v) for k, v in self.__dict__.items()
+                 if v and k != "error"]
+        if self.error:
+            pairs.append(("error", self.error))
+        return ", ".join(f"{k}={v}" for k, v in pairs)
+
+
 class VolumeGroupActionError(StorageException):
     code = 500
     msg = "Error volume group action"
@@ -1345,9 +1362,21 @@ class VolumeGroupAlreadyExistsError(StorageException):
     msg = "Volume Group Already Exists"
 
 
-class VolumeGroupDoesNotExist(StorageException):
+class VolumeGroupDoesNotExist(_HoldingLVMCommandError):
     code = 506
     msg = "Volume Group does not exist"
+
+    def __init__(self, vg_name=None, vg_uuid=None, error=None):
+        if vg_name is None and vg_uuid is None:
+            raise ValueError("Require a VG name or UUID")
+
+        super().__init__(error)
+        self.vg_name = vg_name
+        self.vg_uuid = vg_uuid
+
+    @classmethod
+    def from_error(cls, vg_name, error):
+        return cls(vg_name=vg_name, error=error).with_exception(error)
 
 
 class VolumeGroupRenameError(StorageException):
@@ -1569,11 +1598,17 @@ class CouldNotRetrieveLogicalVolumesList(StorageException):
     msg = "Could not retrieve lv list"
 
 
-class InaccessiblePhysDev(StorageException):
-    def __init__(self, devices):
-        self.value = "devices=%s" % (devices,)
+class InaccessiblePhysDev(_HoldingLVMCommandError):
     code = 606
     msg = "Multipath cannot access physical device(s)"
+
+    def __init__(self, devices, error=None):
+        super().__init__(error)
+        self.devices = devices
+
+    @classmethod
+    def from_error(cls, devices, error):
+        return cls(devices=devices, error=error).with_exception(error)
 
 
 class PartitionedPhysDev(StorageException):
@@ -1593,9 +1628,18 @@ class MissingTagOnLogicalVolume(StorageException):
     msg = "Missing logical volume tag."
 
 
-class LogicalVolumeDoesNotExistError(StorageException):
+class LogicalVolumeDoesNotExistError(_HoldingLVMCommandError):
     code = 610
     msg = "Logical volume does not exist"
+
+    def __init__(self, vg_name, lv_name, error=None):
+        super().__init__(error)
+        self.vg_name = vg_name
+        self.lv_name = lv_name
+
+    @classmethod
+    def from_error(cls, vg_name, lv_name, error):
+        return cls(vg_name, lv_name, error=error).with_exception(error)
 
 
 class LogicalVolumeCachingError(StorageException):

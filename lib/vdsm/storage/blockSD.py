@@ -35,6 +35,7 @@ from collections import namedtuple
 from contextlib import contextmanager
 from contextlib import closing
 
+import sanlock
 import six
 
 from vdsm.common import concurrent
@@ -63,7 +64,6 @@ from vdsm.storage import resourceManager as rm
 from vdsm.storage import sanlock_direct
 from vdsm.storage import sd
 from vdsm.storage import volumemetadata
-from vdsm.storage.compat import sanlock
 from vdsm.storage.mailbox import MAILBOX_SIZE
 from vdsm.storage.persistent import PersistentDict, DictValidator
 from vdsm.storage.volumemetadata import VolumeMetadata
@@ -521,7 +521,8 @@ class BlockStorageDomainManifest(sd.StorageDomainManifest):
                 "This PV is used by LVM to store the VG metadata")
 
     def _validatePVsPartOfVG(self, pv, dstPVs=None):
-        vgPvs = {os.path.basename(pv) for pv in lvm.listPVNames(self.sdUUID)}
+        vgPvs = {os.path.basename(path)
+                 for path in lvm.listPVNames(self.sdUUID)}
         if pv not in vgPvs:
             raise se.NoSuchPhysicalVolume(pv, self.sdUUID)
         if dstPVs:
@@ -1600,7 +1601,8 @@ class BlockStorageDomain(sd.StorageDomain):
     def reduceVolume(self, imgUUID, volUUID, allowActive=False):
         with self.manifest.metadata_lock:
             vol = self.produceVolume(imgUUID, volUUID)
-            vol.reduce(vol.optimal_size(), allowActive=allowActive)
+            if vol.can_reduce():
+                vol.reduce(vol.optimal_size(), allowActive=allowActive)
 
     @staticmethod
     def findDomainPath(sdUUID):

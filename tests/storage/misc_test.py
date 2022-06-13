@@ -47,7 +47,7 @@ from vdsm.storage import fileUtils
 from vdsm.storage import misc
 
 from monkeypatch import MonkeyPatch
-from testValidation import checkSudo
+from . marks import requires_root
 
 
 EXT_DD = "/bin/dd"
@@ -415,9 +415,7 @@ class TestReadBlock(VdsmTestCase):
         """
         Test that when all arguments are correct the method works smoothly.
         """
-        writeData = (b"DON'T THINK OF IT AS DYING, said Death. "
-                     b"JUST THINK OF IT AS LEAVING EARLY TO AVOID THE RUSH.")
-        # (C) Terry Pratchet - Good Omens
+        writeData = b"Some data"
         dataLength = len(writeData)
 
         offset = 512
@@ -459,9 +457,7 @@ class TestReadBlock(VdsmTestCase):
         See that correct exception is raised when trying to read more then the
         file has to offer.
         """
-        writeData = (b"History, contrary to popular theories, "
-                     b"is kings and dates and battles.")
-        # (C) Terry Pratchet - Small Gods
+        writeData = b"Some data"
 
         offset = 512
         size = 512
@@ -574,10 +570,9 @@ class TestExecCmd(VdsmTestCase):
         Tests that execCmd correctly returns the standard output of the prog it
         executes.
         """
-        line = ("All I wanted was to have some pizza, hang out with dad, "
-                "and not let your weirdness mess up my day")
-        # (C) Nickolodeon - Invader Zim
+        line = "Some text line"
         ret, stdout, stderr = commands.execCmd((EXT_ECHO, line))
+        self.assertEqual(ret, 0, f"Command failed: {stderr}")
         self.assertEqual(stdout[0].decode("ascii"), line)
 
     def testStdErr(self):
@@ -587,16 +582,18 @@ class TestExecCmd(VdsmTestCase):
         """
         cmd = ["sh", "-c", "echo it works! >&2"]
         ret, stdout, stderr = commands.execCmd(cmd)
+        self.assertEqual(ret, 0, f"Command failed: {stderr}")
         self.assertEqual(stderr[0].decode("ascii"), "it works!")
 
+    @requires_root
     def testSudo(self):
         """
         Tests that when running with sudo the user really is root (or other
         desired user).
         """
         cmd = [EXT_WHOAMI]
-        checkSudo(cmd)
         ret, stdout, stderr = commands.execCmd(cmd, sudo=True)
+        self.assertEqual(ret, 0, f"Command failed: {stderr}")
         self.assertEqual(stdout[0].decode("ascii"), SUDO_USER)
 
     def testNice(self):

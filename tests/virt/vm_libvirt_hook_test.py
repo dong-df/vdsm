@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
-#
-# Copyright 2019-2020 Red Hat, Inc.
+# Copyright 2019-2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,16 +17,14 @@
 # Refer to the README and COPYING files for full details of the license
 #
 
-from __future__ import absolute_import
-
 import io
 
 from vdsm.virt.libvirthook import vm_libvirt_hook
 
-from testlib import XMLTestCase
+from testlib import normalized
 
 
-_DISK_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
+_ORIG_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
                        xmlns:ovirt-vm="http://ovirt.org/vm/1.0" type="kvm">
     <name>test</name>
     <devices>
@@ -75,6 +71,19 @@ _DISK_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
             <link state="up" />
             <source bridge="ovirtmgmt" />
         </interface>
+        <graphics autoport="yes" passwd="12characters"
+                  passwdValidTo="1970-01-01T00:00:01"
+                  port="-1" tlsPort="-1" type="vnc">
+            <channel mode="secure" name="main"/>
+            <channel mode="secure" name="inputs"/>
+            <channel mode="secure" name="cursor"/>
+            <channel mode="secure" name="playback"/>
+            <channel mode="secure" name="record"/>
+            <channel mode="secure" name="display"/>
+            <channel mode="secure" name="smartcard"/>
+            <channel mode="secure" name="usbredir"/>
+            <listen network="vdsm-ovirtmgmt" type="network"/>
+        </graphics>
     </devices>
     <metadata>
         <ns0:qos />
@@ -90,7 +99,7 @@ _DISK_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
 </domain>
 '''
 
-_MODIFIED_DISK_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
+_MODIFIED_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
                            xmlns:ovirt-vm="http://ovirt.org/vm/1.0" type="kvm">
     <name>test</name>
     <devices>
@@ -142,6 +151,19 @@ _MODIFIED_DISK_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
             <link state="up" />
             <source bridge="ovirtmgmt" />
         </interface>
+        <graphics autoport="yes" passwd="12charac"
+                  passwdValidTo="1970-01-01T00:00:01"
+                  port="-1" tlsPort="-1" type="vnc">
+            <channel mode="secure" name="main"/>
+            <channel mode="secure" name="inputs"/>
+            <channel mode="secure" name="cursor"/>
+            <channel mode="secure" name="playback"/>
+            <channel mode="secure" name="record"/>
+            <channel mode="secure" name="display"/>
+            <channel mode="secure" name="smartcard"/>
+            <channel mode="secure" name="usbredir"/>
+            <listen network="vdsm-ovirtmgmt" type="network"/>
+        </graphics>
     </devices>
     <metadata>
         <ns0:qos />
@@ -158,18 +180,18 @@ _MODIFIED_DISK_XML = '''<domain xmlns:ns0="http://ovirt.org/vm/tune/1.0"
 '''
 
 
-class MigrateHookTestCase(XMLTestCase):
+class TestMigrateHook:
 
     def _test_hook(self, xml, modified_xml,
                    domain='foo', event='migrate', phase='begin'):
         stdin = io.StringIO(xml)
         stdout = io.StringIO()
         vm_libvirt_hook.main(domain, event, phase, stdin=stdin, stdout=stdout)
-        self.assertXMLEqual(stdout.getvalue(), modified_xml)
+        assert normalized(stdout.getvalue()) == normalized(modified_xml)
 
     def test_empty(self):
         xml = '<domain/>'
         self._test_hook(xml, xml)
 
-    def test_disks(self):
-        self._test_hook(_DISK_XML, _MODIFIED_DISK_XML)
+    def test_modifications(self):
+        self._test_hook(_ORIG_XML, _MODIFIED_XML)

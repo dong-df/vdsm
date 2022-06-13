@@ -25,6 +25,8 @@ import six
 
 from collections import defaultdict
 
+import pytest
+
 from vdsm.common.compat import get_args_spec
 from vdsm.common.exception import GeneralException
 from vdsm.common.exception import VdsmException
@@ -39,6 +41,10 @@ def find_module_exceptions(module, base_class=None):
             continue
 
         if base_class and not issubclass(obj, base_class):
+            continue
+
+        # Internal classes are skipped.
+        if name.startswith('_'):
             continue
 
         yield obj
@@ -58,6 +64,11 @@ def test_collisions():
 
 def test_info():
     for obj in find_module_exceptions(storage_exception, VdsmException):
+        if issubclass(obj, storage_exception._HoldingLVMCommandError):
+            # Skip since a constructor parameter requires a specific type.
+            # This exception should be tested separately.
+            continue
+
         # Inspect exception object initialization parameters.
         args, varargs, kwargs = get_args_spec(obj.__init__)
 
@@ -75,6 +86,63 @@ def test_info():
             "code": e.code,
             "message": str(e)
         }
+
+
+def test_LogicalVolumeDoesNotExistError():
+    # Expected error type is LVMCommandError.
+    with pytest.raises(TypeError):
+        e = storage_exception.LogicalVolumeDoesNotExistError(
+            "vg-name", "lv-name", error="error")
+
+    # Correct initialization.
+    fake_error = storage_exception.LVMCommandError(
+        rc=5, cmd=["fake"], out=["fake output"], err=["fake error"])
+    e = storage_exception.LogicalVolumeDoesNotExistError(
+        "vg-name", "lv-name", error=fake_error)
+    assert e.error == fake_error
+    # Check error format
+    formatted = str(e)
+    assert "vg_name=vg-name" in formatted
+    assert "lv_name=lv-name" in formatted
+    assert "error=" in formatted
+
+
+def test_VolumeGroupDoesNotExist():
+    # Require a VG name or UUID at initialization.
+    # Empty constructor shall raise.
+    with pytest.raises(ValueError):
+        e = storage_exception.VolumeGroupDoesNotExist()
+
+    # Expected error type is LVMCommandError.
+    with pytest.raises(TypeError):
+        e = storage_exception.VolumeGroupDoesNotExist("vg-name", error="error")
+
+    # Correct initialization.
+    fake_error = storage_exception.LVMCommandError(
+        rc=5, cmd=["fake"], out=["fake output"], err=["fake error"])
+    e = storage_exception.VolumeGroupDoesNotExist("vg-name", error=fake_error)
+    assert e.error == fake_error
+    # Check error format
+    formatted = str(e)
+    assert "vg_name=vg-name" in formatted
+    assert "error=" in formatted
+    assert "vg_uuid=" not in formatted
+
+
+def test_InaccessiblePhysDev():
+    # Expected error type is LVMCommandError.
+    with pytest.raises(TypeError):
+        e = storage_exception.InaccessiblePhysDev("pv-name", error="error")
+
+    # Correct initialization.
+    fake_error = storage_exception.LVMCommandError(
+        rc=5, cmd=["fake"], out=["fake output"], err=["fake error"])
+    e = storage_exception.InaccessiblePhysDev("pv-name", error=fake_error)
+    assert e.error == fake_error
+    # Check error format
+    formatted = str(e)
+    assert "devices=pv-name" in formatted
+    assert "error=" in formatted
 
 
 class FakeArg(int):

@@ -1,6 +1,4 @@
-==========
-Vdsm tests
-==========
+# Vdsm tests
 
 This tests suite is built on tox, pytest and nose. For more info on
 these projects see:
@@ -9,13 +7,28 @@ these projects see:
 - pytest: https://pytest.readthedocs.io/
 - nose: http://nose.readthedocs.io/
 
-Tox and pytest based tests
-==========================
+# Tox and pytest based tests
 
 Note: Not all tests have been converted to tox and/or pytest yet.
 
-Running the tests
------------------
+## Running the tests
+
+Before running vdsm tests, activate the environment:
+
+    source ~/.venv/vdsm/bin/activate
+
+When done, you can deactivate the environment:
+
+    deactivate
+
+Before running storage tests, make sure you have setup the user storage
+accordingly. To create storage you can do:
+
+    make storage
+
+See
+[Setting up user storage](./storage/README.md#setting-up-user-storage)
+for more information.
 
 Run storage tests:
 
@@ -27,16 +40,23 @@ Increasing test verbosity:
 
 You can also use environment variables:
 
-   export PYTEST_ADDOPTS=-vv
-   tox -e storage
+    export PYTEST_ADDOPTS=-vv
+    tox -e storage
 
 Running specific storage tests modules:
 
-   tox -e storage -- storage/image_test.py
+    tox -e storage -- storage/image_test.py
+
+Alternatively, all tests but storage tests can be run by doing:
+
+    make tests
+
+Furthermore, storage-only tests can be run by doing:
+
+    make tests-storage
 
 
-Using tox virtual environment
------------------------------
+## Using tox virtual environment
 
 Tox creates a virtual environment for each testenv. You don't have to
 know anything about this if you run the tests with tox, but if you like
@@ -85,8 +105,19 @@ Note that your prompt has changed again:
     [user@fedora tests (storage-tests)]$
 
 
-Using pytest directly
----------------------
+## Troubleshooting
+
+Tox may fail due to an outdated or corrupted virtual environment.
+To solve this you can recreate a specific tox environment without test execution:
+
+    tox -e storage -r --notest
+
+Or just remove the tox hidden folder to clean all tox environments by doing:
+
+    rm -rf .tox
+
+
+## Using pytest directly
 
 Running all the tests takes couple of minutes. For quicker feedback you can use
 pytest directly to run a module or some tests in a module.
@@ -122,8 +153,7 @@ Running only stress tests, using markers:
 
     pytest -m "stress" storage
 
-Running the tests as root
--------------------------
+## Running the tests as root
 
 When using sudo, use env to pass PYTHONPATH to the underlying program:
 
@@ -136,11 +166,9 @@ When running the tests as root, use another --basetemp directory for pytest:
 This will avoid failures when you run the tests later as regular user, when
 pytest will try to remove old temporary directories created by root.
 
-Nose based tests
-================
+# Nose based tests
 
-Running the tests
------------------
+## Running the tests
 
 Running the tests from the tests directory, using vdsm code from the source
 directory (lib/vdsm):
@@ -153,19 +181,18 @@ Running individual test module, test cases class or test function:
     ./run_tests_local.sh foo_test:TestBar
     ./run_tests_local.sh foo_test:TestBar.test_baz
 
-Enabling slow tests:
--------------------
+## Enabling slow tests
 
 Some tests are too slow to run on each build. these are marked in the source
 with the @slowtest decorator and are disabled by default.
 
 To enable slow tests:
-     ./run_tests_local.sh --enable-slow-tests filename [...]
+     
+    ./run_tests_local.sh --enable-slow-tests filename [...]
 
 Slow tests are also enabled if NOSE_SLOW_TESTS environment variable is set.
 
-Enabling stress tests:
----------------------
+## Enabling stress tests
 
 Some tests stress the resources of the system running the tests. These tests
 are too slow to run on each build, and may fail on overloaded system or when
@@ -173,12 +200,12 @@ running tests in parallel. These tests are marked in the source with the
 @stresstest decorator and are disabled by default.
 
 To enable stress tests:
-     ./run_tests_local.sh --enable-stress-tests filename [...]
+     
+    ./run_tests_local.sh --enable-stress-tests filename [...]
 
 Stress tests are also enabled if NOSE_STRESS_TESTS environment variable is set.
 
-Enabling threads leak check
----------------------------
+## Enabling threads leak check
 
 To find tests leaking threads, you can enable the thread leak checker plugin:
 
@@ -188,8 +215,7 @@ To run the entire test suit with thread leak detection:
 
     make check NOSE_WITH_THREAD_LEAK_CHECK=1
 
-Enabling process leak check
-----------------------------
+## Enabling process leak check
 
 To find tests leaking child processes, you can enable the process leak checker
 plugin:
@@ -200,8 +226,7 @@ To run the entire test suit with process leak detection:
 
     make check NOSE_WITH_PROCESS_LEAK_CHECK=1
 
-Enabling file leak check
-------------------------
+## Enabling file leak check
 
 To find tests leaking file descriptors, you can enable the process leak checker
 plugin:
@@ -212,24 +237,23 @@ To run the entire test suit with file leak detection:
 
     make check NOSE_WITH_FILE_LEAK_CHECK=1
 
-Control verbose level:
----------------------
+## Control verbose level
 
 By default, tests run without verbose level 1.
 To run with verbose output, set verbose level to 3.
 
 To set verbose level:
+    
     make check NOSE_VERBOSE=<VERBOSE LEVEL>
 
-Functional test suite:
-----------------------
+## Functional test suite
 
 The functional test suite is designed to test a running vdsm instance.  To run
 the full suite of functional tests from within the installed directory:
+    
     ./run_tests.sh functional/*.py
 
-Test timeout
-------------
+## Test timeout
 
 If TIMEOUT environment variable is set, and a test run is too slow, it is
 aborted, and a backtrace of all threads is printed.

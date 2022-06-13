@@ -36,6 +36,7 @@ from functools import partial
 import pytest
 
 from testlib import make_uuid
+from testlib import make_config
 
 import vdsm.storage.mailbox as sm
 
@@ -44,8 +45,9 @@ from vdsm.common.units import MiB, GiB
 MAX_HOSTS = 10
 MAILER_TIMEOUT = 10
 
-# We used 0.1 seconds for several years, and it proved flaky, failing randomly.
-MONITOR_INTERVAL = 0.2
+# Use shorter intervals for quicker tests.
+MONITOR_INTERVAL = 0.4
+EVENT_INTERVAL = 0.1
 
 SPUUID = '5d928855-b09b-47a7-b920-bd2d2eb5808c'
 
@@ -102,7 +104,8 @@ def make_hsm_mailbox(mboxfiles, host_id):
         poolID=SPUUID,
         inbox=mboxfiles.outbox,
         outbox=mboxfiles.inbox,
-        monitorInterval=MONITOR_INTERVAL)
+        monitorInterval=MONITOR_INTERVAL,
+        eventInterval=EVENT_INTERVAL)
     try:
         yield mailbox
     finally:
@@ -118,7 +121,8 @@ def make_spm_mailbox(mboxfiles):
         MAX_HOSTS,
         inbox=mboxfiles.inbox,
         outbox=mboxfiles.outbox,
-        monitorInterval=MONITOR_INTERVAL)
+        monitorInterval=MONITOR_INTERVAL,
+        eventInterval=EVENT_INTERVAL)
     mailbox.start()
     try:
         yield mailbox
@@ -169,7 +173,8 @@ class TestSPMMailMonitor:
             SPUUID, 100,
             inbox=mboxfiles.inbox,
             outbox=mboxfiles.outbox,
-            monitorInterval=MONITOR_INTERVAL)
+            monitorInterval=MONITOR_INTERVAL,
+            eventInterval=EVENT_INTERVAL)
         mailer.start()
         try:
             mailer.stop()
@@ -295,17 +300,79 @@ class TestCommunicate:
 
     @pytest.mark.parametrize("delay", [0, 0.05])
     @pytest.mark.parametrize("messages", [
-        1,
-        2,
-        4,
-        8,
-        # From 9 failures and on the code sleeps for a minute
-        16,
-        32,
-        sm.MESSAGES_PER_MAILBOX,
-    ])
-    def test_roundtrip(self, mboxfiles, delay, messages):
-        timeout = MAILER_TIMEOUT + messages * (1.0 + delay)
+        1, 2, 4, 8, 16, 32, sm.MESSAGES_PER_MAILBOX])
+    def test_roundtrip_events_enabled(self, mboxfiles, delay, messages):
+        """
+        Test roundtrip latency.
+
+        This test is best run like this:
+
+            $ tox -e storage tests/storage/mailbox_test.py -- \
+                -k test_roundtrip \
+                --log-cli-level=info \
+                | grep stats
+
+        Example output (trimmed):
+
+            stats: messages=1 delay=0.000 best=0.215 average=0.215 worst=0.215
+            stats: messages=1 delay=0.050 best=0.234 average=0.234 worst=0.234
+            stats: messages=2 delay=0.000 best=0.231 average=0.233 worst=0.236
+            stats: messages=2 delay=0.050 best=0.252 average=0.285 worst=0.319
+            stats: messages=4 delay=0.000 best=0.257 average=0.258 worst=0.259
+            stats: messages=4 delay=0.050 best=0.267 average=0.311 worst=0.354
+            stats: messages=8 delay=0.000 best=0.231 average=0.344 worst=0.365
+            stats: messages=8 delay=0.050 best=0.246 average=0.314 worst=0.391
+            stats: messages=16 delay=0.000 best=0.244 average=0.379 worst=0.395
+            stats: messages=16 delay=0.050 best=0.148 average=0.312 worst=0.393
+            stats: messages=32 delay=0.000 best=0.260 average=0.378 worst=0.395
+            stats: messages=32 delay=0.050 best=0.146 average=0.267 worst=0.402
+            stats: messages=63 delay=0.000 best=0.269 average=0.429 worst=0.505
+            stats: messages=63 delay=0.050 best=0.160 average=0.272 worst=0.423
+
+        """
+        times = self.roundtrip(mboxfiles, delay, messages)
+
+        best = times[0]
+        worst = times[-1]
+        average = sum(times) / len(times)
+
+        log.info(
+            "stats: messages=%d delay=%.3f best=%.3f average=%.3f worst=%.3f",
+            messages, delay, best, average, worst)
+
+        # This is the slowest run when running locally:
+        # stats: messages=63 delay=0.000 best=0.269 average=0.429 worst=0.505
+        # In github CI this can be about twice slower. We use larger timeouts
+        # to avoid flakeyness on slow CI.
+
+        assert best < 5 * EVENT_INTERVAL
+        assert average < 10 * EVENT_INTERVAL
+        assert worst < 15 * EVENT_INTERVAL
+
+    def test_roundtrip_events_disabled(self, mboxfiles, monkeypatch):
+        config = make_config([("mailbox", "events_enable", "false")])
+        monkeypatch.setattr(sm, "config", config)
+
+        delay = 0.05
+        messages = 8
+        times = self.roundtrip(mboxfiles, delay, messages)
+
+        best = times[0]
+        worst = times[-1]
+        average = sum(times) / len(times)
+
+        log.info(
+            "stats: messages=%d delay=%.3f best=%.3f average=%.3f worst=%.3f",
+            messages, delay, best, average, worst)
+
+        # Running locally takes:
+        # stats: messages=8 delay=0.050 best=0.847 average=1.064 worst=1.243
+        # Using larger timeout to avoid failures on slower environment.
+        assert best < 5 * MONITOR_INTERVAL
+        assert average < 6 * MONITOR_INTERVAL
+        assert worst < 7 * MONITOR_INTERVAL
+
+    def roundtrip(self, mboxfiles, delay, messages):
         with make_hsm_mailbox(mboxfiles, 7) as hsm_mb:
             with make_spm_mailbox(mboxfiles) as spm_mm:
                 pool = FakePool(spm_mm)
@@ -322,7 +389,7 @@ class TestCommunicate:
                     assert vol_id in start, "Missing request"
                     assert vol_id not in end, "Duplicate request"
 
-                    end[vol_id] = time.time()
+                    end[vol_id] = time.monotonic()
                     log.info("got extension reply for volume %s, elapsed %s",
                              vol_id, end[vol_id] - start[vol_id])
                     if len(end) == messages:
@@ -331,7 +398,7 @@ class TestCommunicate:
 
                 for _ in range(messages):
                     vol_id = make_uuid()
-                    start[vol_id] = time.time()
+                    start[vol_id] = time.monotonic()
                     log.info("requesting to extend volume %s (delay=%.3f)",
                              vol_id, delay)
                     hsm_mb.sendExtendMsg(
@@ -340,23 +407,29 @@ class TestCommunicate:
                         callbackFunction=reply_msg_callback)
                     time.sleep(delay)
 
-                log.info("waiting for replies clearing")
-                assert done.wait(timeout), "Roundtrip did not finish"
+                log.info("waiting for all replies")
+                if not done.wait(MAILER_TIMEOUT):
+                    raise RuntimeError("Roundtrip did not finish in time")
 
                 log.info("waiting for messages clearing in SPM inbox")
-                deadline = time.time() + MAILER_TIMEOUT
+                deadline = time.monotonic() + MAILER_TIMEOUT
                 while True:
                     with io.open(mboxfiles.inbox, "rb") as f:
+                        # Skip the event block, checking it is racy since hsm
+                        # mail monitor writes events to this block.
+                        f.seek(sm.MAILBOX_SIZE)
                         # check that SPM inbox was cleared
                         if f.read(sm.MAILBOX_SIZE) == sm.EMPTYMAILBOX:
                             break
-                    assert time.time() < deadline, "Timeout clearing SPM inbox"
-                    time.sleep(0.1)
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Timeout clearing SPM inbox")
+
+                    time.sleep(EVENT_INTERVAL)
 
         times = [end[k] - start[k] for k in start]
         times.sort()
-        log.info("stats: messages=%d delay=%.3f best=%.3f worst=%.3f avg=%.3f",
-                 messages, delay, times[0], times[-1], sum(times) / len(times))
+
+        return times
 
 
 class TestExtendMessage:

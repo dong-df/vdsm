@@ -2818,7 +2818,8 @@ class HSM(object):
         return dict(info=info)
 
     @public
-    def measure(self, sdUUID, imgUUID, volUUID, dest_format, backing=True):
+    def measure(self, sdUUID, imgUUID, volUUID, dest_format, backing=True,
+                baseUUID=None):
         """
         Measure the size of a volume using qemu-img
 
@@ -2826,21 +2827,50 @@ class HSM(object):
             sdUUID (str): The UUID of the storage domain that owns the volume.
             imgUUID (str): The UUID of the image contained on the volume.
             volUUID (str): The UUID of the volume you want to get the info on.
-            dest_format (str): The output format we want to measure for
+            dest_format (int): The output format we want to measure for.
             backing (bool): True if we want to measure the volume with its
-                        backing chain, False otherwise. (Default: True)
+                backing chain, False otherwise. (Default: True)
+            baseUUID (str): If specified, only the sub-chain will be measured.
+                The range of sub-chain is from volUUID to baseUUID. Currently
+                the only allowed value of baseUUID is the parent volume UUID.
+                Ignored if backing is False.
 
         Returns:
             dict containing the required size of the volume
         """
         vol = self._produce_volume(sdUUID, imgUUID, volUUID)
+        base = None
+
+        if backing:
+            if baseUUID:
+                base = vol.getParentVolume()
+                if base is None:
+                    raise se.UnsupportedOperation(
+                        f"BaseUUID specified, but volume {volUUID} does not "
+                        "have a parent")
+
+                if base.volUUID != baseUUID:
+                    raise se.UnsupportedOperation(
+                        f"Base mismatch {baseUUID}, actual {base.volUUID}")
+
+        elif baseUUID:
+            self.log.warning(
+                "Measuring without the backing chain, ignoring baseUUID: %s",
+                baseUUID)
+
+        # Using unsafe=True to allow measuring an active image. Measuring an
+        # active image can give less accurate results since the guest may write
+        # while we measure, but it is good enough for getting an estimate of
+        # the required size.
+
         result = qemuimg.measure(
             vol.getVolumePath(),
             format=sc.fmt2str(vol.getFormat()),
             output_format=sc.fmt2str(dest_format),
             backing=backing,
-            is_block=vol.is_block()
-        )
+            is_block=vol.is_block(),
+            base=base.getVolumePath() if base else None,
+            unsafe=True)
 
         return dict(result=result)
 

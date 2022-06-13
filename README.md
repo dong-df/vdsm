@@ -13,6 +13,11 @@ log collection.
 
 ## How to contribute
 
+### Contibuting
+
+To contribute please read the [development](./doc/development.md)
+documentation.
+
 ### Submitting patches
 
 Please use GitHub pull requests.
@@ -32,9 +37,15 @@ date, please check the [Gerrit vdsm project](https://gerrit.ovirt.org/q/project:
 
 ## Manual installation
 
-Add ovirt repositories to your repositories list:
+Add ovirt repositories to your repositories list.
 
-    sudo dnf install -y http://resources.ovirt.org/pub/yum-repo/ovirt-release-master.rpm
+For CentOS Stream 8 use:
+
+    sudo dnf copr enable -y ovirt/ovirt-master-snapshot centos-stream-8
+    sudo dnf install -y ovirt-release-master
+
+For more info see
+[copr master-snapshot repositories](https://copr.fedorainfracloud.org/coprs/ovirt/ovirt-master-snapshot/).
 
 Install Vdsm:
 
@@ -56,110 +67,6 @@ To inspect Vdsm service status:
     sudo systemctl status vdsmd
 
 Vdsm logs can be found at `/var/log/vdsm/*.log` (refer to README.logging for further information).
-
-
-## Development environment setup
-
-Fork the project on https://github.com/oVirt/vdsm.
-
-Clone your fork:
-
-    sudo dnf install -y git
-    git@github.com:{user}/vdsm.git
-
-Install additional packages for Fedora, CentOS, and RHEL:
-
-    sudo dnf install -y `cat automation/check-patch.packages`
-
-Create virtual environment for vdsm:
-
-    python3 -m venv ~/.venv/vdsm
-    source ~/.venv/vdsm/bin/activate
-    pip install --upgrade pip
-    pip install -r docker/requirements.txt
-    deactivate
-
-Before running vdsm tests, activate the environment:
-
-    source ~/.venv/vdsm/bin/activate
-
-When done, you can deactivate the environment:
-
-    deactivate
-
-## Building Vdsm
-
-To configure sources (run `./configure --help` to see configuration options):
-
-    git clean -xfd
-    ./autogen.sh --system --enable-timestamp
-    make
-
-To test Vdsm (refer to tests/README for further tests information):
-
-    make check
-
-To create an RPM:
-
-    rm -rf ~/rpmbuild/RPMS/*/vdsm*.rpm
-    make rpm
-
-To update your system with local build's RPM:
-
-    (cd ~/rpmbuild/RPMS && sudo dnf upgrade */vdsm*.rpm)
-
-
-## Making new releases
-
-Release process of Vdsm version `VERSION` consists of the following
-steps:
-
-- Changing `Version:` field value in `vdsm.spec.in` to `VERSION`.
-
-- Updating `%changelog` line in `vdsm.spec.in` to the current date,
-  the committer, and `VERSION`.
-
-- Committing these changes, with subject "New release: `VERSION`" and
-  posting the patch to gerrit.
-
-- Verifying the patch by checking that the Jenkins build produced a
-  correct set of rpm's with the correct version.
-
-- Merging the patch (no review needed).
-
-- Tagging the commit immediately after merge with an annotated tag:
-  `git tag -a vVERSION`
-
-- Setting "Keep this build forever" for the check-merge Jenkins build.
-
-- Updating releng-tools with the new Vdsm version.  See releng-tools
-  repo (`git clone https://gerrit.ovirt.org/releng-tools`) and Vdsm
-  related patches there for examples.
-
-
-## CI
-
-Running tests locally is convenient, but before your changes can be
-merged, we need to test them on all supported distributions and
-architectures.
-
-When you submit patches to gerrit, oVirt's Jenkins CI will run its tests
-according to configuration in the stdci.yaml file.
-
-### Travis CI for storage patches
-
-oVirt's Jenkins CI is the integrated method for testing Vdsm patches,
-however for storage related patches we have to cover also 4k tests which
-are not covered currently by Jenkins CI. This can be achieved in a fast
-way manually and independently from gerrit by invoking Travis CI on your
-github branch:
-
-- Fork the project on github.
-- Visit https://travis-ci.org, register using your github account, and
-  enable builds for your Vdsm fork.
-- Push your changes to your github fork to trigger a build.
-
-See .travis.yml file for tested Travis platforms and tests configurations.
 
 
 ## Getting Help

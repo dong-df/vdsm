@@ -53,14 +53,10 @@ class Job(base.Job):
     def __init__(self, job_id, host_id, source, destination,
                  copy_bitmaps=False):
         super(Job, self).__init__(job_id, 'copy_data', host_id)
-        self._source = _create_endpoint(
-            source, host_id, writable=False, job_id=job_id,
-            # Skip locking image for source endpoint as locking would fail
-            # if copy data is performed within the same image.
-            lock_image=source['img_id'] != destination['img_id'])
         self._dest = _create_endpoint(
-            destination, host_id, writable=True, job_id=job_id,
-            is_destination=True)
+            destination, host_id, job_id=job_id)
+        self._source = _create_endpoint(
+            source, host_id, job_id=job_id, dest=self._dest)
         self._operation = None
         self._copy_bitmaps = copy_bitmaps
 
@@ -121,17 +117,13 @@ class Job(base.Job):
                         self._operation.run()
 
 
-def _create_endpoint(params, host_id, writable, job_id=None,
-                     is_destination=False,
-                     lock_image=True):
+def _create_endpoint(params, host_id, job_id=None, dest=None):
     endpoint_type = params.pop('endpoint_type')
     if endpoint_type == 'div':
         return CopyDataDivEndpoint(
             params,
             host_id,
-            writable,
-            is_destination=is_destination,
-            lock_image=lock_image)
+            dest=dest)
     elif endpoint_type == 'external':
         return CopyDataExternalEndpoint(params, host_id, job_id)
     else:
@@ -146,17 +138,19 @@ class CopyDataDivEndpoint(properties.Owner):
                                     maxval=sc.MAX_GENERATION)
     prepared = properties.Boolean(default=False)
 
-    def __init__(self, params, host_id, writable, is_destination=False,
-                 lock_image=True):
+    def __init__(self, params, host_id, dest=None):
         self.sd_id = params.get('sd_id')
         self.img_id = params.get('img_id')
         self.vol_id = params.get('vol_id')
         self.generation = params.get('generation')
         self.prepared = params.get('prepared')
-        self.is_destination = is_destination
-        self.lock_image = lock_image
+        self.is_destination = dest is None
+
+        # Always lock the destination image and only lock the source if
+        # the copy is not within the same image.
+        self.lock_image = self.is_destination or self.img_id != dest.img_id
+
         self._host_id = host_id
-        self._writable = writable
         self._vol = None
 
     @property
@@ -168,10 +162,10 @@ class CopyDataDivEndpoint(properties.Owner):
         # are not the same, otherwise there will be a deadlock.
         if self.lock_image:
             img_ns = rm.getNamespace(sc.IMAGE_NAMESPACE, self.sd_id)
-            mode = rm.EXCLUSIVE if self._writable else rm.SHARED
+            mode = rm.EXCLUSIVE if self.is_destination else rm.SHARED
             ret.append(rm.Lock(img_ns, self.img_id, mode))
 
-        if self._writable:
+        if self.is_destination:
             dom = sdCache.produce_manifest(self.sd_id)
             if dom.hasVolumeLeases():
                 ret.append(volume.VolumeLease(self._host_id, self.sd_id,
@@ -236,8 +230,9 @@ class CopyDataDivEndpoint(properties.Owner):
         if self.prepared:
             yield
         else:
+            # Only destination volumes are writable and allowed illegal
             self.volume.prepare(
-                rw=self._writable,
+                rw=self.is_destination,
                 justme=False,
                 allow_illegal=self.is_destination)
             try:
@@ -313,6 +308,10 @@ class CopyDataExternalEndpoint(properties.Owner):
     @property
     def zero_initialized(self):
         return self.is_zero
+
+    @property
+    def img_id(self):
+        return None
 
     @contextmanager
     def volume_operation(self):
