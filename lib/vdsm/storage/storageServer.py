@@ -595,12 +595,15 @@ class IscsiConnection(Connection):
                 con.setup_node()
             except Exception as err:
                 log.error(
-                    "Could configure connection to % and iface %s",
-                    con.target, con.iface)
+                    "Could not configure connection to %s and iface %s: %s",
+                    con.target, con.iface, err)
                 status, _ = cls.translate_error(err)
                 results.append((con, status))
             else:
                 logins.append(con)
+
+        if not logins:
+            return results
 
         # Run login to nodes in parallel. This operations happen on remote
         # iscsi server and if the some targets are not available, the operation

@@ -451,8 +451,6 @@ class LVMCache(object):
 
     def run_command(self, cmd, devices=(), use_lvmpolld=True):
         with self._cmd_sem:
-            tries = 1
-
             # 1. Try the command with fast specific filter including the
             # specified devices. If the command succeeded and wanted output was
             # returned we are done.
@@ -472,13 +470,10 @@ class LVMCache(object):
                     "Command with specific filter failed or returned no data, "
                     "retrying with refreshed device list: %s", error)
                 full_cmd = wider_cmd
-                tries += 1
                 try:
                     return self._runner.run(full_cmd)
                 except se.LVMCommandError as e:
                     error = e
-
-            log.warning("All %d tries have failed: %s", tries, error)
 
             raise error
 
@@ -756,63 +751,114 @@ class LVMCache(object):
 
         return updatedVGs
 
-    def _reloadlvs(self, vgName):
+    def _updatelvs_locked(self, lvs_output, vg_name, lv_name=None):
+        """
+        Update cached LVs in a given VG based on the output of the LVM command:
+        - Add new LVs to the cache.
+        - Replace LVs in the cache with LVs reported by the 'lvs' command,
+          updating the LV attributes.
+        - Remove specifed LVs in the VG from the cache if they were not
+          reported by LVM.
+        Must be called while holding the lock.
+        Return dict of updated LVs.
+        """
+        updated_lvs = {}
+        for line in lvs_output:
+            fields = [field.strip() for field in line.split(SEPARATOR)]
+            if len(fields) != LV_FIELDS_LEN:
+                raise InvalidOutputLine("lvs", line)
+
+            lv = LV.fromlvm(*fields)
+            # For LV we are only interested in its first extent
+            if lv.seg_start_pe == "0":
+                self._lvs[(lv.vg_name, lv.name)] = lv
+                updated_lvs[(lv.vg_name, lv.name)] = lv
+
+        # Determine if there are stale LVs
+        items = self._lvs if lv_name is None else [(vg_name, lv_name)]
+        stale_lvs = [lvn for vgn, lvn in items
+                     if vgn == vg_name and (vgn, lvn) not in updated_lvs]
+
+        for lvName in stale_lvs:
+            if (vg_name, lvName) in self._lvs:
+                log.warning("Removing stale lv: %s/%s", vg_name, lvName)
+                del self._lvs[(vg_name, lvName)]
+
+        return updated_lvs
+
+    def _update_stale_lvs_locked(self, vg_name):
+        """
+        Check if any LV is stale after an LVM command and make it Unreadable.
+        Log a warning if any LV has been made Unreadable.
+        Must be called while holding the lock.
+        """
+        updated_lvs = {}
+        lv_names = (lvn for vgn, lvn in self._lvs if vgn == vg_name)
+        for lvName in lv_names:
+            key = (vg_name, lvName)
+            lv = self._lvs.get(key)
+            if lv and lv.is_stale():
+                lv = Unreadable(lv.name)
+                self._lvs[key] = lv
+                updated_lvs[key] = lv
+
+        if updated_lvs:
+            # This may be a real error (failure to reload existing LV)
+            # or no error at all (failure to reload non-existing LV),
+            # so we cannot make this an error.
+            log.warning(
+                "Marked lvs=%r as Unreadable due to reload failure",
+                logutils.Head(updated_lvs, max_items=20))
+
+        return updated_lvs
+
+    def _reload_single_lv(self, vg_name, lv_name):
+        """
+        Run LVM 'lvs' command and update LV lv_name.
+        Raise LogicalVolumeDoesNotExistError if a LV is not updated.
+        Return the updated LV.
+        """
         cmd = list(LVS_CMD)
-        cmd.append(vgName)
+        cmd.append(f"{vg_name}/{lv_name}")
 
         out, error = self.run_command_error(
-            cmd, devices=self._getVGDevs((vgName,)))
+            cmd, devices=self._getVGDevs((vg_name,)))
 
         with self._lock:
-            updatedLVs = {}
-
             if error:
-                lvNames = (lvn for vgn, lvn in self._lvs if vgn == vgName)
-                for lvName in lvNames:
-                    key = (vgName, lvName)
-                    lv = self._lvs.get(key)
-                    if lv and lv.is_stale():
-                        lv = Unreadable(lv.name)
-                        self._lvs[key] = lv
-                        updatedLVs[key] = lv
+                self._update_stale_lvs_locked(vg_name)
 
-                if updatedLVs:
-                    # This may be a real error (failure to reload existing LV)
-                    # or no error at all (failure to reload non-existing LV),
-                    # so we cannot make this an error.
-                    log.warning(
-                        "Marked lvs=%r as Unreadable due to reload failure",
-                        logutils.Head(updatedLVs, max_items=20))
+                # Reload a specific LV name and failing
+                # might be indicative of a real error.
+                raise se.LogicalVolumeDoesNotExistError.from_error(
+                    vg_name, lv_name, error=error)
 
-                return updatedLVs
+            updated_lvs = self._updatelvs_locked(out, vg_name, lv_name)
 
-            for line in out:
-                fields = [field.strip() for field in line.split(SEPARATOR)]
-                if len(fields) != LV_FIELDS_LEN:
-                    raise InvalidOutputLine("lvs", line)
+        if (vg_name, lv_name) not in updated_lvs:
+            # This should not happen.
+            raise se.LogicalVolumeDoesNotExistError(vg_name, lv_name)
 
-                lv = LV.fromlvm(*fields)
-                # For LV we are only interested in its first extent
-                if lv.seg_start_pe == "0":
-                    self._lvs[(lv.vg_name, lv.name)] = lv
-                    updatedLVs[(lv.vg_name, lv.name)] = lv
+        return updated_lvs[(vg_name, lv_name)]
 
-            # Determine if there are stale LVs
-            # All the LVs in the VG
-            staleLVs = [lvName for v, lvName in self._lvs
-                        if (v == vgName) and
-                        ((vgName, lvName) not in updatedLVs)]
+    def _reloadlvs(self, vg_name):
+        cmd = list(LVS_CMD)
+        cmd.append(vg_name)
 
-            for lvName in staleLVs:
-                if (vgName, lvName) in self._lvs:
-                    log.warning("Removing stale lv: %s/%s", vgName, lvName)
-                    del self._lvs[(vgName, lvName)]
+        out, error = self.run_command_error(
+            cmd, devices=self._getVGDevs((vg_name,)))
 
-            self._freshlv.add(vgName)
+        with self._lock:
+            if error:
+                return self._update_stale_lvs_locked(vg_name)
+
+            updated_lvs = self._updatelvs_locked(out, vg_name)
+
+            self._freshlv.add(vg_name)
 
             log.debug("lvs reloaded")
 
-        return updatedLVs
+        return updated_lvs
 
     def _loadAllLvs(self):
         """
@@ -1006,49 +1052,54 @@ class LVMCache(object):
                 self.stats.hit()
         return list(vgs.values())
 
-    def getLv(self, vgName, lvName=None):
+    def getLv(self, vg_name, lv_name):
         """
-        Get specific LV or all LVs in specified VG.
+        Get specific LV in specified VG.
 
-        If there are any stale LVs reload the whole VG, since it would
-        cost us around same efforts anyhow and these stale LVs can
-        be in the vg.
+        Reload the LV if it is Stale.
 
-        We never return Stale or Unreadable LVs when
-        getting all LVs for a VG, but may return a Stale or an Unreadable
-        LV when LV name is specified as argument.
+        May return a Stale or an Unreadable LV.
 
         Arguments:
-            vgName (str): VG name to query.
-            lvName (str): Optional LV name.
+            vg_name (str): VG name to query.
+            lv_name (str): LV name.
 
         Returns:
-            LV nameduple if lvName is specified, otherwise list of LV
-            namedtuple for all lvs in VG vgName.
+            LV nameduple.
         """
-
-        if lvName:
-            # vgName, lvName
-            lv = self._lvs.get((vgName, lvName))
-            if not lv or lv.is_stale():
-                self.stats.miss()
-                # while we here reload all the LVs in the VG
-                lvs = self._reloadlvs(vgName)
-                lv = lvs.get((vgName, lvName))
-            else:
-                self.stats.hit()
-
-            return lv
-
-        if self._lvs_needs_reload(vgName):
+        # vg_name, lv_name
+        lv = self._lvs.get((vg_name, lv_name))
+        if not lv or lv.is_stale():
             self.stats.miss()
-            lvs = self._reloadlvs(vgName)
+            lv = self._reload_single_lv(vg_name, lv_name)
+        else:
+            self.stats.hit()
+
+        return lv
+
+    def getAllLvs(self, vg_name):
+        """
+        Get all LVs in specified VG.
+
+        If there are any stale LVs reload the whole VG.
+
+        Never return Stale or Unreadable LVs.
+
+        Arguments:
+            vg_name (str): VG name to query.
+
+        Returns:
+            List of LV namedtuple for all lvs in VG vg_name.
+        """
+        if self._lvs_needs_reload(vg_name):
+            self.stats.miss()
+            lvs = self._reloadlvs(vg_name)
         else:
             self.stats.hit()
             lvs = self._lvs.copy()
 
         lvs = [lv for lv in lvs.values()
-               if not lv.is_stale() and (lv.vg_name == vgName)]
+               if not lv.is_stale() and (lv.vg_name == vg_name)]
         return lvs
 
     def _lvs_needs_reload(self, vg_name):
@@ -1120,7 +1171,7 @@ def deactivateUnusedLVs(vgname, skiplvs=()):
     pattern = "{}/{}/*/*".format(sc.P_VDSM_STORAGE, vgname)
     prepared = frozenset(os.path.basename(n) for n in glob.iglob(pattern))
 
-    for lv in _lvminfo.getLv(vgname):
+    for lv in _lvminfo.getAllLvs(vgname):
         if lv.active:
             if lv.name in skiplvs:
                 log.debug("Skipping active lv: vg=%s lv=%s",
@@ -1405,13 +1456,16 @@ def getVGbyUUID(vgUUID):
     raise se.VolumeGroupDoesNotExist(vg_uuid=vgUUID)
 
 
-def getLV(vgName, lvName=None):
-    lv = _lvminfo.getLv(vgName, lvName)
-    # getLV() should not return None
-    if not lv:
-        raise se.LogicalVolumeDoesNotExistError(vgName, lvName)
-    else:
-        return lv
+def getLV(vgName, lv_name):
+    """
+    Return LV named tuple. Raise se.LogicalVolumeDoesNotExistError if the
+    LV does not exist.
+    """
+    return _lvminfo.getLv(vgName, lv_name)
+
+
+def getAllLVs(vg_name):
+    return _lvminfo.getAllLvs(vg_name)
 
 
 #
@@ -1948,7 +2002,7 @@ def setrwLV(vg_name, lv_name, rw=True):
 
 
 def lvsByTag(vgName, tag):
-    return [lv for lv in getLV(vgName) if tag in lv.tags]
+    return [lv for lv in getAllLVs(vgName) if tag in lv.tags]
 
 
 def invalidate_devices():
