@@ -1,5 +1,5 @@
 #
-# Copyright 2015-2022 Red Hat, Inc.
+# Copyright 2022 Red Hat, Inc.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,29 +13,19 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 #
 # Refer to the README and COPYING files for full details of the license
+#
 
-import logging
-import os
-import sys
-import threading
+EXTRA_DIST = \
+	before_vm_start.py
 
+install-data-local:
+	$(MKDIR_P) $(DESTDIR)$(vdsmhooksdir)/before_vm_start
+	$(INSTALL_SCRIPT) $(srcdir)/before_vm_start.py \
+		$(DESTDIR)$(vdsmhooksdir)/before_vm_start/50_log_firmware
 
-def panic(msg):
-    logging.exception("Panic: %s", msg)
-    ready = threading.Event()
+uninstall-local:
+	$(RM) $(DESTDIR)$(vdsmhooksdir)/before_vm_start/50_log_firmware
 
-    def run():
-        ready.wait(10)
-        os.killpg(0, 9)
-        sys.exit(-3)
-
-    t = threading.Thread(target=run)
-    t.daemon = True
-    t.start()
-    try:
-        logging.shutdown()
-    finally:
-        ready.set()

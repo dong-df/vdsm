@@ -10,7 +10,7 @@ jobs:
     - uses: actions/checkout@v2
     - name: Run linters
       run: ./automation/lint.sh
-  test-storage:
+  test-storage-user:
     env:
       TRAVIS_CI: 1
     runs-on: ubuntu-latest
@@ -20,8 +20,20 @@ jobs:
       options: --privileged
     steps:
     - uses: actions/checkout@v2
-    - name: Run storage tests
-      run: ./automation/tests-storage.sh
+    - name: Run storage tests as vdsm
+      run: ./automation/tests-storage.sh vdsm
+  test-storage-root:
+    env:
+      TRAVIS_CI: 1
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/ovirt/vdsm-test-centos-8
+      # Required to create loop devices.
+      options: --privileged
+    steps:
+    - uses: actions/checkout@v2
+    - name: Run storage tests as root
+      run: ./automation/tests-storage.sh root
   tests:
     env:
       TRAVIS_CI: 1

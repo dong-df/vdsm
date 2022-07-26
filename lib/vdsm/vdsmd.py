@@ -67,6 +67,9 @@ def serve_clients(log):
         running[0] = False
 
     def sigusr1Handler(signum, frame):
+        """
+        Called during fencing from spmprotect.sh when using export domain.
+        """
         if irs:
             log.info("Received signal %s, stopping SPM" % signum)
             # pylint: disable=no-member
@@ -74,10 +77,6 @@ def serve_clients(log):
             # initialize it in line #63
             irs.spmStop(
                 irs.getConnectedStoragePoolsList()['poollist'][0])
-
-    def sigalrmHandler(signum, frame):
-        # Used in panic.panic() when shuting down logging, must not log.
-        raise RuntimeError("Alarm timeout")
 
     sigutils.register()
     signal.signal(signal.SIGTERM, sigtermHandler)

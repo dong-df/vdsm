@@ -56,7 +56,7 @@
 %{!?vdsm_release: %global vdsm_release @PACKAGE_RELEASE@}
 
 Name:           %{vdsm_name}
-Version:        4.50.2
+Version:        4.50.2.1
 Release:        %{vdsm_release}%{?dist}%{?extra_release}
 Summary:        Virtual Desktop Server Manager
 
@@ -377,7 +377,7 @@ Requires:       iproute-tc
 Requires:       ovirt-openvswitch >= 2.15
 # Workaround for BZ#1966143
 Requires:       ovirt-python-openvswitch >= 2.15
-Requires:       nmstate >= 1.0
+Requires:       nmstate >= 1.2.1-3
 %if 0%{?rhel} < 9
 Requires:       nmstate-plugin-ovsdb
 %endif
@@ -502,10 +502,18 @@ The VM must be pinned to the host.
 %package hook-log-console
 Summary:        Log VM's serial console to a file
 BuildArch:      noarch
-Requires:       %{name} == %{version}
+Requires:       %{name}
 
 %description hook-log-console
 This hook allows logging a VM serial console to a file.
+
+%package hook-log-firmware
+Summary:        Log VM's firmware to a file
+BuildArch:      noarch
+Requires:       %{name}
+
+%description hook-log-firmware
+This hook allows logging a VM firmware to a file.
 
 %package hook-macbind
 Summary:        Bind a vNIC to a Bridge
@@ -1061,6 +1069,9 @@ exit 0
 %files hook-log-console
 %{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_log_console
 
+%files hook-log-firmware
+%{_libexecdir}/%{vdsm_name}/hooks/before_vm_start/50_log_firmware
+
 %files hook-vmfex-dev
 %{_libexecdir}/%{vdsm_name}/hooks/before_device_create/50_vmfex
 %{_libexecdir}/%{vdsm_name}/hooks/before_device_migrate_destination/50_vmfex
@@ -1209,5 +1220,5 @@ exit 0
 %endif
 
 %changelog
-* Wed Jul 15 2022 Milan Zamazal <mzamazal@redhat.com> - 4.50.1.3
+* Wed Jun 13 2022 Milan Zamazal <mzamazal@redhat.com> - 4.50.2.1
 - See %{_docdir}/%{vdsm_name}/ChangeLog for the complete list of Vdsm changes.

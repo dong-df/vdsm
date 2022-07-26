@@ -149,9 +149,13 @@ venv:
 tests: tox
 	tox -e "tests,lib,network,virt,gluster,hooks"
 
-.PHONY: tests-storage
-tests-storage: tox
-	tox -e "storage"
+.PHONY: tests-storage-user
+tests-storage-user: tox
+	tox -e "storage-user"
+
+.PHONY: tests-storage-root
+tests-storage-root: tox
+	tox -e "storage-root"
 
 .PHONY: storage
 storage:
