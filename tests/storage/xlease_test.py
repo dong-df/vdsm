@@ -1,22 +1,5 @@
-#
-# Copyright 2016 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
@@ -29,6 +12,7 @@ import os
 import timeit
 
 import pytest
+import userstorage
 
 from vdsm import utils
 from vdsm.common.units import GiB
@@ -40,7 +24,8 @@ from vdsm.storage import xlease
 from testlib import make_uuid
 
 from . fakesanlock import FakeSanlock
-from . import userstorage
+
+BACKENDS = userstorage.load_config("storage.py").BACKENDS
 
 
 class ReadError(Exception):
@@ -64,16 +49,15 @@ class FailingWriter(xlease.DirectFile):
 @pytest.fixture(
     scope="module",
     params=[
-        userstorage.PATHS["file-512"],
-        userstorage.PATHS["file-4k"],
+        BACKENDS["file-512"],
+        BACKENDS["file-4k"],
     ],
     ids=str,
 )
 def user_storage(request):
-    storage = request.param
-    if not storage.exists():
-        pytest.xfail("{} storage not available".format(storage.name))
-    return storage
+    backend = request.param
+    with backend:
+        yield backend
 
 
 class TemporaryVolume(object):
@@ -132,30 +116,29 @@ class TemporaryVolume(object):
 
 @pytest.fixture(params=[
     pytest.param(
-        (userstorage.PATHS["file-512"], sc.ALIGNMENT_1M),
+        (BACKENDS["file-512"], sc.ALIGNMENT_1M),
         id="file-512-1m"),
     pytest.param(
-        (userstorage.PATHS["file-4k"], sc.ALIGNMENT_1M),
+        (BACKENDS["file-4k"], sc.ALIGNMENT_1M),
         id="file-4k-1m"),
     pytest.param(
-        (userstorage.PATHS["file-4k"], sc.ALIGNMENT_2M),
+        (BACKENDS["file-4k"], sc.ALIGNMENT_2M),
         id="file-4k-2m"),
     pytest.param(
-        (userstorage.PATHS["file-4k"], sc.ALIGNMENT_4M),
+        (BACKENDS["file-4k"], sc.ALIGNMENT_4M),
         id="file-4k-4m"),
     pytest.param(
-        (userstorage.PATHS["file-4k"], sc.ALIGNMENT_8M),
+        (BACKENDS["file-4k"], sc.ALIGNMENT_8M),
         id="file-4k-8m"),
 ])
 def tmp_vol(request):
     storage, alignment = request.param
-    if not storage.exists():
-        pytest.xfail("{} storage not available".format(storage.name))
-    backend = xlease.DirectFile(storage.path)
-    tv = TemporaryVolume(backend, alignment, block_size=storage.sector_size)
-
-    yield tv
-    tv.close()
+    with storage:
+        backend = xlease.DirectFile(storage.path)
+        tv = TemporaryVolume(
+            backend, alignment, block_size=storage.sector_size)
+        yield tv
+        tv.close()
 
 
 @pytest.fixture

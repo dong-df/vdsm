@@ -1,35 +1,16 @@
-#
-# Copyright 2014-2018 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-# 02110-1301  USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
 
 import os
-import shutil
 import stat
-import tempfile
 import time
 import uuid
 
 import pytest
+import userstorage
 
 from vdsm.common.units import MiB, GiB
 from vdsm.storage import clusterlock
@@ -41,10 +22,10 @@ from vdsm.storage import qemuimg
 from vdsm.storage import sd
 
 from . import qemuio
-from . import userstorage
 from . marks import requires_unprivileged_user
 from . storagetestlib import chmod
 
+BACKENDS = userstorage.load_config("storage.py").BACKENDS
 PREALLOCATED_VOL_SIZE = 10 * MiB
 SPARSE_VOL_SIZE = GiB
 INITIAL_VOL_SIZE = MiB
@@ -59,40 +40,42 @@ DETECT_BLOCK_SIZE = [
 @pytest.fixture(
     params=[
         pytest.param(
-            (userstorage.PATHS["mount-512"], sc.HOSTS_512_1M, 3),
+            (BACKENDS["mount-512"], sc.HOSTS_512_1M, 3),
             id="mount-512-1m-v3"),
         pytest.param(
-            (userstorage.PATHS["mount-512"], sc.HOSTS_512_1M, 4),
+            (BACKENDS["mount-512"], sc.HOSTS_512_1M, 4),
             id="mount-512-1m-v4"),
         pytest.param(
-            (userstorage.PATHS["mount-512"], sc.HOSTS_512_1M, 5),
+            (BACKENDS["mount-512"], sc.HOSTS_512_1M, 5),
             id="mount-512-1m-v5"),
         pytest.param(
-            (userstorage.PATHS["mount-4k"], sc.HOSTS_4K_1M, 5),
+            (BACKENDS["mount-4k"], sc.HOSTS_4K_1M, 5),
             id="mount-4k-1m-v5"),
         pytest.param(
-            (userstorage.PATHS["mount-4k"], sc.HOSTS_4K_2M, 5),
+            (BACKENDS["mount-4k"], sc.HOSTS_4K_2M, 5),
             id="mount-4k-2m-v5"),
     ]
 )
 def user_mount(request):
-    with Config(*request.param) as backend:
-        yield backend
+    backend, max_hosts, domain_version = request.param
+    with backend:
+        yield Config(backend, max_hosts, domain_version)
 
 
 @pytest.fixture(
     params=[
         pytest.param(
-            (userstorage.PATHS["mount-512"], 2000, 5), id="mount-512-1m-v5"),
+            (BACKENDS["mount-512"], 2000, 5), id="mount-512-1m-v5"),
         pytest.param(
-            (userstorage.PATHS["mount-4k"], 250, 5), id="mount-4k-1m-v5"),
+            (BACKENDS["mount-4k"], 250, 5), id="mount-4k-1m-v5"),
         pytest.param(
-            (userstorage.PATHS["mount-4k"], 500, 5), id="mount-4k-2m-v5"),
+            (BACKENDS["mount-4k"], 500, 5), id="mount-4k-2m-v5"),
     ]
 )
 def user_mount_v5(request):
-    with Config(*request.param) as config:
-        yield config
+    backend, max_hosts, domain_version = request.param
+    with backend:
+        yield Config(backend, max_hosts, domain_version)
 
 
 @pytest.fixture
@@ -679,6 +662,73 @@ def test_volume_create_cow_sparse_with_parent(user_domain, local_fallocate):
     # Check the volume specific apparent size is fragile,
     # will easily break on CI or when qemu change the implementation.
     assert int(actual["apparentsize"]) < MiB
+    assert int(actual["truesize"]) == qemu_info['actual-size']
+
+
+def test_volume_create_cow_prealloc(user_domain, local_fallocate):
+    img_uuid = str(uuid.uuid4())
+    ref_uuid = str(uuid.uuid4())
+    vol_uuid = str(uuid.uuid4())
+    format = qemuimg.FORMAT.QCOW2
+
+    # Create reference sparse volume to obtain initial image end offset
+    user_domain.createVolume(
+        imgUUID=img_uuid,
+        capacity=PREALLOCATED_VOL_SIZE,
+        volFormat=sc.COW_FORMAT,
+        preallocate=sc.SPARSE_VOL,
+        diskType='DATA',
+        volUUID=ref_uuid,
+        desc="Reference volume",
+        srcImgUUID=sc.BLANK_UUID,
+        srcVolUUID=sc.BLANK_UUID)
+
+    ref_vol = user_domain.produceVolume(img_uuid, ref_uuid)
+    init_offset = qemuimg.check(
+        ref_vol.getVolumePath(), format=format)["offset"]
+
+    # Create preallocated volume
+    user_domain.createVolume(
+        imgUUID=img_uuid,
+        capacity=PREALLOCATED_VOL_SIZE,
+        volFormat=sc.COW_FORMAT,
+        preallocate=sc.PREALLOCATED_VOL,
+        diskType='DATA',
+        volUUID=vol_uuid,
+        desc="Test volume",
+        srcImgUUID=sc.BLANK_UUID,
+        srcVolUUID=sc.BLANK_UUID)
+
+    vol = user_domain.produceVolume(img_uuid, vol_uuid)
+
+    path = vol.getVolumePath()
+    qemu_info = qemuimg.info(path)
+
+    verify_volume_file(
+        path=path,
+        format=format,
+        virtual_size=PREALLOCATED_VOL_SIZE,
+        qemu_info=qemu_info)
+
+    # We do not control the allocation in the range between 0 bytes and the
+    # initial image offset, so we need to remove those bytes from the
+    # reported virtual size to obtain the actual allocated bytes.
+    # Actual size is bigger than allocated bytes as it includes
+    # the qcow2 header, which is one cluster size plus the variable sized
+    # tables. The size depends also on the file system, thus checking that
+    # actual size is bigger than the allocated bytes should suffice.
+    assert qemu_info['actual-size'] >= qemu_info['virtual-size'] - init_offset
+
+    # Verify actual volume metadata
+    actual = vol.getInfo()
+    assert int(actual["capacity"]) == PREALLOCATED_VOL_SIZE
+    assert actual["format"] == "COW"
+    assert actual["type"] == "PREALLOCATED"
+    assert actual["voltype"] == "LEAF"
+    assert actual["uuid"] == vol_uuid
+    # Check the volume specific apparent size is fragile,
+    # will easily break on CI or when qemu change the implementation.
+    assert int(actual["apparentsize"]) == qemu_info['virtual-size']
     assert int(actual["truesize"]) == qemu_info['actual-size']
 
 
@@ -1438,19 +1488,17 @@ class Config(object):
     """
 
     def __init__(self, storage, max_hosts, domain_version):
-        if not storage.exists():
-            pytest.xfail("{} storage not available".format(storage.name))
-
-        self.path = tempfile.mkdtemp(dir=storage.path)
-        self.block_size = storage.sector_size
+        self._storage = storage
         self.max_hosts = max_hosts
         self.domain_version = domain_version
 
-    def __enter__(self):
-        return self
+    @property
+    def path(self):
+        return self._storage.path
 
-    def __exit__(self, *args):
-        shutil.rmtree(self.path)
+    @property
+    def block_size(self):
+        return self._storage.sector_size
 
     def __repr__(self):
         rep = "path: {}, block size: {}, max hosts: {}, domain version: {}"

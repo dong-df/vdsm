@@ -1,28 +1,12 @@
-#
-# Copyright 2015-2020 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
 import copy
 import six
 
+from vdsm.network.link.bond import sysfs_options
 from vdsm.network.link.bond import sysfs_options_mapper as bond_opts_mapper
 from vdsm.network.netinfo import bonding
 from vdsm.network.netinfo import bridges
@@ -224,9 +208,9 @@ def _parse_bond_options(opts):
     opts = dict((pair.split('=', 1) for pair in opts.split()))
 
     mode = opts.get(
-        'mode', bonding.getAllDefaultBondingOptions()['0']['mode'][-1]
+        'mode', sysfs_options.getAllDefaultBondingOptions()['0']['mode'][-1]
     )
-    opts['mode'] = numeric_mode = bonding.numerize_bond_mode(mode)
+    opts['mode'] = numeric_mode = sysfs_options.numerize_bond_mode(mode)
 
     # Force a numeric value for an option
     for opname, opval in opts.items():
@@ -236,5 +220,5 @@ def _parse_bond_options(opts):
         if numeric_val is not None:
             opts[opname] = numeric_val
 
-    defaults = bonding.getDefaultBondingOptions(numeric_mode)
+    defaults = sysfs_options.getDefaultBondingOptions(numeric_mode)
     return dict((k, v) for k, v in six.viewitems(opts) if v != defaults.get(k))

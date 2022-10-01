@@ -1,22 +1,5 @@
-#
-# Copyright 2015-2017 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
@@ -45,8 +28,9 @@ from testlib import permutations, expandPermutations
 from testlib import VdsmTestCase
 
 
+CHUNK_SIZE_MB = 1024
 CONFIG = make_config([
-    ('irs', 'volume_utilization_chunk_mb', '1024'),
+    ('irs', 'volume_utilization_chunk_mb', str(CHUNK_SIZE_MB)),
     ('irs', 'volume_utilizzation_precent', '50'),
 ])
 
@@ -71,9 +55,9 @@ class TestBlockVolumeSize(VdsmTestCase):
         [(sc.PREALLOCATED_VOL, sc.COW_FORMAT, GiB, None), GiB],
         # Sparse, cow, capacity config.volume_utilization_chunk_mb - 1,
         # No initial size.
-        # Expected 1024 MiB allocated (config.volume_utilization_chunk_mb)
-        [(sc.SPARSE_VOL, sc.COW_FORMAT, (CONFIG.getint(
-            "irs", "volume_utilization_chunk_mb") - 1) * MiB, None), GiB],
+        # Expected 1023 MiB allocated (config.volume_utilization_chunk_mb - 1)
+        [(sc.SPARSE_VOL, sc.COW_FORMAT, (CHUNK_SIZE_MB - 1) * MiB, None),
+         (CHUNK_SIZE_MB - 1) * MiB],
         # Sparse, cow, capacity 4 GiB, initial size 952320 B.
         [(sc.SPARSE_VOL, sc.COW_FORMAT, 4 * GiB, 952320),
          int(952320 * blockVolume.QCOW_OVERHEAD_FACTOR)],

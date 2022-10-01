@@ -1,22 +1,5 @@
-#
-# Copyright 2015-2020 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
@@ -26,10 +9,10 @@ import logging
 
 import six
 
+from vdsm.network import ipwrapper
+from vdsm.network import link
 from vdsm.network import nmstate
 from vdsm.network.ip.address import ipv6_supported
-from vdsm.network.ipwrapper import getLinks
-from vdsm.network.link import iface as link_iface
 from vdsm.network.netconfpersistence import RunningConfig
 
 from . import bonding
@@ -228,7 +211,7 @@ def _update_net_vlanid_info(network_info, vlans_info):
 def _devices_report(ipaddrs, routes):
     devs_report = {'bondings': {}, 'bridges': {}, 'nics': {}, 'vlans': {}}
 
-    for dev in (link for link in getLinks() if not link.isHidden()):
+    for dev in ipwrapper.visible_links():
         if dev.isBRIDGE():
             devinfo = devs_report['bridges'][dev.name] = bridges.info(dev)
         elif dev.isNICLike():
@@ -289,7 +272,7 @@ def networks_base_info(running_nets, routes=None, ipaddrs=None):
             continue
         iface = get_net_iface_from_config(net, attrs)
         try:
-            if not link_iface.iface(iface).exists():
+            if not link.iface.iface(iface).exists():
                 raise NetworkIsMissing('Iface %s was not found' % iface)
             info[net] = _getNetInfo(iface, attrs['bridged'], routes, ipaddrs)
         except NetworkIsMissing:
@@ -363,7 +346,7 @@ def _getNetInfo(iface, bridged, routes, ipaddrs):
                 'gateway': gateway,
                 'ipv6gateway': get_gateway(routes, iface, family=6),
                 'ipv4defaultroute': is_default_route(gateway, routes),
-                'mtu': link_iface.iface(iface).mtu(),
+                'mtu': link.iface.iface(iface).mtu(),
             }
         )
     except (IOError, OSError) as e:

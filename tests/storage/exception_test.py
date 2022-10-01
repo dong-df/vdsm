@@ -1,25 +1,10 @@
-#
-# Copyright 2012-2016 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
+
+import inspect
 
 import six
 
@@ -27,7 +12,6 @@ from collections import defaultdict
 
 import pytest
 
-from vdsm.common.compat import get_args_spec
 from vdsm.common.exception import GeneralException
 from vdsm.common.exception import VdsmException
 from vdsm.storage import exception as storage_exception
@@ -70,15 +54,15 @@ def test_info():
             continue
 
         # Inspect exception object initialization parameters.
-        args, varargs, kwargs = get_args_spec(obj.__init__)
+        spec = inspect.getfullargspec(obj.__init__)
 
         # Prepare fake parameters for object initialization.
         # We ignore the 'self' argument from counting.
-        args = [FakeArg(i) for i in range(len(args) - 1)]
-        if varargs:
+        args = [FakeArg(i) for i in range(len(spec.args) - 1)]
+        if spec.varargs:
             args.append(FakeArg(len(args)))
             args.append(FakeArg(len(args)))
-        kwargs = {kwargs: FakeArg(len(args))} if kwargs else {}
+        kwargs = {spec.varkw: FakeArg(len(args))} if spec.varkw else {}
 
         # Instantiate the traversed exception object.
         e = obj(*args, **kwargs)

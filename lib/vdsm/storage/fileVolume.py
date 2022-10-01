@@ -1,27 +1,11 @@
-#
-# Copyright 2009-2017 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 
 import errno
 import logging
+import glob
 import os
 
 import sanlock
@@ -30,11 +14,9 @@ from vdsm import constants
 from vdsm import utils
 from vdsm.common import cmdutils
 from vdsm.common import commands
-from vdsm.common import exception
-from vdsm.common.compat import glob_escape
 from vdsm.common.marks import deprecated
 from vdsm.common.threadlocal import vars
-from vdsm.common.units import MiB
+from vdsm.common.units import KiB, MiB
 from vdsm.storage import constants as sc
 from vdsm.storage import exception as se
 from vdsm.storage import fallocate
@@ -186,7 +168,7 @@ class FileVolumeManifest(volume.VolumeManifest):
         This API is not suitable for use with a template's base volume.
         """
         imgDir, _ = os.path.split(self.volumePath)
-        metaPattern = os.path.join(glob_escape(imgDir), "*.meta")
+        metaPattern = os.path.join(glob.escape(imgDir), "*.meta")
         metaPaths = oop.getProcessPool(self.sdUUID).glob.glob(metaPattern)
         pattern = "%s.*%s" % (sc.PUUID, self.volUUID)
         matches = grep_files(pattern, metaPaths)
@@ -353,7 +335,7 @@ class FileVolumeManifest(volume.VolumeManifest):
         """
         sd = sdCache.produce_manifest(sdUUID)
         img_dir = sd.getImageDir(imgUUID)
-        pattern = os.path.join(glob_escape(img_dir), "*.meta")
+        pattern = os.path.join(glob.escape(img_dir), "*.meta")
         files = oop.getProcessPool(sdUUID).glob.glob(pattern)
         volList = []
         for i in files:
@@ -451,14 +433,18 @@ class FileVolume(volume.Volume):
         """
         Class specific implementation of volumeCreate.
         """
-        if volFormat == sc.RAW_FORMAT:
-            return cls._create_raw_volume(
-                dom, volUUID, capacity, volPath, initial_size, preallocate)
-        else:
-            return cls._create_cow_volume(
-                dom, volUUID, capacity, volPath, initial_size, volParent,
-                imgUUID, srcImgUUID, srcVolUUID, add_bitmaps=add_bitmaps,
-                bitmap=bitmap)
+        try:
+            if volFormat == sc.RAW_FORMAT:
+                return cls._create_raw_volume(
+                    dom, volUUID, capacity, volPath, initial_size, preallocate)
+            else:
+                return cls._create_cow_volume(
+                    dom, volUUID, capacity, volPath, initial_size, preallocate,
+                    volParent, imgUUID, srcImgUUID, srcVolUUID,
+                    add_bitmaps=add_bitmaps, bitmap=bitmap)
+        except cmdutils.Error as e:
+            cls.log.error("Unexpected error: %s", e, exc_info=True)
+            raise se.VolumeCreationError(volPath) from e
 
     @classmethod
     def _create_raw_volume(
@@ -492,7 +478,13 @@ class FileVolume(volume.Volume):
 
         cls._truncate_volume(vol_path, 0, vol_id, dom)
 
-        cls._allocate_volume(vol_path, capacity, preallocate=preallocate)
+        cls._create_image(vol_path, capacity, sc.fmt2str(sc.RAW_FORMAT))
+
+        # If the image is preallocated, allocate the rest of the image
+        # using fallocate helper. qemu-img create always writes zeroes to
+        # the first block so we should skip it during preallocation.
+        if preallocate == sc.PREALLOCATED_VOL:
+            cls._preallocate_volume(vol_path, capacity, offset=4 * KiB)
 
         # Forcing volume permissions in case qemu-img changed the permissions.
         cls._set_permissions(vol_path, dom)
@@ -501,8 +493,9 @@ class FileVolume(volume.Volume):
 
     @classmethod
     def _create_cow_volume(
-            cls, dom, vol_id, capacity, vol_path, initial_size, vol_parent,
-            img_id, src_img_id, src_vol_id, add_bitmaps, bitmap=None):
+            cls, dom, vol_id, capacity, vol_path, initial_size, preallocate,
+            vol_parent, img_id, src_img_id, src_vol_id, add_bitmaps,
+            bitmap=None):
         """
         specific implementation of _create() for COW volumes.
         All the exceptions are properly handled and logged in volume.create()
@@ -518,11 +511,17 @@ class FileVolume(volume.Volume):
             cls.log.info("Request to create COW volume %s with capacity = %s",
                          vol_path, capacity)
 
-            operation = qemuimg.create(vol_path,
-                                       size=capacity,
-                                       format=sc.fmt2str(sc.COW_FORMAT),
-                                       qcow2Compat=dom.qcow2_compat())
-            operation.run()
+            format = sc.fmt2str(sc.COW_FORMAT)
+            cls._create_image(vol_path, capacity, format=format,
+                              qcow2_compat=dom.qcow2_compat())
+            if preallocate == sc.PREALLOCATED_VOL:
+                offset = qemuimg.check(vol_path, format=format)["offset"]
+
+                # qemu-img offset is usually not aligned to 4k, and fallocate
+                # uses direct I/O requiring alignment to logical block size.
+                # Using 4k alignment ensures this works for any storage.
+                offset = utils.round(offset, 4 * KiB)
+                cls._preallocate_volume(vol_path, capacity, offset=offset)
         else:
             # Create hardlink to template and its meta file
             cls.log.info("Request to create snapshot %s/%s of volume %s/%s "
@@ -552,39 +551,35 @@ class FileVolume(volume.Volume):
             raise
 
     @classmethod
-    def _allocate_volume(cls, vol_path, size, preallocate):
-        try:
-            # Always create sparse image, since qemu-img create uses
-            # posix_fallocate() which is inefficient and harmful.
-            op = qemuimg.create(vol_path, size=size, format=qemuimg.FORMAT.RAW)
+    def _create_image(cls, vol_path, size, format, qcow2_compat=None):
+        # Always create sparse image, since qemu-img create uses
+        # posix_fallocate() which is inefficient and harmful.
+        op = qemuimg.create(vol_path, size=size,
+                            format=format, qcow2Compat=qcow2_compat)
 
-            # This is fast but it can get stuck if storage is inaccessible.
-            with vars.task.abort_callback(op.abort):
-                with utils.stopwatch(
-                        "Creating image {}".format(vol_path),
-                        level=logging.INFO,
-                        log=cls.log):
-                    op.run()
+        # This is fast but it can get stuck if storage is inaccessible.
+        with vars.task.abort_callback(op.abort):
+            with utils.stopwatch(
+                    "Creating image {}".format(vol_path),
+                    level=logging.INFO,
+                    log=cls.log):
+                op.run()
 
-            # If the image is preallocated, allocate the rest of the image
-            # using fallocate helper. qemu-img create always writes zeroes to
-            # the first block so we should skip it during preallocation.
-            if size > 4096 and preallocate == sc.PREALLOCATED_VOL:
-                op = fallocate.allocate(vol_path, size - 4096, offset=4096)
+    @classmethod
+    def _preallocate_volume(cls, vol_path, capacity, offset):
+        if capacity <= offset:
+            return
+        op = fallocate.allocate(
+            vol_path, size=capacity - offset, offset=offset)
 
-                # This is fast on NFS 4.2, GlusterFS, XFS and ext4, but can be
-                # extremely slow on NFS < 4.2, writing zeroes to entire image.
-                with vars.task.abort_callback(op.abort):
-                    with utils.stopwatch(
-                            "Preallocating volume {}".format(vol_path),
-                            level=logging.INFO,
-                            log=cls.log):
-                        op.run()
-        except exception.ActionStopped:
-            raise
-        except Exception:
-            cls.log.error("Unexpected error", exc_info=True)
-            raise se.VolumesZeroingError(vol_path)
+        # This is fast on NFS 4.2, GlusterFS, XFS and ext4, but can be
+        # extremely slow on NFS < 4.2, writing zeroes to entire image.
+        with vars.task.abort_callback(op.abort):
+            with utils.stopwatch(
+                    "Preallocating volume {}".format(vol_path),
+                    level=logging.INFO,
+                    log=cls.log):
+                op.run()
 
     @classmethod
     def _set_permissions(cls, vol_path, dom):

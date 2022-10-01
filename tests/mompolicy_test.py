@@ -1,13 +1,16 @@
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 from __future__ import absolute_import
 from __future__ import division
 
 import json
 import os
 import unittest
+import subprocess
 
 import six
 
-from vdsm.common.compat import subprocess
 from testValidation import skipif
 
 MOM_POLICY_VALIDATOR = 'mom_policy_validator.py'

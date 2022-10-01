@@ -1,37 +1,21 @@
-#
-# Copyright 2020 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from collections import namedtuple
 
 import pytest
+import userstorage
 
 from vdsm import utils
 from vdsm.common import commands
 from vdsm.storage import sanlock_direct
 from vdsm.storage import constants as sc
 
-from . import userstorage
 from .marks import requires_root
 
 # Wait 1 second for lockspace initialization for quick tests.
 INIT_LOCKSPACE_TIMEOUT = 1
+BACKENDS = userstorage.load_config("storage.py").BACKENDS
 
 Storage = namedtuple("Storage", "path, block_size, alignment")
 
@@ -39,22 +23,17 @@ Storage = namedtuple("Storage", "path, block_size, alignment")
 @pytest.fixture(
     params=[
         pytest.param(
-            (userstorage.PATHS["file-512"], sc.ALIGNMENT_1M),
+            (BACKENDS["file-512"], sc.ALIGNMENT_1M),
             id="file-512-1m"),
         pytest.param(
-            (userstorage.PATHS["file-4k"], sc.ALIGNMENT_2M),
+            (BACKENDS["file-4k"], sc.ALIGNMENT_2M),
             id="file-4k-2m"),
     ]
 )
 def storage(request):
-    storage, alignment = request.param
-    if not storage.exists():
-        pytest.xfail("{} storage not available".format(storage.name))
-
-    with open(storage.path, "wb") as f:
-        f.truncate()
-
-    yield Storage(storage.path, storage.sector_size, alignment)
+    backend, alignment = request.param
+    with backend:
+        yield Storage(backend.path, backend.sector_size, alignment)
 
 
 @requires_root

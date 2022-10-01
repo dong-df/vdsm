@@ -1,22 +1,5 @@
-#
-# Copyright 2012-2016 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
@@ -26,7 +9,6 @@ import gc
 import logging
 import os
 import re
-import shutil
 import stat
 import time
 import weakref
@@ -34,15 +16,17 @@ import weakref
 from contextlib import contextmanager
 
 import pytest
+import userstorage
 
 from vdsm.common.osutils import get_umask
 from vdsm.storage import constants as sc
 from vdsm.storage import outOfProcess as oop
 from vdsm.storage.exception import MiscDirCleanupFailure
 
-from . import userstorage
 from . marks import requires_root, requires_unprivileged_user
 from . storagetestlib import chmod
+
+BACKENDS = userstorage.load_config("storage.py").BACKENDS
 
 
 @pytest.fixture
@@ -53,19 +37,16 @@ def oop_cleanup():
 
 @pytest.fixture(
     params=[
-        userstorage.PATHS["mount-512"],
-        userstorage.PATHS["mount-4k"],
+        BACKENDS["mount-512"],
+        BACKENDS["mount-4k"],
     ],
     ids=str,
 )
 def user_mount(request):
-    storage = request.param
-    if not storage.exists():
-        pytest.xfail("{} storage not available".format(storage.name))
-    tmpdir = os.path.join(storage.path, "tmp")
-    os.mkdir(tmpdir)
-    yield tmpdir
-    shutil.rmtree(tmpdir)
+    backend = request.param
+    with backend:
+        with backend.tmpdir() as tmpdir:
+            yield tmpdir
 
 
 # TODO: the following 2 tests use private instance variables that

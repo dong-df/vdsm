@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 # See github docs for more info on the syntax:
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
@@ -96,7 +99,6 @@ lib/vdsm/common/base26.py               @mz-pdm
 lib/vdsm/common/cache.py                @nirs @tinez
 lib/vdsm/common/cmdutils.py             @tinez @nirs
 lib/vdsm/common/commands.py             @tinez @nirs
-lib/vdsm/common/compat.py               @tinez @nirs
 lib/vdsm/common/concurrent.py           @nirs
 lib/vdsm/common/config.py.in            @tinez
 lib/vdsm/common/constants.py.in         @tinez
@@ -110,7 +112,6 @@ lib/vdsm/common/exception.py            @nirs @mz-pdm
 lib/vdsm/common/filecontrol.py          @tinez
 lib/vdsm/common/fileutils.py            @almusil @nirs @mz-pdm
 lib/vdsm/common/function.py             @almusil
-lib/vdsm/common/glob.py                 @nirs
 lib/vdsm/common/hooks.py                @tinez
 lib/vdsm/common/hostdev.py              @mz-pdm
 lib/vdsm/common/hostutils.py            @almusil

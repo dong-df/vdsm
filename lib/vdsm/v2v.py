@@ -1,21 +1,6 @@
-# Copyright 2014-2018 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """
 When importing a VM a thread start with a new process of virt-v2v.
 The way to feedback the information on the progress and the status of the
@@ -34,6 +19,7 @@ import io
 import logging
 import os
 import re
+import subprocess
 import tarfile
 import time
 import threading
@@ -49,7 +35,6 @@ from vdsm.common import password
 from vdsm.common import response
 from vdsm.common.cmdutils import wrap_command
 from vdsm.common.commands import execCmd, BUFFSIZE, terminating
-from vdsm.common.compat import subprocess
 from vdsm.common.config import config
 from vdsm.common.define import errCode, doneCode
 from vdsm.common.logutils import traceback

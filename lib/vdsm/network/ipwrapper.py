@@ -1,35 +1,20 @@
-# Copyright 2013-2021 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
 
 from fnmatch import fnmatch
+from functools import partial
 from glob import iglob
 from ipaddress import ip_address
 from ipaddress import ip_network
 
 import errno
 import os
+import subprocess
 
 from vdsm.common.cmdutils import CommandPath
-from vdsm.common.compat import subprocess
 from vdsm.common.config import config
 from vdsm.network import cmd
 from vdsm.network import ethtool
@@ -302,9 +287,30 @@ def getLinks():
             continue
 
 
+def visible_links():
+    return (lnk for lnk in getLinks() if not lnk.isHidden())
+
+
+def nic_links():
+    return (lnk for lnk in getLinks() if lnk.isNIC())
+
+
 def getLink(dev):
     """Returns the Link object for the specified dev."""
     return Link.fromDict(link.get_link(dev))
+
+
+def _visible_devs(predicate):
+    """Returns a list of visible (vdsm manageable) links for which the
+    predicate is True"""
+    return [
+        dev.name for dev in getLinks() if predicate(dev) and not dev.isHidden()
+    ]
+
+
+visible_bonds = partial(_visible_devs, Link.isBOND)
+visible_bridges = partial(_visible_devs, Link.isBRIDGE)
+visible_nics = partial(_visible_devs, Link.isNICLike)
 
 
 @equals

@@ -1,22 +1,5 @@
-#
-# Copyright 2016-2021 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from contextlib import contextmanager
 from copy import deepcopy
@@ -35,9 +18,8 @@ from vdsm.network.cmd import exec_sync
 from vdsm.network.dhcp_monitor import MonitoredItemPool
 from vdsm.network.ip.address import ipv6_supported, prefix2netmask
 from vdsm.network.link.iface import iface
-from vdsm.network.link.bond import sysfs_options as bond_options
+from vdsm.network.link.bond import sysfs_options
 from vdsm.network.link.bond import sysfs_options_mapper as bond_opts_mapper
-from vdsm.network.link.bond.sysfs_options import getDefaultBondingOptions
 from vdsm.network.netconfpersistence import RunningConfig
 from vdsm.network.netinfo import bridges
 from vdsm.network.netinfo.cache import CachingNetInfo
@@ -888,12 +870,14 @@ def wait_bonds_lp_interval():
     LACP_BOND_MODE = '4'
 
     default_lp_interval = int(
-        getDefaultBondingOptions(LACP_BOND_MODE)['lp_interval'][0]
+        sysfs_options.getDefaultBondingOptions(LACP_BOND_MODE)['lp_interval'][
+            0
+        ]
     )
     time.sleep(default_lp_interval + GRACE_PERIOD)
 
 
-def _normalize_caps(netinfo_from_caps):
+def _normalize_caps(netinfo_from_caps: CachingNetInfo):
     """
     Normalize network caps to allow kernel vs running config comparison.
 
@@ -953,7 +937,7 @@ def _numerize_bond_options(opts):
     if not mode:
         return opts
 
-    optmap['mode'] = numeric_mode = bond_options.numerize_bond_mode(mode)
+    optmap['mode'] = numeric_mode = sysfs_options.numerize_bond_mode(mode)
     for opname, opval in optmap.items():
         numeric_val = bond_opts_mapper.get_bonding_option_numeric_val(
             numeric_mode, opname, opval

@@ -1,22 +1,5 @@
-#
-# Copyright 2008-2021 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 from __future__ import absolute_import
 from __future__ import division
@@ -139,7 +122,8 @@ class SourceThread(object):
                  tunneled=False, dstqemu='', abortOnError=False,
                  consoleAddress=None, compressed=False,
                  autoConverge=False, recovery=False, encrypted=False,
-                 cpusets=None, parallel=None, numaNodesets=None, **kwargs):
+                 cpusets=None, parallel=None, numaNodesets=None,
+                 zerocopy=False, **kwargs):
         self.log = vm.log
         self._vm = vm
         self._dom = DomainAdapter(self._vm)
@@ -155,6 +139,7 @@ class SourceThread(object):
         if parallel == self._PARALLEL_CONNECTIONS_DISABLED_VALUE:
             parallel = None
         self._parallel = parallel
+        self._zerocopy = zerocopy
         self._maxBandwidth = int(
             kwargs.get('maxBandwidth') or
             config.getint('vars', 'migration_max_bandwidth')
@@ -605,12 +590,16 @@ class SourceThread(object):
         # if we call stop() and libvirt migrateToURI3 didn't start
         # we may return migration stop but it will start at libvirt
         # side
+        params = self._migration_params(muri)
+        params_copy = params.copy()
+        params_copy[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = '...'
+        flags = self._migration_flags
+        self.log.info("Migrating to %s with params %s and flags %s",
+                      duri, params_copy, flags)
         self._preparingMigrationEvt = False
         if not self._migrationCanceledEvt.is_set():
             # pylint: disable=no-member
-            self._dom.migrateToURI3(duri,
-                                    self._migration_params(muri),
-                                    self._migration_flags)
+            self._dom.migrateToURI3(duri, params, flags)
         else:
             self._raiseAbortError()
 
@@ -685,6 +674,12 @@ class SourceThread(object):
             flags |= libvirt.VIR_MIGRATE_PARALLEL
         if self._vm.min_cluster_version(4, 2):
             flags |= libvirt.VIR_MIGRATE_PERSIST_DEST
+        if self._zerocopy:
+            if hasattr(libvirt, 'VIR_MIGRATE_ZEROCOPY'):
+                flags |= libvirt.VIR_MIGRATE_ZEROCOPY
+            else:
+                self._vm.log.info(
+                    "Zero-copy migration support not available, not enabling")
         # Migration may fail immediately when VIR_MIGRATE_POSTCOPY flag is
         # present in the following situations:
         # - The transport is not capable of full bidirectional

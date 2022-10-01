@@ -1,22 +1,5 @@
-#
-# Copyright 2019 Red Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
-#
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 """
 Common fixtures that can be used without importing anything.
@@ -33,6 +16,7 @@ import types
 from contextlib import closing
 
 import pytest
+import userstorage
 
 from vdsm import jobs
 from vdsm.common import threadlocal
@@ -56,8 +40,12 @@ from .fakesanlock import FakeSanlock
 from . import tmpfs
 from . import tmprepo
 from . import tmpstorage
-from . import userstorage
 
+# Mark tests with xfail if userstorage is missing
+userstorage.missing_handler = pytest.xfail
+
+# Requires relative path from tox basedir
+BACKENDS = userstorage.load_config("storage/storage.py").BACKENDS
 
 log = logging.getLogger("test")
 
@@ -146,16 +134,14 @@ def tmp_storage(monkeypatch, tmpdir):
 @pytest.fixture(
     scope="module",
     params=[
-        userstorage.PATHS["mount-512"],
-        userstorage.PATHS["mount-4k"],
+        BACKENDS["mount-512"],
+        BACKENDS["mount-4k"],
     ],
     ids=str,
 )
 def tmp_mount(request):
-    mount = request.param
-    if not mount.exists():
-        pytest.xfail("{} storage not available".format(mount.name))
-    return mount
+    with request.param:
+        yield request.param
 
 
 @pytest.fixture

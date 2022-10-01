@@ -1,51 +1,22 @@
-#
-# Copyright 2015-2017 Hat, Inc.
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
-#
-# Refer to the README and COPYING files for full details of the license
+# SPDX-FileCopyrightText: Red Hat, Inc.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 from __future__ import absolute_import
 from __future__ import division
-from functools import partial
 import os
 
 import six
 
-from vdsm.network.ipwrapper import Link
-
-from .misc import visible_devs
-
 from vdsm.network.link.bond import Bond
 
-# In order to limit the scope of change, this module is now acting as a proxy
-# to the link.bond.sysfs_options module.
-from vdsm.network.link.bond import sysfs_options
-from vdsm.network.link.bond.sysfs_options import getDefaultBondingOptions
-from vdsm.network.link.bond.sysfs_options import getAllDefaultBondingOptions
 from vdsm.network.link.setup import parse_bond_options
 
-getDefaultBondingOptions
-getAllDefaultBondingOptions
 parse_bond_options
 
 BONDING_ACTIVE_SLAVE = '/sys/class/net/%s/bonding/active_slave'
 BONDING_OPT = '/sys/class/net/%s/bonding/%s'
 BONDING_SLAVES = '/sys/class/net/%s/bonding/slaves'
 BONDING_SLAVE_OPT = '/sys/class/net/%s/bonding_slave/%s'
-
-bondings = partial(visible_devs, Link.isBOND)
 
 
 def _file_value(path):
@@ -105,7 +76,3 @@ def permanent_address():
                         len('Permanent HW addr: ') : -1  # noqa: E203
                     ]
     return paddr
-
-
-def numerize_bond_mode(mode):
-    return sysfs_options.numerize_bond_mode(mode)

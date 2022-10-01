@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Red Hat, Inc.
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # Virtual Desktop Server Manager
 
 [![CI Status](https://github.com/oVirt/vdsm/actions/workflows/ci.yml/badge.svg)](https://github.com/oVirt/vdsm/actions)
@@ -25,7 +30,7 @@ Please use GitHub pull requests.
 ### Found a bug or documentation issue?
 
 To submit a bug or suggest an enhancement for Vdsm please use
-[oVirt Bugzilla for vdsm product](https://bugzilla.redhat.com/enter_bug.cgi?product=vdsm).
+GitHub [issues](https://github.com/oVirt/vdsm/issues).
 
 If you find a documentation issue on the oVirt website please navigate
 and click "Report an issue on GitHub" in the page footer.
@@ -86,7 +91,7 @@ The developers also hang out on IRC at #vdsm hosted on freenode.net
 
 The latest upstream code can be obtained from GIT:
 
-    git clone https://gerrit.ovirt.org/vdsm
+    git clone https://github.com/oVirt/vdsm
 
 
 ## Licensing
