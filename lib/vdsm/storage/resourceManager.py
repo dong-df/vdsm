@@ -74,7 +74,7 @@ def _statusFromType(locktype):
         return STATUS_SHARED
     if str(locktype) == EXCLUSIVE:
         return STATUS_LOCKED
-    raise InvalidLockType("Invalid locktype %r was used" % locktype)
+    raise InvalidLockType(f"Invalid locktype {locktype!r} was used")
 
 
 # TODO : Integrate all factory functionality to manager
@@ -333,16 +333,16 @@ class _ResourceManager(object):
 
     def registerNamespace(self, namespace, factory):
         if not self._namespaceValidator.match(namespace):
-            raise InvalidNamespace("Invalid namespace name %r" % namespace)
+            raise InvalidNamespace(f"Invalid namespace name {namespace!r}")
 
         if namespace in self._namespaces:
-            raise NamespaceRegistered("Namespace '%s' already registered"
-                                      % namespace)
+            raise NamespaceRegistered(
+                f"Namespace '{namespace}' already registered")
 
         with self._syncRoot.exclusive:
             if namespace in self._namespaces:
-                raise NamespaceRegistered("Namespace '%s' already registered"
-                                          % namespace)
+                raise NamespaceRegistered(
+                    f"Namespace '{namespace}' already registered")
 
             log.debug("Registering namespace '%s'", namespace)
 
@@ -356,13 +356,13 @@ class _ResourceManager(object):
             try:
                 namespaceObj = self._namespaces[namespace]
             except KeyError:
-                raise ValueError("Namespace '%s' is not registered with this "
-                                 "manager" % namespace)
+                raise ValueError(
+                    f"Namespace '{namespace}' is not registered "
+                    "with this manager")
             resources = namespaceObj.resources
             with namespaceObj.lock:
                 if not namespaceObj.factory.resourceExists(name):
-                    raise KeyError("No such resource '%s.%s'" % (namespace,
-                                                                 name))
+                    raise KeyError(f"No such resource '{namespace}.{name}'")
 
                 if name not in resources:
                     return STATUS_FREE
@@ -426,9 +426,9 @@ class _ResourceManager(object):
         if not request.granted():
             try:
                 request.cancel()
-                raise RequestTimedOutError("Request timed out. Could not "
-                                           "acquire resource '%s.%s'" %
-                                           (namespace, name))
+                raise RequestTimedOutError(
+                    "Request timed out. Could not "
+                    f"acquire resource '{namespace}.{name}'")
             except RequestAlreadyProcessedError:
                 # We might have acquired the resource between 'wait' and
                 # 'cancel'
@@ -449,7 +449,7 @@ class _ResourceManager(object):
             raise se.InvalidResourceName(name)
 
         if lockType not in (SHARED, EXCLUSIVE):
-            raise InvalidLockType("Invalid locktype %r was used" % lockType)
+            raise InvalidLockType(f"Invalid locktype {lockType!r} was used")
 
         request = Request(namespace, name, lockType, callback)
         log.debug("Trying to register resource '%s' for lock type '%s'",
@@ -458,8 +458,9 @@ class _ResourceManager(object):
             try:
                 namespaceObj = self._namespaces[namespace]
             except KeyError:
-                raise ValueError("Namespace '%s' is not registered with this "
-                                 "manager" % namespace)
+                raise ValueError(
+                    f"Namespace '{namespace}' is not registered "
+                    "with this manager")
 
             resources = namespaceObj.resources
             with namespaceObj.lock:
@@ -467,7 +468,7 @@ class _ResourceManager(object):
                     resource = resources[name]
                 except KeyError:
                     if not namespaceObj.factory.resourceExists(name):
-                        raise KeyError("No such resource '%s'" % (full_name))
+                        raise KeyError(f"No such resource '{full_name}'")
                 else:
                     if len(resource.queue) == 0 and \
                             resource.currentLock == SHARED and \
@@ -531,16 +532,18 @@ class _ResourceManager(object):
             try:
                 namespaceObj = self._namespaces[namespace]
             except KeyError:
-                raise ValueError("Namespace '%s' is not registered with this "
-                                 "manager", namespace)
+                raise ValueError(
+                    f"Namespace '{namespace}' is not registered "
+                    "with this manager")
             resources = namespaceObj.resources
 
             with namespaceObj.lock:
                 try:
                     resource = resources[name]
                 except KeyError:
-                    raise ValueError("Resource '%s.%s' is not currently "
-                                     "registered" % (namespace, name))
+                    raise ValueError(
+                        f"Resource '{namespace}.{name}' is not "
+                        "currently registered")
 
                 resource.activeUsers -= 1
                 log.debug("Released resource '%s' (%d active users)",
@@ -676,8 +679,8 @@ class Owner(object):
             try:
                 if full_name in self.resources:
                     raise ResourceAlreadyAcquired(
-                        "%s is already acquired by %s",
-                        full_name, self.ownerobject.getID())
+                        f"{full_name} is already acquired "
+                        f"by {self.ownerobject.getID()}")
                 try:
                     resource = acquireResource(namespace, name, locktype,
                                                timeout)
@@ -700,8 +703,8 @@ class Owner(object):
                     log.debug(
                         "%s: resource '%s' does not exist",
                         self, full_name)
-                    raise ResourceDoesNotExist("Resource %s does not exist"
-                                               % full_name)
+                    raise ResourceDoesNotExist(
+                        f"Resource {full_name} does not exist")
                 except Exception:
                     log.warning(
                         "Unexpected exception caught while owner '%s' tried "
@@ -726,8 +729,7 @@ class Owner(object):
         full_name = "%s.%s" % (namespace, name)
         with self.lock:
             if full_name not in self.resources:
-                raise ValueError("resource %s not owned by %s" %
-                                 (full_name, self))
+                raise ValueError(f"resource {full_name} not owned by {self}")
 
             resource = self.resources[full_name]
 
