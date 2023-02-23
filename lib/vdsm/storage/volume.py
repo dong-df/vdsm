@@ -1381,11 +1381,11 @@ class Volume(object):
             raise se.VolumeNonWritable(self.volUUID)
 
         volFormat = self.getFormat()
-        if volFormat == sc.COW_FORMAT:
+        if volFormat == sc.COW_FORMAT and self.getType() == sc.SPARSE_VOL:
             self.log.debug("skipping cow size extension for volume %s to "
                            "capacity %s", self.volUUID, new_capacity)
             return
-        elif volFormat != sc.RAW_FORMAT:
+        if volFormat not in [sc.RAW_FORMAT, sc.COW_FORMAT]:
             raise se.IncorrectFormat(self.volUUID)
 
         # Note: This function previously prohibited extending non-leaf volumes.
@@ -1416,7 +1416,7 @@ class Volume(object):
                 "Extend size for volume: " + self.volUUID, "volume",
                 "Volume", "extendSizeFinalize",
                 [self.sdUUID, self.imgUUID, self.volUUID]))
-            self._extendSizeRaw(new_capacity)
+            self._extendSize(new_capacity)
 
         self.syncMetadata()  # update the metadata
 
@@ -1594,7 +1594,7 @@ class Volume(object):
     def getImageVolumes(cls, sdUUID, imgUUID):
         return cls.manifestClass.getImageVolumes(sdUUID, imgUUID)
 
-    def _extendSizeRaw(self, newSize):
+    def _extendSize(self, newSize):
         raise NotImplementedError
 
     # Used only for block volume

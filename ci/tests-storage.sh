@@ -56,6 +56,16 @@ if [ -z "$user" ]; then
     exit 1
 fi
 
+# Only when running in a container
+[ -d /venv ] && {
+    # Workaround to avoid this warning:
+    #   fatal: detected dubious ownership in repository at '/dir'
+    git config --global --add safe.directory "$(pwd)"
+
+    # Activate the tests venv (for containers only)
+    source /venv/bin/activate
+}
+
 echo "Running tests as user $user"
 
 setup_storage
