@@ -1380,13 +1380,10 @@ class Volume(object):
         if self.isShared():
             raise se.VolumeNonWritable(self.volUUID)
 
-        volFormat = self.getFormat()
-        if volFormat == sc.COW_FORMAT and self.getType() == sc.SPARSE_VOL:
-            self.log.debug("skipping cow size extension for volume %s to "
+        if self.getType() == sc.SPARSE_VOL:
+            self.log.debug("skipping sparse size extension for volume %s to "
                            "capacity %s", self.volUUID, new_capacity)
             return
-        if volFormat not in [sc.RAW_FORMAT, sc.COW_FORMAT]:
-            raise se.IncorrectFormat(self.volUUID)
 
         # Note: This function previously prohibited extending non-leaf volumes.
         # If a disk is enlarged a volume may become larger than its parent.  In
